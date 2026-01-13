@@ -88,7 +88,7 @@ async def test_priority_game_ambiguous():
     with patch("src.bot.handlers.db.AsyncSessionLocal", return_value=mock_session):
         await priority_game(mock_update, mock_context)
 
-    # Should ask for specificity
-    mock_update.message.reply_text.assert_called_with(
-        "Found multiple games in your collection: Catan: Cities, Catan: Seafarers. Be more specific."
-    )
+    # Should show buttons
+    call_args = mock_update.message.reply_text.call_args
+    assert "Found multiple games matching 'Catan'. Select one:" in call_args[0][0]
+    assert "reply_markup" in call_args[1]
