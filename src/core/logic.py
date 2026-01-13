@@ -1,11 +1,11 @@
-from typing import List, Tuple
 from src.core.models import Game
 
-def split_games(games: List[Game], max_per_poll: int = 10) -> List[Tuple[str, List[Game]]]:
+
+def split_games(games: list[Game], max_per_poll: int = 10) -> list[tuple[str, list[Game]]]:
     """
     Split games into logical groups for polling.
     Sorts by complexity and labels by category.
-    
+
     Returns:
         List of (Label, List[Game]) tuples.
     """
@@ -14,7 +14,7 @@ def split_games(games: List[Game], max_per_poll: int = 10) -> List[Tuple[str, Li
 
     # Filter invalid entries
     valid_games = [g for g in games if g.name]
-    
+
     # Sort by complexity (ascending: light games first)
     valid_games.sort(key=lambda g: (g.complexity or 0, g.name.lower()))
 
@@ -24,9 +24,9 @@ def split_games(games: List[Game], max_per_poll: int = 10) -> List[Tuple[str, Li
     # Split into chunks of max_per_poll
     chunks = []
     for i in range(0, len(valid_games), max_per_poll):
-        chunk = valid_games[i:i + max_per_poll]
+        chunk = valid_games[i : i + max_per_poll]
         chunks.append(chunk)
-    
+
     # Label chunks based on complexity category
     def get_category_label(avg_complexity: float) -> str:
         if avg_complexity < 2.0:
@@ -35,21 +35,21 @@ def split_games(games: List[Game], max_per_poll: int = 10) -> List[Tuple[str, Li
             return "Medium Weight Games"
         else:
             return "Heavy Strategy Games"
-    
+
     # First pass: assign labels
     labeled = []
     for chunk in chunks:
         avg_complexity = sum((g.complexity or 0) for g in chunk) / len(chunk) if chunk else 0
         label = get_category_label(avg_complexity)
         labeled.append((label, chunk))
-    
+
     # Second pass: add part numbers for duplicate labels
-    label_counts = {}
+    label_counts: dict[str, int] = {}
     for label, _ in labeled:
         label_counts[label] = label_counts.get(label, 0) + 1
-    
+
     # Track which labels need part numbers
-    label_indices = {}
+    label_indices: dict[str, int] = {}
     result = []
     for label, chunk in labeled:
         if label_counts[label] > 1:
@@ -60,5 +60,5 @@ def split_games(games: List[Game], max_per_poll: int = 10) -> List[Tuple[str, Li
         else:
             final_label = label
         result.append((final_label, chunk))
-        
+
     return result

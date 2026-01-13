@@ -1,6 +1,6 @@
 import pytest
+
 from src.core.bgg import BGGClient
-from src.core.models import Game
 
 # Sample BGG XML Response
 MOCK_BGG_XML = b"""
@@ -33,18 +33,19 @@ MOCK_BGG_XML = b"""
 </items>
 """
 
+
 @pytest.mark.asyncio
 async def test_parse_collection_xml():
     client = BGGClient()
     games = client._parse_collection_xml(MOCK_BGG_XML)
-    
+
     # By default, xml API returns all items, filtering happens in fetch_collection via params
     # But _parse_collection_xml just parses what it gets.
     # However, our current BGGClient implementation relies on API params to filter expansions.
     # So we should test that the parser correctly extracts data for the items provided.
-    
+
     assert len(games) == 2
-    
+
     # Check Catan
     catan = games[0]
     assert catan.name == "Catan"
@@ -53,7 +54,7 @@ async def test_parse_collection_xml():
     assert catan.complexity == 2.32
     assert catan.thumbnail == "http://example.com/catan.jpg"
     assert catan.id == 1
-    
+
     # Check Expansion
     expansion = games[1]
     assert expansion.name == "Catan Extension"
@@ -100,13 +101,13 @@ def test_parse_search_xml():
     """Test BGG search XML parsing."""
     client = BGGClient()
     results = client._parse_search_xml(MOCK_SEARCH_XML, limit=5)
-    
+
     assert len(results) == 2
-    
+
     assert results[0]["id"] == 13
     assert results[0]["name"] == "Catan"
     assert results[0]["year_published"] == "1995"
-    
+
     assert results[1]["id"] == 42
     assert results[1]["name"] == "Ticket to Ride"
 
@@ -115,7 +116,7 @@ def test_parse_search_xml_respects_limit():
     """Test that search parsing respects the limit parameter."""
     client = BGGClient()
     results = client._parse_search_xml(MOCK_SEARCH_XML, limit=1)
-    
+
     assert len(results) == 1
     assert results[0]["name"] == "Catan"
 
@@ -124,7 +125,7 @@ def test_parse_thing_xml():
     """Test BGG thing/stats XML parsing."""
     client = BGGClient()
     game = client._parse_thing_xml(MOCK_THING_XML, bgg_id=13)
-    
+
     assert game is not None
     assert game.id == 13
     assert game.name == "Catan"
@@ -140,6 +141,5 @@ def test_parse_thing_xml_empty():
     client = BGGClient()
     empty_xml = b"<items></items>"
     game = client._parse_thing_xml(empty_xml, bgg_id=999)
-    
-    assert game is None
 
+    assert game is None

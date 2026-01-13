@@ -1,8 +1,9 @@
-import os
 import logging
-from typing import AsyncGenerator
+import os
+from collections.abc import AsyncGenerator
 
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
 from src.core.models import Base
 
 logger = logging.getLogger(__name__)
@@ -10,17 +11,18 @@ logger = logging.getLogger(__name__)
 # Default to local SQLite if no DATABASE_URL is present
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///game_night.db")
 
-# If using Postgres on Cloud Run (which might start with 'postgres://'), 
+# If using Postgres on Cloud Run (which might start with 'postgres://'),
 # SQLAlchemy requires 'postgresql+asyncpg://'
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://") and "asyncpg" not in DATABASE_URL:
-     # Ensure async driver is used
-     if "+" not in DATABASE_URL.split("://")[0]:
+    # Ensure async driver is used
+    if "+" not in DATABASE_URL.split("://")[0]:
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
 
 async def init_db() -> None:
     """Initialize the database (create tables)."""
@@ -30,6 +32,7 @@ async def init_db() -> None:
         logger.info(f"Creating tables: {Base.metadata.tables.keys()}")
         await conn.run_sync(Base.metadata.create_all)
     logger.info(f"Database initialized with URL: {DATABASE_URL}")
+
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Dependency for getting DB session."""

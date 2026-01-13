@@ -1,5 +1,6 @@
 """Fix handlers.py to add Cancel button and update Poll button emoji."""
-with open('src/bot/handlers.py', 'r', encoding='utf-8') as f:
+
+with open("src/bot/handlers.py", encoding="utf-8") as f:
     content = f.read()
 
 # Fix any remaining old poll buttons to use blue circle
@@ -15,32 +16,34 @@ import re
 # Pattern: [InlineKeyboardButton(...Poll...)] followed by \n    ] (end of keyboard array)
 
 # Match the last Poll button in a keyboard array that doesn't have Cancel
-lines = content.split('\n')
+lines = content.split("\n")
 new_lines = []
 i = 0
 while i < len(lines):
     line = lines[i]
     # Check if this is a Poll button line (any emoji variant)
-    if 'Poll' in line and 'callback_data="start_poll"' in line:
+    if "Poll" in line and 'callback_data="start_poll"' in line:
         # Make sure it uses the blue circle emoji
         line = re.sub(r'"\S* Poll"', '"🔵 Poll"', line)
         # Check if next line is ]    (end of keyboard)
-        if i + 1 < len(lines) and lines[i + 1].strip() == ']':
+        if i + 1 < len(lines) and lines[i + 1].strip() == "]":
             # Add comma to the poll line if not present
-            if not line.rstrip().endswith(','):
-                line = line.rstrip() + ','
+            if not line.rstrip().endswith(","):
+                line = line.rstrip() + ","
             new_lines.append(line)
             # Add cancel button before the closing ]
             indent = len(line) - len(line.lstrip())
-            new_lines.append(' ' * indent + '[InlineKeyboardButton("❌ Cancel", callback_data="cancel_night")]')
+            new_lines.append(
+                " " * indent + '[InlineKeyboardButton("❌ Cancel", callback_data="cancel_night")]'
+            )
             i += 1
             continue
     new_lines.append(line)
     i += 1
 
-content = '\n'.join(new_lines)
+content = "\n".join(new_lines)
 
-with open('src/bot/handlers.py', 'w', encoding='utf-8') as f:
+with open("src/bot/handlers.py", "w", encoding="utf-8") as f:
     f.write(content)
 
-print('Done! Updated Poll buttons and added Cancel buttons where missing.')
+print("Done! Updated Poll buttons and added Cancel buttons where missing.")
