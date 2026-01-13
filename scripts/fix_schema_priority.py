@@ -1,8 +1,10 @@
 import asyncio
-import aiosqlite
 import os
 
+import aiosqlite
+
 DB_PATH = "game_night.db"
+
 
 async def fix_schema():
     if not os.path.exists(DB_PATH):
@@ -15,7 +17,7 @@ async def fix_schema():
         async with db.execute("PRAGMA table_info(collection)") as cursor:
             columns = await cursor.fetchall()
             column_names = [col[1] for col in columns]
-            
+
         if "is_priority" in column_names:
             print("Column 'is_priority' already exists. No action needed.")
         else:
@@ -26,6 +28,7 @@ async def fix_schema():
                 print("Successfully added 'is_priority' column.")
             except Exception as e:
                 print(f"Error adding column: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(fix_schema())

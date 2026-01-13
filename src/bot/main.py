@@ -7,23 +7,35 @@ from dotenv import load_dotenv
 # Load env vars first
 load_dotenv()
 
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler
 
-from src.core.db import init_db
 from src.bot.handlers import (
-    start, set_bgg, start_night, join_lobby_callback, leave_lobby_callback, create_poll,
-    mark_played, exclude_game, priority_game, add_game, test_mode,
-    add_guest, guest_game, priority_select_callback,
-    resume_night_callback, restart_night_callback, start_poll_callback, cancel_night_callback
+    add_game,
+    add_guest,
+    cancel_night_callback,
+    create_poll,
+    exclude_game,
+    guest_game,
+    join_lobby_callback,
+    leave_lobby_callback,
+    mark_played,
+    priority_game,
+    priority_select_callback,
+    restart_night_callback,
+    resume_night_callback,
+    set_bgg,
+    start,
+    start_night,
+    start_poll_callback,
+    test_mode,
 )
-
-
+from src.core.db import init_db
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
 
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -62,6 +74,7 @@ def main():
 
     logger.info("Bot is polling...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

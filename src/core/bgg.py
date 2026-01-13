@@ -1,7 +1,6 @@
 import logging
 import os
 import xml.etree.ElementTree as ET
-from typing import List, Optional
 
 import httpx
 
@@ -11,9 +10,10 @@ logger = logging.getLogger(__name__)
 
 BGG_API_TOKEN = os.getenv("BGG_API_TOKEN")
 
+
 class BGGClient:
     BASE_URL = "https://boardgamegeek.com/xmlapi2"
-    
+
     def _get_headers(self) -> dict:
         """Get headers for BGG API requests."""
         headers = {
@@ -23,14 +23,14 @@ class BGGClient:
             headers["Authorization"] = f"Bearer {BGG_API_TOKEN}"
         return headers
 
-    async def fetch_collection(self, username: str, exclude_expansions: bool = True) -> List[Game]:
+    async def fetch_collection(self, username: str, exclude_expansions: bool = True) -> list[Game]:
         """
         Fetch a user's collection from BGG.
-        
+
         Args:
             username: BGG Username
             exclude_expansions: If True, filters out items with subtype 'boardgameexpansion'
-            
+
         Returns:
             List of Game objects
         """
@@ -47,34 +47,39 @@ class BGGClient:
             for attempt in range(5):  # Try up to 5 times
                 try:
                     response = await client.get(
-                        f"{self.BASE_URL}/collection", 
-                        params=params, 
+                        f"{self.BASE_URL}/collection",
+                        params=params,
                         headers=self._get_headers(),
-                        timeout=30.0 # Increased timeout
+                        timeout=30.0,  # Increased timeout
                     )
-                    
+
                     # Check specific status codes before raising
                     if response.status_code == 202:
                         wait_time = (attempt + 1) * 2  # 2, 4, 6, 8 seconds
                         if attempt < 4:
-                            logger.warning(f"BGG returned 202 (Queued) for {username}. Retrying in {wait_time}s...")
+                            logger.warning(
+                                f"BGG returned 202 (Queued) for {username}. Retrying in {wait_time}s..."
+                            )
                             # Use asyncio.sleep
                             import asyncio
+
                             await asyncio.sleep(wait_time)
                             continue
                         else:
-                            logger.warning(f"BGG returned 202 (Queued) for {username} after retries.")
+                            logger.warning(
+                                f"BGG returned 202 (Queued) for {username} after retries."
+                            )
                             return []
-                    
+
                     if response.status_code == 404:
                         logger.warning(f"BGG user not found: {username}")
                         raise ValueError(f"User '{username}' not found on BoardGameGeek")
-                    
+
                     # Raise for any other non-2xx status
                     response.raise_for_status()
-                    
+
                     return self._parse_collection_xml(response.content)
-                    
+
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404:
                         logger.warning(f"BGG user not found: {username}")
@@ -86,9 +91,9 @@ class BGGClient:
                     raise
             return []
 
-    def _parse_collection_xml(self, xml_content: bytes) -> List[Game]:
+    def _parse_collection_xml(self, xml_content: bytes) -> list[Game]:
         root = ET.fromstring(xml_content)
-        games: List[Game] = []
+        games: list[Game] = []
 
         for item in root.findall("item"):
             try:
@@ -96,7 +101,7 @@ class BGGClient:
                 stats = item.find("stats")
                 if stats is None:
                     continue
-                
+
                 # Check ownership again to be safe
                 status = item.find("status")
                 if status is not None and status.get("own") != "1":
@@ -104,19 +109,21 @@ class BGGClient:
 
                 bgg_id = int(item.get("objectid", 0))
                 name = item.find("name").text if item.find("name") is not None else "Unknown"
-                thumbnail = item.find("thumbnail").text if item.find("thumbnail") is not None else None
-                
+                thumbnail = (
+                    item.find("thumbnail").text if item.find("thumbnail") is not None else None
+                )
+
                 min_players = int(stats.get("minplayers", 1))
                 max_players = int(stats.get("maxplayers", 1))
                 playing_time = int(stats.get("playingtime", 0))
-                
+
                 # Complexity (averageweight)
                 rating = stats.find("rating")
                 complexity = 0.0
                 if rating is not None:
                     avg_weight = rating.find("averageweight")
                     if avg_weight is not None:
-                         # Handle '0' or None
+                        # Handle '0' or None
                         try:
                             complexity = float(avg_weight.get("value", 0))
                         except ValueError:
@@ -129,24 +136,24 @@ class BGGClient:
                     max_players=max_players,
                     playing_time=playing_time,
                     complexity=complexity,
-                    thumbnail=thumbnail
+                    thumbnail=thumbnail,
                 )
                 games.append(game)
-                
+
             except (ValueError, AttributeError) as e:
                 logger.warning(f"Failed to parse item {item.get('objectid')}: {e}")
                 continue
-                
+
         return games
 
-    async def search_games(self, query: str, limit: int = 5) -> List[dict]:
+    async def search_games(self, query: str, limit: int = 5) -> list[dict]:
         """
         Search for board games on BGG by name.
-        
+
         Args:
             query: Search string (game name)
             limit: Maximum number of results to return (default 5)
-            
+
         Returns:
             List of dicts: [{id, name, year_published}, ...]
         """
@@ -154,27 +161,27 @@ class BGGClient:
             "query": query,
             "type": "boardgame",
         }
-        
+
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(
                     f"{self.BASE_URL}/search",
                     params=params,
                     headers=self._get_headers(),
-                    timeout=10.0
+                    timeout=10.0,
                 )
                 response.raise_for_status()
-                
+
                 return self._parse_search_xml(response.content, limit)
             except httpx.HTTPError as e:
                 logger.error(f"Error searching BGG for '{query}': {e}")
                 return []
-    
-    def _parse_search_xml(self, xml_content: bytes, limit: int) -> List[dict]:
+
+    def _parse_search_xml(self, xml_content: bytes, limit: int) -> list[dict]:
         """Parse BGG search XML response."""
         root = ET.fromstring(xml_content)
-        results: List[dict] = []
-        
+        results: list[dict] = []
+
         for item in root.findall("item")[:limit]:
             try:
                 bgg_id = int(item.get("id", 0))
@@ -182,25 +189,21 @@ class BGGClient:
                 name = name_elem.get("value", "Unknown") if name_elem is not None else "Unknown"
                 year_elem = item.find("yearpublished")
                 year = year_elem.get("value") if year_elem is not None else None
-                
-                results.append({
-                    "id": bgg_id,
-                    "name": name,
-                    "year_published": year
-                })
+
+                results.append({"id": bgg_id, "name": name, "year_published": year})
             except (ValueError, AttributeError) as e:
                 logger.warning(f"Failed to parse search item: {e}")
                 continue
-                
+
         return results
-    
-    async def get_game_details(self, bgg_id: int) -> Optional[Game]:
+
+    async def get_game_details(self, bgg_id: int) -> Game | None:
         """
         Fetch full game details from BGG by ID.
-        
+
         Args:
             bgg_id: BoardGameGeek game ID
-            
+
         Returns:
             Game object with full stats, or None if fetch fails
         """
@@ -208,30 +211,30 @@ class BGGClient:
             "id": bgg_id,
             "stats": 1,
         }
-        
+
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(
                     f"{self.BASE_URL}/thing",
                     params=params,
                     headers=self._get_headers(),
-                    timeout=10.0
+                    timeout=10.0,
                 )
                 response.raise_for_status()
-                
+
                 return self._parse_thing_xml(response.content, bgg_id)
             except httpx.HTTPError as e:
                 logger.error(f"Error fetching BGG game details for ID {bgg_id}: {e}")
                 return None
-    
-    def _parse_thing_xml(self, xml_content: bytes, bgg_id: int) -> Optional[Game]:
+
+    def _parse_thing_xml(self, xml_content: bytes, bgg_id: int) -> Game | None:
         """Parse BGG thing XML response."""
         root = ET.fromstring(xml_content)
         item = root.find("item")
-        
+
         if item is None:
             return None
-            
+
         try:
             # Get primary name
             name = "Unknown"
@@ -239,18 +242,24 @@ class BGGClient:
                 if name_elem.get("type") == "primary":
                     name = name_elem.get("value", "Unknown")
                     break
-            
+
             # Get basic info
             min_players_elem = item.find("minplayers")
             max_players_elem = item.find("maxplayers")
             playing_time_elem = item.find("playingtime")
             thumbnail_elem = item.find("thumbnail")
-            
-            min_players = int(min_players_elem.get("value", 1)) if min_players_elem is not None else 1
-            max_players = int(max_players_elem.get("value", 1)) if max_players_elem is not None else 6
-            playing_time = int(playing_time_elem.get("value", 0)) if playing_time_elem is not None else 0
+
+            min_players = (
+                int(min_players_elem.get("value", 1)) if min_players_elem is not None else 1
+            )
+            max_players = (
+                int(max_players_elem.get("value", 1)) if max_players_elem is not None else 6
+            )
+            playing_time = (
+                int(playing_time_elem.get("value", 0)) if playing_time_elem is not None else 0
+            )
             thumbnail = thumbnail_elem.text if thumbnail_elem is not None else None
-            
+
             # Complexity (averageweight) from statistics
             complexity = 0.0
             stats = item.find("statistics")
@@ -271,9 +280,8 @@ class BGGClient:
                 max_players=max_players,
                 playing_time=playing_time,
                 complexity=complexity,
-                thumbnail=thumbnail
+                thumbnail=thumbnail,
             )
         except (ValueError, AttributeError) as e:
             logger.warning(f"Failed to parse thing item {bgg_id}: {e}")
             return None
-
