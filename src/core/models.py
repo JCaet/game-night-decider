@@ -102,3 +102,34 @@ class SessionPlayer(Base):
     # Relationships
     session: Mapped["Session"] = relationship(back_populates="players")
     user: Mapped["User"] = relationship(lazy="joined")
+
+
+class GameNightPoll(Base):
+    """Track active polls for a session"""
+
+    __tablename__ = "game_night_polls"
+
+    poll_id: Mapped[str] = mapped_column(String, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(ForeignKey("sessions.chat_id"))
+    message_id: Mapped[int] = mapped_column(Integer)
+
+    # Relationships
+    votes: Mapped[list["PollVote"]] = relationship(
+        back_populates="poll", cascade="all, delete-orphan"
+    )
+
+
+class PollVote(Base):
+    """Track who voted in a poll"""
+
+    __tablename__ = "poll_votes"
+
+    poll_id: Mapped[str] = mapped_column(
+        ForeignKey("game_night_polls.poll_id"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_name: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # Relationships
+    poll: Mapped["GameNightPoll"] = relationship(back_populates="votes")
+

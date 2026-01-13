@@ -150,3 +150,11 @@ cython_debug/
 .idea/
 .vscode/
 *.swp
+
+# Project specific
+*_fail.txt
+fail_log.txt
+test_output.txt
+test_results.txt
+ruff_errors.txt
+game_night.db
