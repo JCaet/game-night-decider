@@ -1,9 +1,9 @@
 import logging
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from unittest.mock import AsyncMock, MagicMock
-from telegram import Update, Message, CallbackQuery
+from telegram import CallbackQuery, Message, Update
 from telegram.ext import ContextTypes
 
 from src.core import db
@@ -69,6 +69,13 @@ def mock_context():
     """Create a mock Telegram Context object."""
     context = MagicMock(spec=ContextTypes.DEFAULT_TYPE)
     context.bot.send_message = AsyncMock()
-    context.bot.send_poll = AsyncMock()
+
+    # Configure send_poll to return a proper mock with poll.id
+    mock_poll_message = MagicMock()
+    mock_poll_message.poll.id = "test_poll_id"
+    mock_poll_message.message_id = 999
+    context.bot.send_poll = AsyncMock(return_value=mock_poll_message)
+
     context.args = []
     return context
+
