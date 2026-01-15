@@ -5,7 +5,7 @@ from sqlalchemy import select
 
 from src.bot.handlers import add_game, set_bgg
 from src.core import db
-from src.core.models import Collection, Game, User
+from src.core.models import Collection, Game, GameState, User
 
 # ============================================================================
 # /setbgg command tests
@@ -33,6 +33,7 @@ async def test_setbgg_creates_user(mock_update, mock_context):
     with patch("src.bot.handlers.BGGClient") as MockBGG:
         mock_client = MockBGG.return_value
         mock_client.fetch_collection = AsyncMock(return_value=[])
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
 
         await set_bgg(mock_update, mock_context)
 
@@ -97,6 +98,7 @@ async def test_setbgg_resync_adds_new_games(mock_update, mock_context):
     with patch("src.bot.handlers.BGGClient") as MockBGG:
         mock_client = MockBGG.return_value
         mock_client.fetch_collection = AsyncMock(return_value=mock_games)
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
 
         await set_bgg(mock_update, mock_context)
 
@@ -109,7 +111,9 @@ async def test_setbgg_resync_adds_new_games(mock_update, mock_context):
 
     # Verify feedback message mentions new game
     calls = [call[0][0] for call in mock_update.message.reply_text.call_args_list]
-    success_msg = calls[-1]  # Last message should be success
+    # Find the game sync message (contains "games total")
+    success_msg = next((c for c in calls if "games total" in c), None)
+    assert success_msg is not None
     assert "3 games total" in success_msg
     assert "1 new" in success_msg
 
@@ -145,6 +149,7 @@ async def test_setbgg_resync_removes_deleted_games(mock_update, mock_context):
     with patch("src.bot.handlers.BGGClient") as MockBGG:
         mock_client = MockBGG.return_value
         mock_client.fetch_collection = AsyncMock(return_value=mock_games)
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
 
         await set_bgg(mock_update, mock_context)
 
@@ -157,7 +162,9 @@ async def test_setbgg_resync_removes_deleted_games(mock_update, mock_context):
 
     # Verify feedback message mentions removed game
     calls = [call[0][0] for call in mock_update.message.reply_text.call_args_list]
-    success_msg = calls[-1]
+    # Find the game sync message (contains "games total")
+    success_msg = next((c for c in calls if "games total" in c), None)
+    assert success_msg is not None
     assert "2 games total" in success_msg
     assert "1 removed" in success_msg
 
@@ -191,12 +198,15 @@ async def test_setbgg_resync_no_changes(mock_update, mock_context):
     with patch("src.bot.handlers.BGGClient") as MockBGG:
         mock_client = MockBGG.return_value
         mock_client.fetch_collection = AsyncMock(return_value=mock_games)
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
 
         await set_bgg(mock_update, mock_context)
 
     # Verify feedback message shows no changes
     calls = [call[0][0] for call in mock_update.message.reply_text.call_args_list]
-    success_msg = calls[-1]
+    # Find the game sync message (contains "games total")
+    success_msg = next((c for c in calls if "games total" in c), None)
+    assert success_msg is not None
     assert "2 games total" in success_msg
     assert "no changes" in success_msg
 
@@ -216,16 +226,19 @@ async def test_setbgg_initial_sync_feedback(mock_update, mock_context):
     with patch("src.bot.handlers.BGGClient") as MockBGG:
         mock_client = MockBGG.return_value
         mock_client.fetch_collection = AsyncMock(return_value=mock_games)
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
 
         await set_bgg(mock_update, mock_context)
 
-    # Verify feedback messages
+    # Verify feedback messages (4 messages: initial, sync result, expansion sync, expansion result)
     calls = [call[0][0] for call in mock_update.message.reply_text.call_args_list]
-    assert len(calls) == 2
+    assert len(calls) == 4
     assert "Fetching collection..." in calls[0]
-    success_msg = calls[1]
-    assert "3 games total" in success_msg
-    assert "3 new" in success_msg
+    # Find the game sync message (contains "games total")
+    game_sync_msg = next((c for c in calls if "games total" in c), None)
+    assert game_sync_msg is not None
+    assert "3 games total" in game_sync_msg
+    assert "3 new" in game_sync_msg
 
 
 # ============================================================================
@@ -410,3 +423,153 @@ async def test_addgame_uses_cache(mock_update, mock_context):
 
 
 
+
+# ============================================================================
+# Auto-Star Feature Tests
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_setbgg_incremental_sync_auto_stars_new_games(mock_update, mock_context):
+    """Test /setbgg incremental sync marks NEW games as STARRED."""
+    mock_context.args = ["testuser"]
+
+    # Setup: User has existing games (first sync happened long ago)
+    async with db.AsyncSessionLocal() as session:
+        user = User(telegram_id=111, telegram_name="TestUser", bgg_username="testuser")
+        session.add(user)
+        # Existing game
+        g1 = Game(id=1, name="OldGame", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+        session.add(g1)
+        # Existing collection entry (normal state)
+        c1 = Collection(user_id=111, game_id=1, state=GameState.INCLUDED)
+        session.add(c1)
+        await session.commit()
+
+    # Mock BGG: OldGame + NewGame
+    g2 = Game(id=2, name="NewGame", min_players=2, max_players=4, playing_time=60, complexity=2.5)
+    mock_games = [
+        Game(id=1, name="OldGame", min_players=2, max_players=4, playing_time=60, complexity=2.0),
+        g2,
+    ]
+
+    with patch("src.bot.handlers.BGGClient") as MockBGG:
+        mock_client = MockBGG.return_value
+        mock_client.fetch_collection = AsyncMock(return_value=mock_games)
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
+
+        await set_bgg(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        # Check OldGame is still INCLUDED (not changed)
+        # Check OldGame is still INCLUDED (not changed)
+        stmt = select(Collection).where(Collection.user_id == 111, Collection.game_id == 1)
+        c1 = (await session.execute(stmt)).scalar_one()
+        assert c1.state == GameState.INCLUDED
+
+        # Check NewGame is STARRED
+        stmt = select(Collection).where(Collection.user_id == 111, Collection.game_id == 2)
+        c2 = (await session.execute(stmt)).scalar_one()
+        assert c2.state == GameState.STARRED
+
+
+@pytest.mark.asyncio
+async def test_setbgg_first_sync_no_auto_star(mock_update, mock_context):
+    """Test /setbgg first-time sync does NOT auto-star games."""
+    mock_context.args = ["newuser"]
+
+    # No existing user/collection
+
+    mock_games = [
+        Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.0),
+        Game(id=2, name="Game2", min_players=2, max_players=4, playing_time=60, complexity=2.0),
+    ]
+
+    with patch("src.bot.handlers.BGGClient") as MockBGG:
+        mock_client = MockBGG.return_value
+        mock_client.fetch_collection = AsyncMock(return_value=mock_games)
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
+
+        await set_bgg(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        stmt = select(Collection).where(Collection.user_id == 111)
+        cols = (await session.execute(stmt)).scalars().all()
+        assert len(cols) == 2
+        for c in cols:
+            assert c.state == GameState.INCLUDED  # Not starred
+
+
+@pytest.mark.asyncio
+async def test_setbgg_force_sync_no_auto_star(mock_update, mock_context):
+    """Test /setbgg force sync does NOT auto-star new games."""
+    mock_context.args = ["testuser", "force"]
+
+    # Setup: User has existing games
+    async with db.AsyncSessionLocal() as session:
+        user = User(telegram_id=111, telegram_name="TestUser", bgg_username="testuser")
+        session.add(user)
+        g1 = Game(id=1, name="OldGame", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+        session.add(g1)
+        c1 = Collection(user_id=111, game_id=1, state=GameState.INCLUDED)
+        session.add(c1)
+        await session.commit()
+
+    # Mock BGG: OldGame + NewGame (NewGame found during Force Sync shouldn't star)
+    # Actually, rationale says "during a first sync or force sync... shouldn't all be starred"
+    # Wait, if I do a force sync and a NEW game appears, should it be starred?
+    # Rationale: "Force sync... importing entire existing collection... shouldn't all be starred".
+    # Logic implemented: should_auto_star = not is_first_sync and not force_update
+    # So ANY force sync disables auto-starring, even for new games found during it. This matches requirement.
+
+    g2 = Game(id=2, name="NewGame", min_players=2, max_players=4, playing_time=60, complexity=2.5)
+    mock_games = [
+        Game(id=1, name="OldGame", min_players=2, max_players=4, playing_time=60, complexity=2.0),
+        g2,
+    ]
+
+    with patch("src.bot.handlers.BGGClient") as MockBGG:
+        mock_client = MockBGG.return_value
+        mock_client.fetch_collection = AsyncMock(return_value=mock_games)
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
+
+        await set_bgg(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        # Check NewGame is INCLUDED (not starred)
+        stmt = select(Collection).where(Collection.user_id == 111, Collection.game_id == 2)
+        c2 = (await session.execute(stmt)).scalar_one()
+        assert c2.state == GameState.INCLUDED
+
+
+@pytest.mark.asyncio
+async def test_addgame_manual_auto_stars(mock_update, mock_context):
+    """Test /addgame manual entry auto-stars the game."""
+    mock_context.args = ["ManualGame", "2", "4", "2.0"] # Manual args
+
+    with patch("src.bot.handlers.BGGClient") as MockBGG:
+        await add_game(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        stmt = select(Collection).join(Game).where(Game.name == "ManualGame")
+        col = (await session.execute(stmt)).scalar_one()
+        assert col.state == GameState.STARRED
+
+
+@pytest.mark.asyncio
+async def test_addgame_bgg_search_auto_stars(mock_update, mock_context):
+    """Test /addgame BGG search auto-stars the game."""
+    mock_context.args = ["SearchGame"]
+
+    mock_game = Game(id=100, name="SearchGame", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+
+    with patch("src.bot.handlers.BGGClient") as MockBGG:
+        mock_client = MockBGG.return_value
+        mock_client.search_games = AsyncMock(return_value=[{"id": 100, "name": "SearchGame"}])
+        mock_client.get_game_details = AsyncMock(return_value=mock_game)
+
+        await add_game(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        stmt = select(Collection).where(Collection.game_id == 100)
+        col = (await session.execute(stmt)).scalar_one()
+        assert col.state == GameState.STARRED
