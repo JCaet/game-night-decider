@@ -116,6 +116,8 @@ class BGGClient:
                 min_players = int(stats.get("minplayers", 1))
                 max_players = int(stats.get("maxplayers", 1))
                 playing_time = int(stats.get("playingtime", 0))
+                min_playing_time = int(stats.get("minplaytime", 0)) or None
+                max_playing_time = int(stats.get("maxplaytime", 0)) or None
 
                 # Complexity (averageweight)
                 rating = stats.find("rating")
@@ -135,6 +137,8 @@ class BGGClient:
                     min_players=min_players,
                     max_players=max_players,
                     playing_time=playing_time,
+                    min_playing_time=min_playing_time,
+                    max_playing_time=max_playing_time,
                     complexity=complexity,
                     thumbnail=thumbnail,
                 )
@@ -247,6 +251,8 @@ class BGGClient:
             min_players_elem = item.find("minplayers")
             max_players_elem = item.find("maxplayers")
             playing_time_elem = item.find("playingtime")
+            min_playtime_elem = item.find("minplaytime")
+            max_playtime_elem = item.find("maxplaytime")
             thumbnail_elem = item.find("thumbnail")
 
             min_players = (
@@ -258,6 +264,12 @@ class BGGClient:
             playing_time = (
                 int(playing_time_elem.get("value", 0)) if playing_time_elem is not None else 0
             )
+            min_playing_time = (
+                int(min_playtime_elem.get("value", 0)) if min_playtime_elem is not None else None
+            ) or None
+            max_playing_time = (
+                int(max_playtime_elem.get("value", 0)) if max_playtime_elem is not None else None
+            ) or None
             thumbnail = thumbnail_elem.text if thumbnail_elem is not None else None
 
             # Complexity (averageweight) from statistics
@@ -279,6 +291,8 @@ class BGGClient:
                 min_players=min_players,
                 max_players=max_players,
                 playing_time=playing_time,
+                min_playing_time=min_playing_time,
+                max_playing_time=max_playing_time,
                 complexity=complexity,
                 thumbnail=thumbnail,
             )

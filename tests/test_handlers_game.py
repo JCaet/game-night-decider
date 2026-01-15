@@ -3,12 +3,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import select
 
-from src.bot.handlers import (
-    add_game,
-    exclude_game,
-    mark_played,
-    set_bgg,
-)
+from src.bot.handlers import add_game, set_bgg
 from src.core import db
 from src.core.models import Collection, Game, User
 
@@ -414,111 +409,4 @@ async def test_addgame_uses_cache(mock_update, mock_context):
         assert col is not None
 
 
-# ============================================================================
-# /markplayed command tests
-# ============================================================================
 
-
-@pytest.mark.asyncio
-async def test_markplayed_no_args(mock_update, mock_context):
-    """Test /markplayed without args shows usage."""
-    mock_context.args = []
-    await mark_played(mock_update, mock_context)
-
-    mock_update.message.reply_text.assert_called_with("Usage: /markplayed <game name>")
-
-
-@pytest.mark.asyncio
-async def test_markplayed_game_not_found(mock_update, mock_context):
-    """Test /markplayed with nonexistent game."""
-    mock_context.args = ["NonexistentGame"]
-    await mark_played(mock_update, mock_context)
-
-    mock_update.message.reply_text.assert_called_with("Game not found.")
-
-
-@pytest.mark.asyncio
-async def test_markplayed_multiple_matches(mock_update, mock_context):
-    """Test /markplayed with ambiguous name."""
-    async with db.AsyncSessionLocal() as session:
-        g1 = Game(id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0)
-        g2 = Game(
-            id=2,
-            name="Catan: Cities",
-            min_players=2,
-            max_players=4,
-            playing_time=60,
-            complexity=2.5,
-        )
-        session.add_all([g1, g2])
-        await session.commit()
-
-    mock_context.args = ["Catan"]
-    await mark_played(mock_update, mock_context)
-
-    call_args = mock_update.message.reply_text.call_args[0][0]
-    assert "Found multiple games" in call_args
-
-
-# ============================================================================
-# /exclude command tests
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_exclude_no_args(mock_update, mock_context):
-    """Test /exclude without args shows usage."""
-    mock_context.args = []
-    await exclude_game(mock_update, mock_context)
-
-    mock_update.message.reply_text.assert_called_with("Usage: /exclude <game name>")
-
-
-@pytest.mark.asyncio
-async def test_exclude_toggles_state(mock_update, mock_context):
-    """Test /exclude toggles exclusion state."""
-    async with db.AsyncSessionLocal() as session:
-        user = User(telegram_id=111, telegram_name="Test")
-        session.add(user)
-        game = Game(
-            id=1, name="TestGame", min_players=2, max_players=4, playing_time=60, complexity=2.0
-        )
-        session.add(game)
-        await session.flush()
-        col = Collection(user_id=111, game_id=1, is_excluded=False)
-        session.add(col)
-        await session.commit()
-
-    mock_context.args = ["TestGame"]
-
-    # First call: exclude
-    await exclude_game(mock_update, mock_context)
-    async with db.AsyncSessionLocal() as session:
-        stmt = select(Collection).where(Collection.user_id == 111, Collection.game_id == 1)
-        col = (await session.execute(stmt)).scalar_one()
-        assert col.is_excluded is True
-
-    # Second call: include
-    await exclude_game(mock_update, mock_context)
-    async with db.AsyncSessionLocal() as session:
-        stmt = select(Collection).where(Collection.user_id == 111, Collection.game_id == 1)
-        col = (await session.execute(stmt)).scalar_one()
-        assert col.is_excluded is False
-
-
-@pytest.mark.asyncio
-async def test_exclude_not_owned(mock_update, mock_context):
-    """Test /exclude on game not in collection."""
-    async with db.AsyncSessionLocal() as session:
-        user = User(telegram_id=111, telegram_name="Test")
-        session.add(user)
-        game = Game(
-            id=1, name="OtherGame", min_players=2, max_players=4, playing_time=60, complexity=2.0
-        )
-        session.add(game)
-        await session.commit()
-
-    mock_context.args = ["OtherGame"]
-    await exclude_game(mock_update, mock_context)
-
-    mock_update.message.reply_text.assert_called_with("You don't own this game.")

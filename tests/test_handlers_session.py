@@ -10,7 +10,7 @@ from src.bot.handlers import (
     start_night,
 )
 from src.core import db
-from src.core.models import Collection, Game, Session, SessionPlayer, User
+from src.core.models import Collection, Game, GameState, Session, SessionPlayer, User
 
 # ============================================================================
 # /gamenight command tests
@@ -681,8 +681,8 @@ async def test_poll_excludes_excluded_games(mock_update, mock_context):
         await session.flush()
 
         # Both users have excluded the game
-        c1 = Collection(user_id=111, game_id=1, is_excluded=True)
-        c2 = Collection(user_id=222, game_id=1, is_excluded=True)
+        c1 = Collection(user_id=111, game_id=1, state=GameState.EXCLUDED)
+        c2 = Collection(user_id=222, game_id=1, state=GameState.EXCLUDED)
         session.add_all([c1, c2])
 
         sp1 = SessionPlayer(session_id=12345, user_id=111)

@@ -5,7 +5,15 @@ import pytest
 
 from src.bot.handlers import receive_poll_answer
 from src.core import db
-from src.core.models import Collection, Game, GameNightPoll, Session, SessionPlayer, User
+from src.core.models import (
+    Collection,
+    Game,
+    GameNightPoll,
+    GameState,
+    Session,
+    SessionPlayer,
+    User,
+)
 
 
 @pytest.mark.asyncio
@@ -29,9 +37,9 @@ async def test_weighted_voting_logic(mock_update, mock_context):
 
         # Collections - Only User1 starred Game2
         c1 = Collection(user_id=111, game_id=1)
-        c2 = Collection(user_id=111, game_id=2, is_priority=True) # User1 starred Game2
+        c2 = Collection(user_id=111, game_id=2, state=GameState.STARRED)  # User1 starred Game2
         c3 = Collection(user_id=222, game_id=1)
-        c4 = Collection(user_id=222, game_id=2) # User2 did NOT star Game2
+        c4 = Collection(user_id=222, game_id=2)  # User2 did NOT star Game2
         session.add_all([c1, c2, c3, c4])
 
         # Session with weighted ON
@@ -116,11 +124,11 @@ async def test_per_user_star_boost(mock_update, mock_context):
 
         # All 3 players star Game2
         c1 = Collection(user_id=301, game_id=101)
-        c2 = Collection(user_id=301, game_id=102, is_priority=True)
+        c2 = Collection(user_id=301, game_id=102, state=GameState.STARRED)
         c3 = Collection(user_id=302, game_id=101)
-        c4 = Collection(user_id=302, game_id=102, is_priority=True)
+        c4 = Collection(user_id=302, game_id=102, state=GameState.STARRED)
         c5 = Collection(user_id=303, game_id=101)
-        c6 = Collection(user_id=303, game_id=102, is_priority=True)
+        c6 = Collection(user_id=303, game_id=102, state=GameState.STARRED)
         session.add_all([c1, c2, c3, c4, c5, c6])
 
         s = Session(chat_id=chat_id, is_active=True, settings_weighted=True)

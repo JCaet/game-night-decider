@@ -8,7 +8,7 @@ MOCK_BGG_XML = b"""
     <item objectid="1" subtype="boardgame" collid="1">
         <name sortindex="1">Catan</name>
         <yearpublished>1995</yearpublished>
-        <stats minplayers="3" maxplayers="4" playingtime="60">
+        <stats minplayers="3" maxplayers="4" playingtime="60" minplaytime="45" maxplaytime="90">
             <rating value="NULL">
                 <usersrated value="100"/>
                 <average value="7.5"/>
@@ -54,6 +54,8 @@ async def test_parse_collection_xml():
     assert catan.complexity == 2.32
     assert catan.thumbnail == "http://example.com/catan.jpg"
     assert catan.id == 1
+    assert catan.min_playing_time == 45
+    assert catan.max_playing_time == 90
 
     # Check Expansion
     expansion = games[1]
@@ -132,6 +134,8 @@ def test_parse_thing_xml():
     assert game.min_players == 3
     assert game.max_players == 4
     assert game.playing_time == 60
+    assert game.min_playing_time == 60
+    assert game.max_playing_time == 120
     assert game.complexity == 2.32
     assert game.thumbnail == "https://example.com/catan_thumb.jpg"
 

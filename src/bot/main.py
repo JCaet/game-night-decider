@@ -16,13 +16,11 @@ from src.bot.handlers import (
     cancel_night_callback,
     create_poll,
     guest_game,
+    help_command,
     join_lobby_callback,
     leave_lobby_callback,
     manage_collection,
     manage_collection_callback,
-    mark_played,
-    priority_game,
-    priority_select_callback,
     receive_poll_answer,
     restart_night_callback,
     resume_night_callback,
@@ -55,8 +53,7 @@ def main():
     app.add_handler(CommandHandler("addgame", add_game))
     app.add_handler(CommandHandler("gamenight", start_night))
     app.add_handler(CommandHandler("poll", create_poll))
-    app.add_handler(CommandHandler("markplayed", mark_played))
-    app.add_handler(CommandHandler("priority", priority_game))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("testmode", test_mode))
     app.add_handler(CommandHandler("addguest", add_guest))
     app.add_handler(CommandHandler("guestgame", guest_game))
@@ -69,7 +66,6 @@ def main():
     app.add_handler(CallbackQueryHandler(start_poll_callback, pattern="^start_poll$"))
     app.add_handler(CallbackQueryHandler(cancel_night_callback, pattern="^cancel_night$"))
     app.add_handler(CallbackQueryHandler(toggle_weights_callback, pattern="^toggle_weights$"))
-    app.add_handler(CallbackQueryHandler(priority_select_callback, pattern="^prio:"))
     app.add_handler(CallbackQueryHandler(manage_collection_callback, pattern="^manage:"))
     app.add_handler(PollAnswerHandler(receive_poll_answer))
 

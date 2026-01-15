@@ -37,14 +37,13 @@ logger = logging.getLogger(__name__)
 # Commands shown in the Telegram menu (max 100 commands, each max 32 chars)
 BOT_COMMANDS = [
     BotCommand("start", "Welcome message and command list"),
+    BotCommand("help", "Show all available commands"),
     BotCommand("setbgg", "Link your BoardGameGeek account"),
     BotCommand("addgame", "Manually add a game to your collection"),
-    BotCommand("manage", "Toggle game availability for game nights"),
+    BotCommand("manage", "Manage collection (⬜→🌟→❌ cycle)"),
     BotCommand("gamenight", "Start a new game night lobby"),
     BotCommand("cancel", "Cancel the current game night"),
     BotCommand("poll", "Generate polls based on lobby"),
-    BotCommand("markplayed", "Mark a game as played"),
-    BotCommand("priority", "Toggle priority status on a game"),
     BotCommand("addguest", "Add a guest player to game night"),
     BotCommand("guestgame", "Add a game for a guest"),
     BotCommand("testmode", "Add fake test users [count]"),

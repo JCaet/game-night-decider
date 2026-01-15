@@ -30,7 +30,9 @@ class Game(Base):
     name: Mapped[str] = mapped_column(String, index=True)
     min_players: Mapped[int] = mapped_column(Integer)
     max_players: Mapped[int] = mapped_column(Integer)
-    playing_time: Mapped[int] = mapped_column(Integer)  # in minutes
+    playing_time: Mapped[int] = mapped_column(Integer)  # in minutes (typical)
+    min_playing_time: Mapped[int | None] = mapped_column(Integer, nullable=True)  # in minutes
+    max_playing_time: Mapped[int | None] = mapped_column(Integer, nullable=True)  # in minutes
     complexity: Mapped[float] = mapped_column(Float)  # BGG Weight (1-5)
     thumbnail: Mapped[str | None] = mapped_column(String, nullable=True)
 
@@ -57,6 +59,14 @@ class User(Base):
     )
 
 
+class GameState:
+    """Game collection states for the 3-state cycle."""
+
+    INCLUDED = 0  # ⬜ Normal game, available for polls
+    STARRED = 1   # 🌟 Priority game, gets boost in weighted voting
+    EXCLUDED = 2  # ❌ Excluded from polls
+
+
 class Collection(Base):
     __tablename__ = "collection"
     __table_args__ = (UniqueConstraint("user_id", "game_id", name="uq_user_game"),)
@@ -65,9 +75,8 @@ class Collection(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.telegram_id"))
     game_id: Mapped[int] = mapped_column(ForeignKey("games.id"))
 
-    is_excluded: Mapped[bool] = mapped_column(Boolean, default=False)
-    is_new: Mapped[bool] = mapped_column(Boolean, default=False)  # "New" game flag
-    is_priority: Mapped[bool] = mapped_column(Boolean, default=False)  # High priority flag
+    # Game state: 0=included, 1=starred, 2=excluded
+    state: Mapped[int] = mapped_column(Integer, default=GameState.INCLUDED)
 
     # Relationships
     user: Mapped["User"] = relationship(back_populates="collection")

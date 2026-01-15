@@ -9,7 +9,16 @@ from telegram.ext import ContextTypes
 from src.core import db
 from src.core.bgg import BGGClient
 from src.core.logic import split_games
-from src.core.models import Collection, Game, GameNightPoll, PollVote, Session, SessionPlayer, User
+from src.core.models import (
+    Collection,
+    Game,
+    GameNightPoll,
+    GameState,
+    PollVote,
+    Session,
+    SessionPlayer,
+    User,
+)
 
 STAR_BOOST = 0.5  # Points added to starred games in weighted mode
 
@@ -33,7 +42,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3️⃣ /poll - Let democracy decide!\n\n"
         "**Other Commands:**\n"
         "• /addgame `<name>` - Search BGG and add game\n"
-        "• /markplayed `<game>` - Mark game as played\n"
+        "• /manage - Toggle game availability (⬜→🌟→❌)\n"
         "• /help - Show all available commands\n\n"
         "_Add me to a group chat for the best experience!_"
     )
@@ -53,9 +62,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Setup & Profile:**\n"
         "• /setbgg `<username>` - Link your BoardGameGeek account\n"
         "• /addgame `<name>` - Add a game to your collection (searches BGG)\n"
-        "• /manage - Toggle which games are available for game nights\n"
-        "• /priority `<game>` - Toggle high priority ⭐ on a game\n"
-        "• /markplayed `<game>` - Mark a game as played\n\n"
+        "• /manage - Manage collection (⬜ Included → 🌟 Starred → ❌ Excluded)\n\n"
         "**Game Night:**\n"
         "• /gamenight - Start a new game night lobby\n"
         "• /poll - Create a poll from joined players' collections\n"
@@ -165,7 +172,7 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Fetch detailed complexity for games that need it
             if games_needing_complexity:
                 await update.message.reply_text(
-                    f"⏳ Fetching data for {len(games_needing_complexity)} games..."
+                    f"⏳ Fetching data for {len(games)} games..."
                 )
                 import asyncio
                 complexity_updated = 0
@@ -510,7 +517,7 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             .join(Collection)
             .where(
                 Collection.user_id.in_(player_ids),
-                Collection.is_excluded == False,
+                Collection.state != GameState.EXCLUDED,  # Excludes games in EXCLUDED state
                 Game.min_players <= player_count,
                 Game.max_players >= player_count,
             )
@@ -526,7 +533,7 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Get games marked as priority by ANY player in session
         priority_query = (
             select(Collection.game_id)
-            .where(Collection.user_id.in_(player_ids), Collection.is_priority == True)
+            .where(Collection.user_id.in_(player_ids), Collection.state == GameState.STARRED)
             .distinct()
         )
         priority_result = await session.execute(priority_query)
@@ -579,211 +586,6 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await session.commit()
 
 
-async def mark_played(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mark a game as played (remove 'New' status)."""
-    if not context.args:
-        await update.message.reply_text("Usage: /markplayed <game name>")
-        return
-
-    game_name_query = " ".join(context.args)
-    user_id = update.effective_user.id
-
-    async with db.AsyncSessionLocal() as session:
-        # Find the game first (exact match or like?)
-        # Let's do simple ILIKE
-        stmt = select(Game).where(Game.name.ilike(f"%{game_name_query}%"))
-        result = await session.execute(stmt)
-        games = result.scalars().all()
-
-        if not games:
-            await update.message.reply_text("Game not found.")
-            return
-
-        if len(games) > 1:
-            await update.message.reply_text(
-                f"Found multiple games: {', '.join([g.name for g in games])}. Be more specific."
-            )
-            return
-
-        game = games[0]
-
-        # Update Collection entry for this user
-        # NOTE: 'is_new' is per user collection in our model.
-        # If the group played it, should we mark it played for EVERYONE?
-        # The prompt said: "bot knows which game won/was played... /markplayed <game> used after session to update history".
-        # If I mark it played, presumably it's no longer "New" for anyone who played it?
-        # But we only track `Collection` (User-Game).
-        # Let's Update it for ALL users in the current active session?
-        # Or just the user running the command?
-        # "Option B: A command like /markplayed <game_name> ... to update the history"
-        # Let's assume it updates for the user running it, or maybe all players in session.
-        # Safe bet: Update for user running it.
-
-        # Update collection
-        upd = (
-            sa_update(Collection)
-            .where(Collection.user_id == user_id, Collection.game_id == game.id)
-            .values(is_new=False)
-        )
-        await session.execute(upd)
-        await session.commit()
-
-        await update.message.reply_text(f"Marked '{game.name}' as played!")
-
-
-async def exclude_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Exclude a game from polls."""
-    if not context.args:
-        await update.message.reply_text("Usage: /exclude <game name>")
-        return
-
-    game_name_query = " ".join(context.args)
-    user_id = update.effective_user.id
-
-    async with db.AsyncSessionLocal() as session:
-        stmt = select(Game).where(Game.name.ilike(f"%{game_name_query}%"))
-        games = (await session.execute(stmt)).scalars().all()
-
-        if not games:
-            await update.message.reply_text("Game not found.")
-            return
-
-        if len(games) > 1:
-            await update.message.reply_text(
-                f"Found multiple games: {', '.join([g.name for g in games])}. Be more specific."
-            )
-            return
-
-        game = games[0]
-
-        # Toggle exclusion
-        # First check current state
-        col_stmt = select(Collection).where(
-            Collection.user_id == user_id, Collection.game_id == game.id
-        )
-        col = (await session.execute(col_stmt)).scalar_one_or_none()
-
-        if col:
-            new_state = not col.is_excluded
-            col.is_excluded = new_state
-            await session.commit()
-            status = "EXCLUDED" if new_state else "INCLUDED"
-            await update.message.reply_text(f"Game '{game.name}' is now {status}.")
-        else:
-            await update.message.reply_text("You don't own this game.")
-
-
-async def priority_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle priority status on a game."""
-    if not context.args:
-        await update.message.reply_text("Usage: /priority <game name>")
-        return
-
-    game_name_query = " ".join(context.args)
-    user_id = update.effective_user.id
-
-    async with db.AsyncSessionLocal() as session:
-        # Search ONLY within user's collection
-        # We need the Collection object to update it, but we want to match on Game.name
-        stmt = (
-            select(Collection, Game)
-            .join(Game)
-            .where(Collection.user_id == user_id, Game.name.ilike(f"%{game_name_query}%"))
-        )
-        results = (await session.execute(stmt)).all()
-
-        if not results:
-            await update.message.reply_text("Game not found in your collection.")
-            return
-
-        # Results is list of (Collection, Game) tuples
-        collections_games = [(r[0], r[1]) for r in results]
-
-        # Smart Matching Logic
-        # 1. Check for exact match (case-insensitive)
-        exact_match = next(
-            (pair for pair in collections_games if pair[1].name.lower() == game_name_query.lower()),
-            None,
-        )
-
-        if exact_match:
-            target_col, target_game = exact_match
-            # Toggle priority directly
-            new_state = not target_col.is_priority
-            target_col.is_priority = new_state
-            await session.commit()
-
-            if new_state:
-                await update.message.reply_text(
-                    f"⭐ Game '{target_game.name}' is now HIGH PRIORITY!"
-                )
-            else:
-                await update.message.reply_text(f"Game '{target_game.name}' priority removed.")
-
-        elif len(collections_games) == 1:
-            target_col, target_game = collections_games[0]
-            # Toggle priority directly
-            new_state = not target_col.is_priority
-            target_col.is_priority = new_state
-            await session.commit()
-
-            if new_state:
-                await update.message.reply_text(
-                    f"⭐ Game '{target_game.name}' is now HIGH PRIORITY!"
-                )
-            else:
-                await update.message.reply_text(f"Game '{target_game.name}' priority removed.")
-        else:
-            # Multiple matches and no exact match - Show Buttons!
-            keyboard = []
-            for col, game in collections_games[:10]:  # Limit to 10 buttons
-                keyboard.append([InlineKeyboardButton(game.name, callback_data=f"prio:{game.id}")])
-
-            await update.message.reply_text(
-                f"Found multiple games matching '{game_name_query}'. Select one:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-
-
-async def priority_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle priority selection button."""
-    query = update.callback_query
-    await query.answer()
-
-    # data is "prio:<game_id>"
-    try:
-        game_id = int(query.data.split(":")[1])
-    except (ValueError, IndexError):
-        await query.edit_message_text("Invalid game ID.")
-        return
-
-    user_id = query.from_user.id
-
-    async with db.AsyncSessionLocal() as session:
-        col_stmt = (
-            select(Collection, Game)
-            .join(Game)
-            .where(Collection.user_id == user_id, Collection.game_id == game_id)
-        )
-        result = (await session.execute(col_stmt)).first()
-
-        if not result:
-            await query.edit_message_text("Game not found in your collection.")
-            return
-
-        col, game = result
-
-        # Toggle priority
-        new_state = not col.is_priority
-        col.is_priority = new_state
-        await session.commit()
-
-        if new_state:
-            text = f"⭐ Game '{game.name}' is now HIGH PRIORITY!"
-        else:
-            text = f"Game '{game.name}' priority removed."
-
-        await query.edit_message_text(text)
 
 
 async def add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1478,7 +1280,7 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             .join(Collection)
             .where(
                 Collection.user_id.in_(player_ids),
-                Collection.is_excluded.is_(False),
+                Collection.state != GameState.EXCLUDED,
                 Game.min_players <= player_count,
                 Game.max_players >= player_count,
             )
@@ -1491,7 +1293,7 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Get games marked as priority by ANY player in session
         priority_query = (
             select(Collection.game_id)
-            .where(Collection.user_id.in_(player_ids), Collection.is_priority.is_(True))
+            .where(Collection.user_id.in_(player_ids), Collection.state == GameState.STARRED)
             .distinct()
         )
         priority_result = await session.execute(priority_query)
@@ -1740,7 +1542,7 @@ async def calculate_winner_scores(poll_data, chat_id: int, session, is_weighted:
                     select(func.count(Collection.user_id)).where(
                         Collection.game_id == game.id,
                         Collection.user_id.in_(player_ids),
-                        Collection.is_priority == True
+                        Collection.state == GameState.STARRED
                     )
                 )
                 if priority_count > 0:
@@ -1849,14 +1651,15 @@ async def manage_collection_callback(update: Update, context: ContextTypes.DEFAU
         if action == "toggle":
             game_id = int(parts[2])
 
-            # Toggle is_excluded for this user's game
+            # Cycle through states: INCLUDED -> STARRED -> EXCLUDED -> INCLUDED
             col_stmt = select(Collection).where(
                 Collection.user_id == user_id, Collection.game_id == game_id
             )
             col = (await session.execute(col_stmt)).scalar_one_or_none()
 
             if col:
-                col.is_excluded = not col.is_excluded
+                # 3-state cycle: 0 (included) -> 1 (starred) -> 2 (excluded) -> 0
+                col.state = (col.state + 1) % 3
                 await session.commit()
 
         # Fetch updated collection to rebuild keyboard
@@ -1888,8 +1691,8 @@ async def manage_collection_callback(update: Update, context: ContextTypes.DEFAU
 
     await query.edit_message_text(
         f"📚 **Your Collection** ({len(results)} games)\n"
-        "Tap a game to toggle availability for game nights.\n"
-        "✅ = Available | ❌ = Excluded",
+        "Tap a game to cycle its state:\n"
+        "⬜ Included → 🌟 Starred → ❌ Excluded",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -1909,7 +1712,9 @@ def _build_manage_keyboard(
 
     keyboard = []
     for col, game in page_items:
-        status = "❌" if col.is_excluded else "✅"
+        # State icons: 0=included (⬜), 1=starred (🌟), 2=excluded (❌)
+        state_icons = {GameState.INCLUDED: "⬜", GameState.STARRED: "🌟", GameState.EXCLUDED: "❌"}
+        status = state_icons.get(col.state, "⬜")
         # Truncate long names
         name = game.name[:25] + "…" if len(game.name) > 26 else game.name
         keyboard.append(
