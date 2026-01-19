@@ -299,3 +299,174 @@ class BGGClient:
         except (ValueError, AttributeError) as e:
             logger.warning(f"Failed to parse thing item {bgg_id}: {e}")
             return None
+
+    async def fetch_expansions(self, username: str) -> list[dict]:
+        """
+        Fetch a user's owned expansions from BGG.
+
+        Args:
+            username: BGG Username
+
+        Returns:
+            List of dicts: [{id, name}, ...]
+        """
+        params = {
+            "username": username,
+            "own": 1,
+            "subtype": "boardgameexpansion",
+        }
+
+        async with httpx.AsyncClient() as client:
+            for attempt in range(5):
+                try:
+                    response = await client.get(
+                        f"{self.BASE_URL}/collection",
+                        params=params,
+                        headers=self._get_headers(),
+                        timeout=30.0,
+                    )
+
+                    if response.status_code == 202:
+                        wait_time = (attempt + 1) * 2
+                        if attempt < 4:
+                            logger.warning(
+                                f"BGG returned 202 (Queued) for expansions. "
+                                f"Retrying in {wait_time}s..."
+                            )
+                            import asyncio
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            return []
+
+                    if response.status_code == 404:
+                        return []
+
+                    response.raise_for_status()
+                    return self._parse_expansion_collection_xml(response.content)
+
+                except httpx.HTTPError as e:
+                    logger.error(f"Error fetching expansions for {username}: {e}")
+                    return []
+            return []
+
+    def _parse_expansion_collection_xml(self, xml_content: bytes) -> list[dict]:
+        """Parse expansion collection XML response."""
+        root = ET.fromstring(xml_content)
+        expansions: list[dict] = []
+
+        for item in root.findall("item"):
+            try:
+                status = item.find("status")
+                if status is not None and status.get("own") != "1":
+                    continue
+
+                bgg_id = int(item.get("objectid", 0))
+                name_elem = item.find("name")
+                name = name_elem.text if name_elem is not None else "Unknown"
+
+                expansions.append({"id": bgg_id, "name": name})
+            except (ValueError, AttributeError) as e:
+                logger.warning(f"Failed to parse expansion item: {e}")
+                continue
+
+        return expansions
+
+    async def get_expansion_info(self, expansion_id: int) -> dict | None:
+        """
+        Fetch expansion details including base game link and player count.
+
+        Args:
+            expansion_id: BGG expansion ID
+
+        Returns:
+            Dict with: {id, name, base_game_id, new_max_players, complexity_delta}
+            or None if fetch fails
+        """
+        params = {
+            "id": expansion_id,
+            "stats": 1,
+        }
+
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(
+                    f"{self.BASE_URL}/thing",
+                    params=params,
+                    headers=self._get_headers(),
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                return self._parse_expansion_thing_xml(response.content, expansion_id)
+            except httpx.HTTPError as e:
+                logger.error(f"Error fetching expansion info for ID {expansion_id}: {e}")
+                return None
+
+    def _parse_expansion_thing_xml(self, xml_content: bytes, expansion_id: int) -> dict | None:
+        """Parse expansion thing XML response to extract base game link and modifiers."""
+        root = ET.fromstring(xml_content)
+        item = root.find("item")
+
+        if item is None:
+            return None
+
+        try:
+            # Get primary name
+            name = "Unknown"
+            for name_elem in item.findall("name"):
+                if name_elem.get("type") == "primary":
+                    name = name_elem.get("value", "Unknown")
+                    break
+
+            # Get max players (for player count expansion detection)
+            max_players_elem = item.find("maxplayers")
+            new_max_players = None
+            if max_players_elem is not None:
+                try:
+                    new_max_players = int(max_players_elem.get("value", 0))
+                    if new_max_players == 0:
+                        new_max_players = None
+                except ValueError:
+                    pass
+
+            # Find base game link (type="boardgameexpansion" with inbound="true")
+            # The expansion links back to its base game with inbound="true"
+            base_game_id = None
+            for link in item.findall("link"):
+                # inbound="true" means this is the base game that this expansion expands
+                if (
+                    link.get("type") == "boardgameexpansion"
+                    and link.get("inbound") == "true"
+                ):
+                    try:
+                        base_game_id = int(link.get("id", 0))
+                        break
+                    except ValueError:
+                        continue
+
+            # Get complexity for potential delta calculation
+            complexity = None
+            stats = item.find("statistics")
+            if stats is not None:
+                ratings = stats.find("ratings")
+                if ratings is not None:
+                    avg_weight = ratings.find("averageweight")
+                    if avg_weight is not None:
+                        try:
+                            complexity = float(avg_weight.get("value", 0))
+                            if complexity == 0:
+                                complexity = None
+                        except ValueError:
+                            pass
+
+            return {
+                "id": expansion_id,
+                "name": name,
+                "base_game_id": base_game_id,
+                "new_max_players": new_max_players,
+                "complexity": complexity,
+            }
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Failed to parse expansion thing {expansion_id}: {e}")
+            return None
+

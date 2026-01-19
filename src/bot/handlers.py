@@ -11,6 +11,7 @@ from src.core.bgg import BGGClient
 from src.core.logic import split_games
 from src.core.models import (
     Collection,
+    Expansion,
     Game,
     GameNightPoll,
     GameState,
@@ -18,6 +19,7 @@ from src.core.models import (
     Session,
     SessionPlayer,
     User,
+    UserExpansion,
 )
 
 STAR_BOOST = 0.5  # Points added to starred games in weighted mode
@@ -129,6 +131,12 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Calculate differences
             new_game_ids = bgg_game_ids - current_collection_ids
             removed_game_ids = current_collection_ids - bgg_game_ids
+
+            # Determine if this is a "safe" sync where we should auto-star new games
+            # Don't auto-star on: first sync (no existing games) or force sync
+            is_first_sync = len(current_collection_ids) == 0
+            should_auto_star = not is_first_sync and not force_update
+
             updated_count = 0
 
             # Add/Update games in DB
@@ -150,7 +158,9 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Add new games to collection
             for game_id in new_game_ids:
-                col = Collection(user_id=telegram_id, game_id=game_id)
+                # Auto-star new games in incremental syncs
+                initial_state = GameState.STARRED if should_auto_star else GameState.INCLUDED
+                col = Collection(user_id=telegram_id, game_id=game_id, state=initial_state)
                 session.add(col)
 
             # Remove games no longer in BGG collection
@@ -214,6 +224,104 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message = f"Collection synced! {total_games} games total (no changes)"
 
         await update.message.reply_text(message)
+
+        # Phase 2: Fetch and sync expansions
+        try:
+            await update.message.reply_text("🔄 Syncing expansions...")
+            expansions_data = await bgg.fetch_expansions(bgg_username)
+
+            if expansions_data:
+                import asyncio
+                expansions_processed = 0
+                player_count_updates = 0
+
+                async with db.AsyncSessionLocal() as session:
+                    for exp_data in expansions_data:
+                        try:
+                            # Get expansion details (base game link, player count)
+                            exp_info = await bgg.get_expansion_info(exp_data["id"])
+                            await asyncio.sleep(0.3)  # Rate limit
+
+                            if not exp_info or not exp_info.get("base_game_id"):
+                                continue
+
+                            base_game_id = exp_info["base_game_id"]
+
+                            # Check if base game is in user's collection
+                            base_game = await session.get(Game, base_game_id)
+                            if not base_game:
+                                continue
+
+                            # Create or update expansion record
+                            existing_exp = await session.get(Expansion, exp_data["id"])
+                            if not existing_exp:
+                                expansion = Expansion(
+                                    id=exp_data["id"],
+                                    name=exp_info["name"],
+                                    base_game_id=base_game_id,
+                                    new_max_players=exp_info.get("new_max_players"),
+                                    complexity_delta=None,  # Future use
+                                )
+                                session.add(expansion)
+                            else:
+                                # Update existing expansion
+                                existing_exp.name = exp_info["name"]
+                                existing_exp.base_game_id = base_game_id
+                                existing_exp.new_max_players = exp_info.get("new_max_players")
+
+                            # Link expansion to user
+                            user_exp_stmt = select(UserExpansion).where(
+                                UserExpansion.user_id == telegram_id,
+                                UserExpansion.expansion_id == exp_data["id"],
+                            )
+                            if not (await session.execute(user_exp_stmt)).scalar_one_or_none():
+                                user_exp = UserExpansion(
+                                    user_id=telegram_id,
+                                    expansion_id=exp_data["id"],
+                                )
+                                session.add(user_exp)
+
+                            # Update effective_max_players on Collection if expansion adds players
+                            exp_max = exp_info.get("new_max_players")
+                            if exp_max and exp_max > base_game.max_players:
+                                col_stmt = select(Collection).where(
+                                    Collection.user_id == telegram_id,
+                                    Collection.game_id == base_game_id,
+                                )
+                                collection_entry = (
+                                    await session.execute(col_stmt)
+                                ).scalar_one_or_none()
+                                if collection_entry:
+                                    # Update if new max is higher than current effective
+                                    current_eff = (
+                                        collection_entry.effective_max_players
+                                        or base_game.max_players
+                                    )
+                                    if exp_max > current_eff:
+                                        collection_entry.effective_max_players = exp_max
+                                        player_count_updates += 1
+
+                            expansions_processed += 1
+
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to process expansion {exp_data.get('id')}: {e}"
+                            )
+                            continue
+
+                    await session.commit()
+
+                if expansions_processed > 0:
+                    exp_msg = f"📦 Synced {expansions_processed} expansions"
+                    if player_count_updates > 0:
+                        exp_msg += f" ({player_count_updates} player count updates)"
+                    await update.message.reply_text(exp_msg)
+            else:
+                await update.message.reply_text("📦 No expansions found in your collection.")
+
+        except Exception as e:
+            logger.warning(f"Expansion sync failed (non-critical): {e}")
+            # Don't fail the whole sync if expansion sync fails
 
     except ValueError as e:
         # User not found
@@ -519,7 +627,9 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 Collection.user_id.in_(player_ids),
                 Collection.state != GameState.EXCLUDED,  # Excludes games in EXCLUDED state
                 Game.min_players <= player_count,
-                Game.max_players >= player_count,
+                # Use effective_max_players if set (from owned expansions), else base game max
+                func.coalesce(Collection.effective_max_players, Game.max_players)
+                >= player_count,
             )
             .distinct()
         )
@@ -642,7 +752,8 @@ async def add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 Collection.user_id == telegram_id, Collection.game_id == game_id
             )
             if not (await session.execute(col_stmt)).scalar_one_or_none():
-                col = Collection(user_id=telegram_id, game_id=game_id)
+                # Auto-star manually added games
+                col = Collection(user_id=telegram_id, game_id=game_id, state=GameState.STARRED)
                 session.add(col)
 
             await session.commit()
@@ -733,7 +844,8 @@ async def add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 Collection.user_id == telegram_id, Collection.game_id == game.id
             )
             if not (await session.execute(col_stmt)).scalar_one_or_none():
-                col = Collection(user_id=telegram_id, game_id=game.id)
+                # Auto-star manually added games (via search)
+                col = Collection(user_id=telegram_id, game_id=game.id, state=GameState.STARRED)
                 session.add(col)
 
             await session.commit()
@@ -1282,7 +1394,9 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 Collection.user_id.in_(player_ids),
                 Collection.state != GameState.EXCLUDED,
                 Game.min_players <= player_count,
-                Game.max_players >= player_count,
+                # Use effective_max_players if set (from owned expansions), else base game max
+                func.coalesce(Collection.effective_max_players, Game.max_players)
+                >= player_count,
             )
             .distinct()
         )

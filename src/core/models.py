@@ -78,6 +78,11 @@ class Collection(Base):
     # Game state: 0=included, 1=starred, 2=excluded
     state: Mapped[int] = mapped_column(Integer, default=GameState.INCLUDED)
 
+    # Effective values (base game + owned expansions)
+    # Null means use base game values (no expansion modifiers)
+    effective_max_players: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    effective_complexity: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Relationships
     user: Mapped["User"] = relationship(back_populates="collection")
     game: Mapped["Game"] = relationship(lazy="joined")
@@ -143,3 +148,36 @@ class PollVote(Base):
     # Relationships
     poll: Mapped["GameNightPoll"] = relationship(back_populates="votes")
 
+
+class Expansion(Base):
+    """Track expansions and their modifiers to base games."""
+
+    __tablename__ = "expansions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # BGG expansion ID
+    name: Mapped[str] = mapped_column(String, index=True)
+    base_game_id: Mapped[int] = mapped_column(ForeignKey("games.id"), index=True)
+
+    # Player count modifier (new max when expansion is used)
+    new_max_players: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Complexity modifier (delta to add to base complexity)
+    complexity_delta: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # Relationships
+    base_game: Mapped["Game"] = relationship()
+
+
+class UserExpansion(Base):
+    """Track user ownership of expansions."""
+
+    __tablename__ = "user_expansions"
+    __table_args__ = (UniqueConstraint("user_id", "expansion_id", name="uq_user_expansion"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.telegram_id"))
+    expansion_id: Mapped[int] = mapped_column(ForeignKey("expansions.id"))
+
+    # Relationships
+    user: Mapped["User"] = relationship()
+    expansion: Mapped["Expansion"] = relationship()
