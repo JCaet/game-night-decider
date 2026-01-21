@@ -54,7 +54,13 @@ def mock_update():
     update.effective_user.id = 111
     update.effective_user.first_name = "TestUser"
     update.message = MagicMock(spec=Message)
-    update.message.reply_text = AsyncMock()
+    
+    # Configure reply_text to return a proper message with message_id
+    mock_reply_message = MagicMock()
+    mock_reply_message.message_id = 997
+    mock_reply_message.edit_text = AsyncMock()  # Must be awaitable
+    update.message.reply_text = AsyncMock(return_value=mock_reply_message)
+    
     update.callback_query = MagicMock(spec=CallbackQuery)
     update.callback_query.message.chat.id = 12345
     update.callback_query.from_user.id = 111
@@ -68,7 +74,11 @@ def mock_update():
 def mock_context():
     """Create a mock Telegram Context object."""
     context = MagicMock(spec=ContextTypes.DEFAULT_TYPE)
-    context.bot.send_message = AsyncMock()
+
+    # Configure send_message to return a proper mock with message_id
+    mock_message = MagicMock()
+    mock_message.message_id = 998
+    context.bot.send_message = AsyncMock(return_value=mock_message)
 
     # Configure send_poll to return a proper mock with poll.id
     mock_poll_message = MagicMock()
@@ -76,6 +86,8 @@ def mock_context():
     mock_poll_message.message_id = 999
     context.bot.send_poll = AsyncMock(return_value=mock_poll_message)
 
+    # Configure edit_message_text
+    context.bot.edit_message_text = AsyncMock()
+
     context.args = []
     return context
-

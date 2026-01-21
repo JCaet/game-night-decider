@@ -10,7 +10,7 @@ from src.bot.handlers import (
     start_night,
 )
 from src.core import db
-from src.core.models import Collection, Game, GameState, Session, SessionPlayer, User
+from src.core.models import Collection, Game, GameState, PollType, Session, SessionPlayer, User
 
 # ============================================================================
 # /gamenight command tests
@@ -617,15 +617,19 @@ async def test_poll_no_matching_games(mock_update, mock_context):
 
     await create_poll(mock_update, mock_context)
 
-    call_args = mock_update.message.reply_text.call_args[0][0]
-    assert "No games found matching 2 players" in call_args
+    # The handler now uses context.bot.send_message for "no matching games" error
+    mock_context.bot.send_message.assert_called()
+    call_args = mock_context.bot.send_message.call_args
+    text = call_args.kwargs.get("text") or call_args.args[1]
+    assert "No games found matching 2 players" in text
 
 
 @pytest.mark.asyncio
 async def test_poll_with_valid_games(mock_update, mock_context):
-    """Test /poll creates poll with valid intersecting games."""
+    """Test /poll creates poll with valid intersecting games (native mode)."""
     async with db.AsyncSessionLocal() as session:
-        sess = Session(chat_id=12345, is_active=True)
+        # Use native poll mode for this test
+        sess = Session(chat_id=12345, is_active=True, poll_type=PollType.NATIVE)
         session.add(sess)
 
         u1 = User(telegram_id=111, telegram_name="User1")

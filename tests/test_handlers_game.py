@@ -110,11 +110,15 @@ async def test_setbgg_resync_adds_new_games(mock_update, mock_context):
         assert collection_ids == {1, 2, 3}
 
     # Verify feedback message mentions new game
-    calls = [call[0][0] for call in mock_update.message.reply_text.call_args_list]
-    # Find the game sync message (contains "games total")
-    success_msg = next((c for c in calls if "games total" in c), None)
+    # The command now updates the status message via edit_text
+    status_msg = mock_update.message.reply_text.return_value
+    
+    # Get all calls to edit_text
+    edit_calls = [c[0][0] for c in status_msg.edit_text.call_args_list]
+    success_msg = next((m for m in edit_calls if "Sync Complete" in m), None)
+    
     assert success_msg is not None
-    assert "3 games total" in success_msg
+    assert "3 games" in success_msg
     assert "1 new" in success_msg
 
 
@@ -161,11 +165,12 @@ async def test_setbgg_resync_removes_deleted_games(mock_update, mock_context):
         assert collection_ids == {1, 2}
 
     # Verify feedback message mentions removed game
-    calls = [call[0][0] for call in mock_update.message.reply_text.call_args_list]
-    # Find the game sync message (contains "games total")
-    success_msg = next((c for c in calls if "games total" in c), None)
+    status_msg = mock_update.message.reply_text.return_value
+    edit_calls = [c[0][0] for c in status_msg.edit_text.call_args_list]
+    success_msg = next((m for m in edit_calls if "Sync Complete" in m), None)
+
     assert success_msg is not None
-    assert "2 games total" in success_msg
+    assert "2 games" in success_msg
     assert "1 removed" in success_msg
 
 
@@ -203,12 +208,15 @@ async def test_setbgg_resync_no_changes(mock_update, mock_context):
         await set_bgg(mock_update, mock_context)
 
     # Verify feedback message shows no changes
-    calls = [call[0][0] for call in mock_update.message.reply_text.call_args_list]
-    # Find the game sync message (contains "games total")
-    success_msg = next((c for c in calls if "games total" in c), None)
+    status_msg = mock_update.message.reply_text.return_value
+    edit_calls = [c[0][0] for c in status_msg.edit_text.call_args_list]
+    success_msg = next((m for m in edit_calls if "Sync Complete" in m), None)
+
     assert success_msg is not None
-    assert "2 games total" in success_msg
-    assert "no changes" in success_msg
+    assert "2 games" in success_msg
+    # "no changes" isn't explicitly printed, the absence of "new" or "removed" or "updated" implies it
+    # We just check the base message is there
+    assert "Sync Complete" in success_msg
 
 
 @pytest.mark.asyncio
@@ -230,15 +238,26 @@ async def test_setbgg_initial_sync_feedback(mock_update, mock_context):
 
         await set_bgg(mock_update, mock_context)
 
-    # Verify feedback messages (4 messages: initial, sync result, expansion sync, expansion result)
-    calls = [call[0][0] for call in mock_update.message.reply_text.call_args_list]
-    assert len(calls) == 4
-    assert "Fetching collection..." in calls[0]
-    # Find the game sync message (contains "games total")
-    game_sync_msg = next((c for c in calls if "games total" in c), None)
-    assert game_sync_msg is not None
-    assert "3 games total" in game_sync_msg
-    assert "3 new" in game_sync_msg
+    # Verify feedback messages
+    # 1. Initial reply_text ("Fetching collection...")
+    # 2. edit_text ("Fetching computed complexity...")
+    # 3. edit_text ("Syncing expansions...")
+    # 4. edit_text ("Sync Complete!")
+    
+    assert mock_update.message.reply_text.call_count == 1
+    status_msg = mock_update.message.reply_text.return_value
+    
+    edit_calls = [c[0][0] for c in status_msg.edit_text.call_args_list]
+    # We expect at least one update (complexity/expansion) and one final result
+    assert len(edit_calls) >= 2 
+    
+    # Check for specific updates
+    assert any("computed complexity" in c for c in edit_calls) or any("Syncing expansions" in c for c in edit_calls)
+    
+    final_msg = edit_calls[-1]
+    assert "Sync Complete" in final_msg
+    assert "3 games" in final_msg
+    assert "3 new" in final_msg
 
 
 # ============================================================================

@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 
 from src.bot.handlers import create_poll, receive_poll_answer
 from src.core import db
-from src.core.models import Collection, Game, GameNightPoll, PollVote, Session, SessionPlayer, User
+from src.core.models import Collection, Game, GameNightPoll, PollType, PollVote, Session, SessionPlayer, User
 
 
 @pytest.mark.asyncio
@@ -39,8 +39,8 @@ async def test_poll_auto_close(mock_update, mock_context):
         c4 = Collection(user_id=222, game_id=2)
         session.add_all([c1, c2, c3, c4])
 
-        # Create Session
-        s = Session(chat_id=chat_id, is_active=True)
+        # Create Session (use native poll mode)
+        s = Session(chat_id=chat_id, is_active=True, poll_type=PollType.NATIVE)
         session.add(s)
 
         # Add Players to Session

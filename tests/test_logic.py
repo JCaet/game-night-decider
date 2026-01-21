@@ -211,3 +211,103 @@ def test_split_games_all_same_complexity():
     # No single-game groups
     for label, chunk in result:
         assert len(chunk) >= 2
+
+
+# ============================================================================
+# calculate_poll_winner tests
+# ============================================================================
+
+from dataclasses import dataclass
+from src.core.logic import calculate_poll_winner, STAR_BOOST
+
+
+@dataclass
+class MockVote:
+    """Mock vote for testing."""
+    game_id: int
+    user_id: int
+
+
+def test_calculate_poll_winner_basic():
+    """Test basic winner calculation with clear winner."""
+    games = [create_game("Winner", 2.0), create_game("Loser", 2.5)]
+    # Give games IDs
+    games[0].id = 1
+    games[1].id = 2
+
+    votes = [
+        MockVote(game_id=1, user_id=111),
+        MockVote(game_id=1, user_id=222),
+        MockVote(game_id=2, user_id=333),
+    ]
+
+    winners, scores, modifiers = calculate_poll_winner(
+        games, votes, priority_game_ids=set(), is_weighted=False
+    )
+
+    assert winners == ["Winner"]
+    assert scores["Winner"] == 2.0
+    assert scores["Loser"] == 1.0
+    assert modifiers == []
+
+
+def test_calculate_poll_winner_tie():
+    """Test tie handling - both games with same votes."""
+    games = [create_game("Game1", 2.0), create_game("Game2", 2.5)]
+    games[0].id = 1
+    games[1].id = 2
+
+    votes = [
+        MockVote(game_id=1, user_id=111),
+        MockVote(game_id=2, user_id=222),
+    ]
+
+    winners, scores, modifiers = calculate_poll_winner(
+        games, votes, priority_game_ids=set(), is_weighted=False
+    )
+
+    assert len(winners) == 2
+    assert "Game1" in winners
+    assert "Game2" in winners
+
+
+def test_calculate_poll_winner_no_votes():
+    """Test with no votes."""
+    games = [create_game("Game1", 2.0)]
+    games[0].id = 1
+
+    winners, scores, modifiers = calculate_poll_winner(
+        games, votes=[], priority_game_ids=set(), is_weighted=False
+    )
+
+    assert winners == []
+    assert scores["Game1"] == 0.0
+
+
+def test_calculate_poll_winner_with_star_boost():
+    """Test weighted voting with star boost breaks tie."""
+    games = [create_game("StarredGame", 2.0), create_game("NormalGame", 2.5)]
+    games[0].id = 1
+    games[1].id = 2
+
+    votes = [
+        MockVote(game_id=1, user_id=111),  # User 111 voted for starred game
+        MockVote(game_id=2, user_id=222),
+    ]
+
+    # User 111 has StarredGame starred
+    star_collections = {1: [111]}
+
+    winners, scores, modifiers = calculate_poll_winner(
+        games, votes,
+        priority_game_ids={1},  # Game 1 is starred
+        is_weighted=True,
+        star_collections=star_collections
+    )
+
+    # StarredGame should win due to boost
+    assert winners == ["StarredGame"]
+    assert scores["StarredGame"] == 1.0 + STAR_BOOST
+    assert scores["NormalGame"] == 1.0
+    assert len(modifiers) == 1
+    assert "StarredGame" in modifiers[0]

@@ -15,12 +15,15 @@ from src.bot.handlers import (
     cancel_night,
     cancel_night_callback,
     create_poll,
+    custom_poll_action_callback,
+    custom_poll_vote_callback,
     guest_game,
     help_command,
     join_lobby_callback,
     leave_lobby_callback,
     manage_collection,
     manage_collection_callback,
+    poll_settings_callback,
     receive_poll_answer,
     restart_night_callback,
     resume_night_callback,
@@ -29,7 +32,10 @@ from src.bot.handlers import (
     start_night,
     start_poll_callback,
     test_mode,
+    toggle_hide_voters_callback,
+    toggle_poll_mode_callback,
     toggle_weights_callback,
+    cycle_vote_limit_callback,
 )
 from src.core.db import init_db
 
@@ -66,6 +72,15 @@ def main():
     app.add_handler(CallbackQueryHandler(start_poll_callback, pattern="^start_poll$"))
     app.add_handler(CallbackQueryHandler(cancel_night_callback, pattern="^cancel_night$"))
     app.add_handler(CallbackQueryHandler(toggle_weights_callback, pattern="^toggle_weights$"))
+    app.add_handler(CallbackQueryHandler(poll_settings_callback, pattern="^poll_settings$"))
+    app.add_handler(CallbackQueryHandler(toggle_poll_mode_callback, pattern="^toggle_poll_mode$"))
+    app.add_handler(CallbackQueryHandler(custom_poll_vote_callback, pattern=r"^vote:"))
+    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_refresh:"))
+    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_close:"))
+    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_random_vote:"))
+    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_toggle_voters:"))
+    app.add_handler(CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$"))
+    app.add_handler(CallbackQueryHandler(cycle_vote_limit_callback, pattern=r"^cycle_vote_limit$"))
     app.add_handler(CallbackQueryHandler(manage_collection_callback, pattern="^manage:"))
     app.add_handler(PollAnswerHandler(receive_poll_answer))
 
