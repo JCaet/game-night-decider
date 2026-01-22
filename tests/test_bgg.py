@@ -18,7 +18,8 @@ MOCK_BGG_XML = b"""
                 <averageweight value="2.32"/>
             </rating>
         </stats>
-        <status own="1" prevowned="0" fortrade="0" want="0" wanttoplay="0" wanttobuy="0" wishlist="0" preordered="0" lastmodified="2021-01-01 00:00:00"/>
+        <status own="1" prevowned="0" fortrade="0" want="0" wanttoplay="0"
+            wanttobuy="0" wishlist="0" preordered="0" lastmodified="2021-01-01 00:00:00"/>
         <thumbnail>http://example.com/catan.jpg</thumbnail>
     </item>
     <item objectid="2" subtype="boardgameexpansion" collid="2">

@@ -202,25 +202,25 @@ def group_games_by_complexity(games: list[Game]) -> dict[int, list[Game]]:
         Games with complexity None are grouped under 0 (Unrated).
     """
     groups = {0: [], 1: [], 2: [], 3: [], 4: [], 5: []}
-    
+
     for game in games:
         if game.complexity is None or game.complexity <= 0:
             groups[0].append(game)
             continue
-            
+
         level = int(game.complexity)
         # Clamp to 1-5 range (though BGG is max 5)
         if level < 1:
             level = 1
         elif level > 5:
             level = 5
-            
+
         groups[level].append(game)
-        
+
     # Sort games within each group by name
     for level in groups:
         groups[level].sort(key=lambda g: g.name)
-        
+
     # Remove empty groups
     return {k: v for k, v in groups.items() if v}
 

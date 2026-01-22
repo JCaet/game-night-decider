@@ -6,7 +6,16 @@ from sqlalchemy import func, select
 
 from src.bot.handlers import create_poll, receive_poll_answer
 from src.core import db
-from src.core.models import Collection, Game, GameNightPoll, PollType, PollVote, Session, SessionPlayer, User
+from src.core.models import (
+    Collection,
+    Game,
+    GameNightPoll,
+    PollType,
+    PollVote,
+    Session,
+    SessionPlayer,
+    User,
+)
 
 
 @pytest.mark.asyncio
@@ -28,7 +37,12 @@ async def test_poll_auto_close(mock_update, mock_context):
             id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0
         )
         g2 = Game(
-            id=2, name="Ticket to Ride", min_players=2, max_players=5, playing_time=60, complexity=2.0
+            id=2,
+            name="Ticket to Ride",
+            min_players=2,
+            max_players=5,
+            playing_time=60,
+            complexity=2.0,
         )
         session.add_all([g1, g2])
 
@@ -85,7 +99,9 @@ async def test_poll_auto_close(mock_update, mock_context):
 
     # Verify Vote saved
     async with db.AsyncSessionLocal() as session:
-        voters = await session.scalar(select(func.count(PollVote.user_id)).where(PollVote.poll_id == poll_id))
+        voters = await session.scalar(
+            select(func.count(PollVote.user_id)).where(PollVote.poll_id == poll_id)
+        )
         assert voters == 1
 
     # Verify stop_poll NOT called
@@ -108,7 +124,9 @@ async def test_poll_auto_close(mock_update, mock_context):
 
     # Verify Vote saved
     async with db.AsyncSessionLocal() as session:
-        voters = await session.scalar(select(func.count(PollVote.user_id)).where(PollVote.poll_id == poll_id))
+        voters = await session.scalar(
+            select(func.count(PollVote.user_id)).where(PollVote.poll_id == poll_id)
+        )
         assert voters == 2
 
     # Verify stop_poll CALLED

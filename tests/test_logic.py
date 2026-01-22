@@ -1,4 +1,12 @@
-from src.core.logic import split_games, _find_best_split, _get_complexity_label
+from dataclasses import dataclass
+
+from src.core.logic import (
+    STAR_BOOST,
+    _find_best_split,
+    _get_complexity_label,
+    calculate_poll_winner,
+    split_games,
+)
 from src.core.models import Game
 
 
@@ -64,8 +72,8 @@ def test_split_games_avoids_single_game():
     result = split_games(games, max_per_poll=10)
 
     # Check that no group has only 1 game
-    for label, chunk in result:
-        assert len(chunk) >= 2, f"Single-game group found: {label}"
+    for _label, chunk in result:
+        assert len(chunk) >= 2, f"Single-game group found: {_label}"
 
 
 def test_split_games_edge_penalty():
@@ -89,8 +97,8 @@ def test_split_games_edge_penalty():
     result = split_games(games, max_per_poll=10)
 
     # All groups should have at least 2 games
-    for label, chunk in result:
-        assert len(chunk) >= 2, f"Single-game group found: {label}"
+    for _label, chunk in result:
+        assert len(chunk) >= 2, f"Single-game group found: {_label}"
 
 
 def test_split_games_category_overflow():
@@ -106,8 +114,8 @@ def test_split_games_category_overflow():
     total_games = sum(len(chunk) for _, chunk in result)
     assert total_games == 15
     # No single-game groups
-    for label, chunk in result:
-        assert len(chunk) >= 2, f"Single-game group found: {label}"
+    for _label, chunk in result:
+        assert len(chunk) >= 2, f"Single-game group found: {_label}"
 
 
 def test_split_games_unrated():
@@ -209,7 +217,7 @@ def test_split_games_all_same_complexity():
     total = sum(len(chunk) for _, chunk in result)
     assert total == 12
     # No single-game groups
-    for label, chunk in result:
+    for _label, chunk in result:
         assert len(chunk) >= 2
 
 
@@ -217,8 +225,7 @@ def test_split_games_all_same_complexity():
 # calculate_poll_winner tests
 # ============================================================================
 
-from dataclasses import dataclass
-from src.core.logic import calculate_poll_winner, STAR_BOOST
+
 
 
 @dataclass

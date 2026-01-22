@@ -1,11 +1,15 @@
 
-import sys
 import os
+import sys
+
 sys.path.append(os.getcwd())
 
 import asyncio
+
 from sqlalchemy import text
+
 from src.core.db import engine
+
 
 async def migrate():
     async with engine.begin() as conn:
