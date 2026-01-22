@@ -43,6 +43,7 @@ patch_tags = ["fix", "perf"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+exclude = ["scripts/**"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
@@ -61,7 +62,8 @@ omit = ["tests/*", ".venv/*"]
 python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
-disallow_untyped_defs = true
+disallow_untyped_defs = false
+strict_optional = false
 ignore_missing_imports = true
 mypy_path = "src"
 

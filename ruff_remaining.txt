@@ -1,0 +1,493 @@
+﻿SIM115 Use a context manager for opening files
+  --> src\bot\handlers.py:56:19
+   |
+54 |     if os.path.exists(banner_path):
+55 |         await update.message.reply_photo(
+56 |             photo=open(banner_path, "rb"), caption=caption, parse_mode="Markdown"
+   |                   ^^^^
+57 |         )
+58 |     else:
+   |
+
+SIM105 Use `contextlib.suppress(Exception)` instead of `try`-`except`-`pass`
+   --> src\bot\handlers.py:188:17
+    |
+186 |               if games_needing_complexity:
+187 |                   # Update status message instead of sending new one
+188 | /                 try:
+189 | |                     await status_msg.edit_text(
+190 | |                         f"ÔÅ│ Linked BGG account: {bgg_username}\n"
+191 | |                         f"ÔÇó Fetching computed complexity for {len(games_needing_complexity)} games..."
+192 | |                     )
+193 | |                 except Exception:
+194 | |                     pass  # Ignore edit errors (e.g. message too old)
+    | |________________________^
+195 |
+196 |                   import asyncio
+    |
+help: Replace `try`-`except`-`pass` with `with contextlib.suppress(Exception): ...`
+
+E501 Line too long (102 > 100)
+   --> src\bot\handlers.py:191:101
+    |
+189 |                     await status_msg.edit_text(
+190 |                         f"ÔÅ│ Linked BGG account: {bgg_username}\n"
+191 |                         f"ÔÇó Fetching computed complexity for {len(games_needing_complexity)} games..."
+    |                                                                                                     ^^
+192 |                     )
+193 |                 except Exception:
+    |
+
+SIM115 Use a context manager for opening files
+   --> src\bot\handlers.py:427:19
+    |
+425 |     if banner_path.exists():
+426 |         await update.message.reply_photo(
+427 |             photo=open(banner_path, "rb"),
+    |                   ^^^^
+428 |             caption="­ƒÄ▓ **Game Night Started!**",
+429 |             parse_mode="Markdown",
+    |
+
+SIM102 Use a single `if` statement instead of nested `if` statements
+   --> src\bot\handlers.py:464:9
+    |
+462 |           # Validate Session Message ID
+463 |           session_obj = await session.get(Session, chat_id)
+464 | /         if session_obj:
+465 | |              if session_obj.message_id and session_obj.message_id != message_id:
+    | |________________________________________________________________________________^
+466 |                    await query.answer("This session is expired. Please use the active Game Night message.", show_alert=True)
+467 |                    return
+    |
+help: Combine `if` statements using `and`
+
+E501 Line too long (122 > 100)
+   --> src\bot\handlers.py:466:101
+    |
+464 |         if session_obj:
+465 |              if session_obj.message_id and session_obj.message_id != message_id:
+466 |                  await query.answer("This session is expired. Please use the active Game Night message.", show_alert=True)
+    |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^
+467 |                  return
+    |
+
+E501 Line too long (114 > 100)
+   --> src\bot\handlers.py:732:101
+    |
+730 |     if not valid_games:
+731 |         await context.bot.send_message(
+732 |             chat_id=chat_id, text=f"No games found matching {player_count} players (intersection of collections)."
+    |                                                                                                     ^^^^^^^^^^^^^^
+733 |         )
+734 |         return
+    |
+
+E501 Line too long (103 > 100)
+    --> src\bot\handlers.py:1045:101
+     |
+1043 |             if existing_session:
+1044 |                 # Clear session players first
+1045 |                 await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
+     |                                                                                                     ^^^
+1046 |                 # Delete the session itself
+1047 |                 await session.delete(existing_session)
+     |
+
+E501 Line too long (102 > 100)
+    --> src\bot\handlers.py:1227:101
+     |
+1225 |             names = [g.telegram_name for g in guests]
+1226 |             await update.message.reply_text(
+1227 |                 f"Could not find a matching guest in: {full_text}.\nActive guests: {', '.join(names)}"
+     |                                                                                                     ^^
+1228 |             )
+1229 |             return
+     |
+
+E501 Line too long (101 > 100)
+    --> src\bot\handlers.py:1301:101
+     |
+1299 |         session_obj = await session.get(Session, chat_id)
+1300 |         if session_obj:
+1301 |             # Transfer session ownership to this message (handles "Resume" from start_night conflict)
+     |                                                                                                     ^
+1302 |             session_obj.message_id = message_id
+1303 |             await session.commit()
+     |
+
+SIM105 Use `contextlib.suppress(Exception)` instead of `try`-`except`-`pass`
+    --> src\bot\handlers.py:1355:17
+     |
+1353 |               old_message_id = db_session.message_id
+1354 |               if old_message_id:
+1355 | /                 try:
+1356 | |                     await context.bot.edit_message_text(
+1357 | |                         chat_id=chat_id,
+1358 | |                         message_id=old_message_id,
+1359 | |                         text="­ƒÄ▓ **Game Night Cancelled** (A new one was started)",
+1360 | |                         parse_mode="Markdown",
+1361 | |                         reply_markup=None
+1362 | |                     )
+1363 | |                 except Exception:
+1364 | |                     pass  # Message might be deleted or inaccessible
+     | |________________________^
+1365 |
+1366 |               # Auto-Close Previous Polls
+     |
+help: Replace `try`-`except`-`pass` with `with contextlib.suppress(Exception): ...`
+
+E501 Line too long (111 > 100)
+    --> src\bot\handlers.py:1394:101
+     |
+1392 |             await session.commit()
+1393 |
+1394 |     # Get session for settings (not really needed for keyboard anymore but good for consistancy if we add back)
+     |                                                                                                     ^^^^^^^^^^^
+1395 |     # Actually, we don't need to fetch session just to show the basic keyboard anymore if weights are gone
+     |
+
+E501 Line too long (106 > 100)
+    --> src\bot\handlers.py:1395:101
+     |
+1394 |     # Get session for settings (not really needed for keyboard anymore but good for consistancy if we add back)
+1395 |     # Actually, we don't need to fetch session just to show the basic keyboard anymore if weights are gone
+     |                                                                                                     ^^^^^^
+1396 |
+1397 |     keyboard = [
+     |
+
+E501 Line too long (109 > 100)
+    --> src\bot\handlers.py:1452:101
+     |
+1450 |                 [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
+1451 |                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
+1452 |                 [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
+     |                                                                                                     ^^^^^^^^^
+1453 |                 [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
+1454 |                 [InlineKeyboardButton("­ƒöÖ Back to Lobby", callback_data="resume_night")]
+     |
+
+E501 Line too long (102 > 100)
+    --> src\bot\handlers.py:1453:101
+     |
+1451 |                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
+1452 |                 [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
+1453 |                 [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
+     |                                                                                                     ^^
+1454 |                 [InlineKeyboardButton("­ƒöÖ Back to Lobby", callback_data="resume_night")]
+1455 |             ]
+     |
+
+SIM105 Use `contextlib.suppress(Exception)` instead of `try`-`except`-`pass`
+    --> src\bot\handlers.py:1510:21
+     |
+1508 |                   except Exception:
+1509 |                       # If failed (e.g. not a poll), try to edit message (Custom Poll)
+1510 | /                     try:
+1511 | |                         await context.bot.edit_message_text(
+1512 | |                             chat_id=chat_id,
+1513 | |                             message_id=p.message_id,
+1514 | |                             text="­ƒøæ **Poll Closed** (New poll started)",
+1515 | |                             parse_mode="Markdown",
+1516 | |                             reply_markup=None
+1517 | |                         )
+1518 | |                     except Exception:
+1519 | |                         pass # Message might be deleted or inaccessible
+     | |____________________________^
+1520 |
+1521 |                   await session.delete(p)
+     |
+help: Replace `try`-`except`-`pass` with `with contextlib.suppress(Exception): ...`
+
+E501 Line too long (104 > 100)
+    --> src\bot\handlers.py:1538:101
+     |
+1536 |             await context.bot.send_message(
+1537 |                 chat_id=chat_id,
+1538 |                 text="No games in any player's collection! Use /setbgg or /addgame to add games first.",
+     |                                                                                                     ^^^^
+1539 |             )
+1540 |             return
+     |
+
+E501 Line too long (105 > 100)
+    --> src\bot\handlers.py:1751:101
+     |
+1749 |             # Close the poll!
+1750 |             try:
+1751 |                 poll_data = await context.bot.stop_poll(chat_id=chat_id, message_id=game_poll.message_id)
+     |                                                                                                     ^^^^^
+1752 |
+1753 |                 # Calculate Winner using extensible helper
+     |
+
+E501 Line too long (117 > 100)
+    --> src\bot\handlers.py:1772:102
+     |
+1770 |                         text = f"­ƒù│´©Å **Poll Closed!**\n\n­ƒÅå The winner is: **{winners[0]}**! ­ƒÄë"
+1771 |                     else:
+1772 |                         text = "­ƒù│´©Å **Poll Closed!**\n\nIt's a tie between:\n" + "\n".join([f"ÔÇó {w}" for w in winners])
+     |                                                                                                     ^^^^^^^^^^^^^^^^^
+1773 |
+1774 |                     if modifiers_applied:
+     |
+
+E501 Line too long (105 > 100)
+    --> src\bot\handlers.py:1838:101
+     |
+1836 |         #     if loss_count > 0:
+1837 |         #         modifier_score += STARVATION_BOOST * loss_count
+1838 |         #         modifiers_info.append(f"Starvation: +{STARVATION_BOOST * loss_count} for {clean_name}")
+     |                                                                                                     ^^^^^
+1839 |
+1840 |         scores[clean_name] = base_score + modifier_score
+     |
+
+B007 Loop control variable `col` not used within loop body
+    --> src\bot\handlers.py:1965:19
+     |
+1963 |         # Stay on same page - figure out which page the toggled game is on
+1964 |         game_id = int(parts[2])
+1965 |         for idx, (col, game) in enumerate(results):
+     |                   ^^^
+1966 |             if game.id == game_id:
+1967 |                 page = idx // GAMES_PER_PAGE
+     |
+help: Rename unused `col` to `_col`
+
+E501 Line too long (101 > 100)
+    --> src\bot\handlers.py:2078:101
+     |
+2076 |         [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
+2077 |         [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
+2078 |         [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
+     |                                                                                                     ^
+2079 |         [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
+2080 |         [InlineKeyboardButton("­ƒöÖ Back to Lobby", callback_data="resume_night")]
+     |
+
+E501 Line too long (109 > 100)
+    --> src\bot\handlers.py:2129:101
+     |
+2127 |                 [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
+2128 |                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
+2129 |                 [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
+     |                                                                                                     ^^^^^^^^^
+2130 |                 [InlineKeyboardButton("­ƒöÖ Back to Lobby", callback_data="resume_night")]
+2131 |             ]
+     |
+
+E501 Line too long (109 > 100)
+    --> src\bot\handlers.py:2175:101
+     |
+2173 |                 [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
+2174 |                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
+2175 |                 [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
+     |                                                                                                     ^^^^^^^^^
+2176 |                 [InlineKeyboardButton("­ƒöÖ Back to Lobby", callback_data="resume_night")]
+2177 |             ]
+     |
+
+E501 Line too long (109 > 100)
+    --> src\bot\handlers.py:2230:101
+     |
+2228 |                 [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
+2229 |                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
+2230 |                 [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
+     |                                                                                                     ^^^^^^^^^
+2231 |                 [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
+2232 |                 [InlineKeyboardButton("­ƒöÖ Back to Lobby", callback_data="resume_night")]
+     |
+
+E501 Line too long (102 > 100)
+    --> src\bot\handlers.py:2231:101
+     |
+2229 |                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
+2230 |                 [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
+2231 |                 [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
+     |                                                                                                     ^^
+2232 |                 [InlineKeyboardButton("­ƒöÖ Back to Lobby", callback_data="resume_night")]
+2233 |             ]
+     |
+
+E501 Line too long (103 > 100)
+    --> src\bot\handlers.py:2364:101
+     |
+2362 |         if valid_games:
+2363 |             await render_poll_message(
+2364 |                 context.bot, chat_id, game_poll.message_id, session, poll_id, valid_games, priority_ids
+     |                                                                                                     ^^^
+2365 |             )
+     |
+
+E501 Line too long (107 > 100)
+    --> src\bot\handlers.py:2581:101
+     |
+2579 |                 valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+2580 |                 await render_poll_message(
+2581 |                     context.bot, chat_id, game_poll.message_id, session, poll_id, valid_games, priority_ids
+     |                                                                                                     ^^^^^^^
+2582 |                 )
+     |
+
+E501 Line too long (111 > 100)
+    --> src\bot\handlers.py:2597:101
+     |
+2595 |                     valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+2596 |                     await render_poll_message(
+2597 |                         context.bot, chat_id, game_poll.message_id, session, poll_id, valid_games, priority_ids
+     |                                                                                                     ^^^^^^^^^^^
+2598 |                     )
+2599 |         await query.answer("Visibility toggled")
+     |
+
+E402 Module level import not at top of file
+  --> src\bot\main.py:10:1
+   |
+ 8 | load_dotenv()
+ 9 |
+10 | from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, PollAnswerHandler
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+11 |
+12 | from src.bot.handlers import (
+   |
+
+E402 Module level import not at top of file
+  --> src\bot\main.py:12:1
+   |
+10 |   from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, PollAnswerHandler
+11 |
+12 | / from src.bot.handlers import (
+13 | |     add_game,
+14 | |     add_guest,
+15 | |     cancel_night,
+16 | |     cancel_night_callback,
+17 | |     create_poll,
+18 | |     custom_poll_action_callback,
+19 | |     custom_poll_vote_callback,
+20 | |     cycle_vote_limit_callback,
+21 | |     guest_game,
+22 | |     help_command,
+23 | |     join_lobby_callback,
+24 | |     leave_lobby_callback,
+25 | |     manage_collection,
+26 | |     manage_collection_callback,
+27 | |     poll_settings_callback,
+28 | |     receive_poll_answer,
+29 | |     restart_night_callback,
+30 | |     resume_night_callback,
+31 | |     set_bgg,
+32 | |     start,
+33 | |     start_night,
+34 | |     start_poll_callback,
+35 | |     test_mode,
+36 | |     toggle_hide_voters_callback,
+37 | |     toggle_poll_mode_callback,
+38 | |     toggle_weights_callback,
+39 | | )
+   | |_^
+40 |   from src.core.db import init_db
+   |
+
+E402 Module level import not at top of file
+  --> src\bot\main.py:40:1
+   |
+38 |     toggle_weights_callback,
+39 | )
+40 | from src.core.db import init_db
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+41 |
+42 | logging.basicConfig(
+   |
+
+E501 Line too long (101 > 100)
+  --> src\bot\main.py:80:101
+   |
+78 |     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_refresh:"))
+79 |     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_close:"))
+80 |     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_random_vote:"))
+   |                                                                                                     ^
+81 |     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_toggle_voters:"))
+82 |     app.add_handler(CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$"))
+   |
+
+E501 Line too long (103 > 100)
+  --> src\bot\main.py:81:101
+   |
+79 |     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_close:"))
+80 |     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_random_vote:"))
+81 |     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_toggle_voters:"))
+   |                                                                                                     ^^^
+82 |     app.add_handler(CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$"))
+83 |     app.add_handler(CallbackQueryHandler(cycle_vote_limit_callback, pattern=r"^cycle_vote_limit$"))
+   |
+
+E501 Line too long (103 > 100)
+  --> src\bot\main.py:82:101
+   |
+80 |     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_random_vote:"))
+81 |     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_toggle_voters:"))
+82 |     app.add_handler(CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$"))
+   |                                                                                                     ^^^
+83 |     app.add_handler(CallbackQueryHandler(cycle_vote_limit_callback, pattern=r"^cycle_vote_limit$"))
+84 |     app.add_handler(CallbackQueryHandler(manage_collection_callback, pattern="^manage:"))
+   |
+
+E501 Line too long (139 > 100)
+  --> src\core\bgg.py:21:101
+   |
+19 | ÔÇª
+20 | ÔÇª
+21 | ÔÇª.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+   |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+22 | ÔÇª
+23 | ÔÇª
+   |
+
+E501 Line too long (104 > 100)
+  --> src\core\bgg.py:62:101
+   |
+60 |                         if attempt < 4:
+61 |                             logger.warning(
+62 |                                 f"BGG returned 202 (Queued) for {username}. Retrying in {wait_time}s..."
+   |                                                                                                     ^^^^
+63 |                             )
+64 |                             # Use asyncio.sleep
+   |
+
+B904 Within an `except` clause, raise exceptions with `raise ... from err` or `raise ... from None` to distinguish them from errors in exception handling
+  --> src\core\bgg.py:87:25
+   |
+85 |                     if e.response.status_code == 404:
+86 |                         logger.warning(f"BGG user not found: {username}")
+87 |                         raise ValueError(f"User '{username}' not found on BoardGameGeek")
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+88 |                     logger.error(f"HTTP error fetching BGG collection for {username}: {e}")
+89 |                     raise
+   |
+
+SIM102 Use a single `if` statement instead of nested `if` statements
+  --> src\core\db.py:18:1
+   |
+16 |   if DATABASE_URL.startswith("postgres://"):
+17 |       DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+18 | / elif DATABASE_URL.startswith("postgresql://") and "asyncpg" not in DATABASE_URL:
+19 | |     # Ensure async driver is used
+20 | |     if "+" not in DATABASE_URL.split("://")[0]:
+   | |_______________________________________________^
+21 |           DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+   |
+help: Combine `if` statements using `and`
+
+E501 Line too long (106 > 100)
+   --> src\core\models.py:166:101
+    |
+164 |     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+165 |     # game_id is nullable: NULL for native polls, set for custom polls
+166 |     game_id: Mapped[int | None] = mapped_column(BigInteger, primary_key=True, nullable=True, default=None)
+    |                                                                                                     ^^^^^^
+167 |     user_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    |
+
+Found 40 errors.

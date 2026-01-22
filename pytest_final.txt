@@ -1,0 +1,36 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.12, pytest-9.0.2, pluggy-1.6.0
+rootdir: C:\Users\joaoc\Projects\game-night-decider
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0, cov-7.0.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 120 items
+
+tests\test_bgg.py .....                                                  [  4%]
+tests\test_custom_poll.py .........................                      [ 25%]
+tests\test_handlers_core.py .......                                      [ 30%]
+tests\test_handlers_game.py ....................                         [ 47%]
+tests\test_handlers_session.py ..........................                [ 69%]
+tests\test_logic.py ................                                     [ 82%]
+tests\test_poll_auto_close.py .                                          [ 83%]
+tests\test_poll_edge_cases.py ....                                       [ 86%]
+tests\test_vote_limit.py ..............                                  [ 98%]
+tests\test_weighted_votes.py ..                                          [100%]
+
+=============================== tests coverage ================================
+______________ coverage: platform win32, python 3.12.12-final-0 _______________
+
+Name                   Stmts   Miss  Cover   Missing
+----------------------------------------------------
+src\__init__.py            0      0   100%
+src\bot\__init__.py        0      0   100%
+src\bot\handlers.py     1304    341    74%   58-59, 127, 186, 192-212, 234-312, 334, 338-341, 348-349, 353-354, 469-473, 529, 574-575, 592-593, 641, 760, 766-771, 906-907, 912-918, 979-983, 1106-1108, 1156-1160, 1191-1192, 1207-1208, 1236-1241, 1246-1249, 1286, 1307-1352, 1359-1433, 1448-1449, 1504-1505, 1512-1515, 1518-1521, 1532-1535, 1558-1565, 1596-1599, 1610-1650, 1669-1680, 1687-1708, 1728, 1739, 1772, 1789, 1795, 1801, 1809, 1813-1814, 1891-1947, 1956-1966, 1972-1977, 1986-1989, 1993-2006, 2019-2053, 2094-2095, 2149-2150, 2192-2229, 2253-2254, 2261-2262, 2358-2359, 2540, 2581, 2599, 2623-2626, 2655-2675, 2682-2683, 2705-2706, 2737-2740, 2744-2749, 2776
+src\bot\main.py           52     52     0%   1-112
+src\core\__init__.py       0      0   100%
+src\core\bgg.py          245    155    37%   20-28, 41-101, 112, 117, 140-141, 156-158, 173-191, 207-209, 223-241, 306-308, 320-358, 362-380, 393-410, 414-478
+src\core\db.py            21      8    62%   17, 23, 31-36, 41-42
+src\core\logic.py        122     23    81%   66, 96, 109, 117, 140-159, 175-176, 180, 205-206, 211, 213
+src\core\models.py        94      0   100%
+----------------------------------------------------
+TOTAL                   1838    579    68%
+============================= 120 passed in 8.54s =============================

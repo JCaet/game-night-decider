@@ -45,7 +45,7 @@ async def migrate():
             await conn.execute(text("ALTER TABLE sessions ADD COLUMN poll_type INTEGER DEFAULT 0"))
             # Migrate data: True (custom) -> 0, False (native) -> 1
             await conn.execute(text("""
-                UPDATE sessions SET poll_type = CASE 
+                UPDATE sessions SET poll_type = CASE
                     WHEN settings_single_poll = 1 THEN 0
                     ELSE 1
                 END

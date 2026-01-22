@@ -1,0 +1,76 @@
+﻿SIM105 Use `contextlib.suppress(Exception)` instead of `try`-`except`-`pass`
+    --> src\bot\handlers.py:1526:21
+     |
+1524 |                   except Exception:
+1525 |                       # If failed (e.g. not a poll), try to edit message (Custom Poll)
+1526 | /                     try:
+1527 | |                         await context.bot.edit_message_text(
+1528 | |                             chat_id=chat_id,
+1529 | |                             message_id=p.message_id,
+1530 | |                             text="­ƒøæ **Poll Closed** (New poll started)",
+1531 | |                             parse_mode="Markdown",
+1532 | |                             reply_markup=None
+1533 | |                         )
+1534 | |                     except Exception:
+1535 | |                         pass # Message might be deleted or inaccessible
+     | |____________________________^
+1536 |
+1537 |                   await session.delete(p)
+     |
+help: Replace `try`-`except`-`pass` with `with contextlib.suppress(Exception): ...`
+
+E402 Module level import not at top of file
+  --> src\bot\main.py:10:1
+   |
+ 8 | load_dotenv()
+ 9 |
+10 | from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, PollAnswerHandler
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+11 |
+12 | from src.core.db import init_db  # noqa: E402
+   |
+
+I001 [*] Import block is un-sorted or un-formatted
+  --> src\bot\main.py:10:1
+   |
+ 8 |   load_dotenv()
+ 9 |
+10 | / from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, PollAnswerHandler
+11 | |
+12 | | from src.core.db import init_db  # noqa: E402
+13 | | from src.bot.handlers import (  # noqa: E402
+14 | |     add_game,
+15 | |     add_guest,
+16 | |     cancel_night,
+17 | |     cancel_night_callback,
+18 | |     create_poll,
+19 | |     custom_poll_action_callback,
+20 | |     custom_poll_vote_callback,
+21 | |     cycle_vote_limit_callback,
+22 | |     guest_game,
+23 | |     help_command,
+24 | |     join_lobby_callback,
+25 | |     leave_lobby_callback,
+26 | |     manage_collection,
+27 | |     manage_collection_callback,
+28 | |     poll_settings_callback,
+29 | |     receive_poll_answer,
+30 | |     restart_night_callback,
+31 | |     resume_night_callback,
+32 | |     set_bgg,
+33 | |     start,
+34 | |     start_night,
+35 | |     start_poll_callback,
+36 | |     test_mode,
+37 | |     toggle_hide_voters_callback,
+38 | |     toggle_poll_mode_callback,
+39 | |     toggle_weights_callback,
+40 | | )
+   | |_^
+41 |
+42 |   logging.basicConfig(
+   |
+help: Organize imports
+
+Found 3 errors.
+[*] 1 fixable with the `--fix` option.

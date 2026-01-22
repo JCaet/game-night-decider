@@ -154,10 +154,7 @@ def split_games(
                 max_c = chunk[-1].complexity or 0
                 base_label = _get_complexity_label(min_c, max_c)
 
-                if len(chunks) > 1:
-                    label = f"{base_label} ({idx + 1}/{len(chunks)})"
-                else:
-                    label = base_label
+                label = f"{base_label} ({idx + 1}/{len(chunks)})" if len(chunks) > 1 else base_label
                 results.append((label, chunk))
             return results
 
@@ -191,17 +188,17 @@ def split_games(
 def group_games_by_complexity(games: list[Game]) -> dict[int, list[Game]]:
     """
     Group games by their integer complexity level (floor).
-    
+
     Args:
         games: List of games to group.
-        
+
     Returns:
         Dictionary mapping complexity level (1-5) to list of games.
         Games with complexity < 1.0 are grouped under 1.
         Games with complexity >= 5.0 are grouped under 5.
         Games with complexity None are grouped under 0 (Unrated).
     """
-    groups = {0: [], 1: [], 2: [], 3: [], 4: [], 5: []}
+    groups: dict[int, list[Game]] = {0: [], 1: [], 2: [], 3: [], 4: [], 5: []}
 
     for game in games:
         if game.complexity is None or game.complexity <= 0:

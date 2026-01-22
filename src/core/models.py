@@ -163,7 +163,9 @@ class PollVote(Base):
     )
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     # game_id is nullable: NULL for native polls, set for custom polls
-    game_id: Mapped[int | None] = mapped_column(BigInteger, primary_key=True, nullable=True, default=None)
+    game_id: Mapped[int | None] = mapped_column(
+        BigInteger, primary_key=True, nullable=True, default=None
+    )
     user_name: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Relationships

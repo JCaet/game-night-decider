@@ -1,0 +1,158 @@
+﻿E501 Line too long (107 > 100)
+  --> scripts\add_weighted_column.py:21:101
+   |
+19 |             logger.info("Attempting to add settings_weighted column to sessions table...")
+20 |             # SQLite syntax to add column
+21 |             await conn.execute(text("ALTER TABLE sessions ADD COLUMN settings_weighted BOOLEAN DEFAULT 0"))
+   |                                                                                                     ^^^^^^^
+22 |             logger.info("Successfully added settings_weighted column.")
+23 |         except Exception as e:
+   |
+
+E501 Line too long (123 > 100)
+ --> scripts\debug_poll_dummy.py:2:101
+  |
+1 | # Simple test script to run create_poll logic locally if possible
+2 | # BUT handlers require Telegram Update/Context objects which are hard to mock fully in a script script without a framework.
+  |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^
+3 | # Instead, I'll rely on reading code.
+4 | # The code view will happen in parallel.
+  |
+
+E501 Line too long (135 > 100)
+  --> scripts\manual_tests\test_bgg_api_debug.py:32:101
+   |
+31 |     headers = {
+32 |         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+33 |     }
+   |
+
+E501 Line too long (135 > 100)
+  --> scripts\manual_tests\test_params.py:23:101
+   |
+22 |     headers = {
+23 |         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+24 |     }
+   |
+
+E722 Do not use bare `except`
+  --> scripts\manual_tests\test_real_token.py:12:5
+   |
+10 |         with open(".env") as f:
+11 |             content = f.read()
+12 |     except:
+   |     ^^^^^^
+13 |         print("Could not read .env")
+14 |         return
+   |
+
+E501 Line too long (136 > 100)
+  --> scripts\manual_tests\test_real_token.py:28:101
+   |
+26 | ÔÇª
+27 | ÔÇª
+28 | ÔÇª Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+   |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+29 | ÔÇª
+30 | ÔÇª
+   |
+
+E501 Line too long (135 > 100)
+  --> scripts\manual_tests\test_search.py:11:101
+   |
+ 9 |     params = {"query": "Catan", "type": "boardgame"}
+10 |     header = {
+11 |         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+12 |     }
+   |
+
+E501 Line too long (122 > 100)
+  --> scripts\manual_tests\test_ua.py:11:101
+   |
+10 |     user_agents = [
+11 |         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^
+12 |         "GameNightDecider/1.0 (Telegram Bot)",
+13 |         "python-httpx/0.27.0",
+   |
+
+E501 Line too long (128 > 100)
+  --> scripts\manual_tests\test_ua.py:15:101
+   |
+13 |         "python-httpx/0.27.0",
+14 |         "PostmanRuntime/7.26.8",
+15 |         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+   |                                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+16 |         "",  # No User-Agent
+17 |     ]
+   |
+
+E402 Module level import not at top of file
+  --> scripts\migrate_custom_poll.py:20:1
+   |
+18 | sys.path.insert(0, str(project_root))
+19 |
+20 | from sqlalchemy import inspect, text
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+21 | from sqlalchemy.ext.asyncio import create_async_engine
+   |
+
+E402 Module level import not at top of file
+  --> scripts\migrate_custom_poll.py:21:1
+   |
+20 | from sqlalchemy import inspect, text
+21 | from sqlalchemy.ext.asyncio import create_async_engine
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+22 |
+23 | logging.basicConfig(level=logging.INFO)
+   |
+
+W291 Trailing whitespace
+  --> scripts\migrate_custom_poll.py:48:53
+   |
+46 |             # Migrate data: True (custom) -> 0, False (native) -> 1
+47 |             await conn.execute(text("""
+48 |                 UPDATE sessions SET poll_type = CASE 
+   |                                                     ^
+49 |                     WHEN settings_single_poll = 1 THEN 0
+50 |                     ELSE 1
+   |
+help: Remove trailing whitespace
+
+E501 Line too long (101 > 100)
+  --> scripts\migrate_hide_voters.py:19:101
+   |
+17 |         try:
+18 |             # Check if column exists pragma
+19 |             await conn.execute(text("ALTER TABLE sessions ADD COLUMN hide_voters BOOLEAN DEFAULT 0"))
+   |                                                                                                     ^
+20 |             print("Added hide_voters column.")
+21 |         except Exception as e:
+   |
+
+E501 Line too long (103 > 100)
+  --> scripts\refresh_complexity.py:22:101
+   |
+20 |         # Get all games with no complexity
+21 |         result = await session.execute(
+22 |             select(Game).where(Game.complexity <= 0, Game.id > 0)  # Only real BGG games (positive IDs)
+   |                                                                                                     ^^^
+23 |         )
+24 |         games = result.scalars().all()
+   |
+
+E501 Line too long (102 > 100)
+  --> scripts\sync_bot_config.py:71:100
+   |
+69 | # Leave None to keep current
+70 | BOT_SHORT_DESCRIPTION: str | None = (
+71 |     "Your board game night companion! ­ƒÄ▓ Syncs BGG collections and helps groups vote on what to play."
+   |                                                                                                     ^^
+72 | )
+   |
+
+Found 15 errors.
+No fixes available (1 hidden fix can be enabled with the `--unsafe-fixes` option).

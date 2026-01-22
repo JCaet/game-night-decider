@@ -1,6 +1,10 @@
+import contextlib
 import logging
 import math
 import random
+from collections import namedtuple
+
+ResolvedVote = namedtuple("ResolvedVote", ["game_id", "user_id"])
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
@@ -51,9 +55,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if os.path.exists(banner_path):
-        await update.message.reply_photo(
-            photo=open(banner_path, "rb"), caption=caption, parse_mode="Markdown"
-        )
+        with open(banner_path, "rb") as f:
+            await update.message.reply_photo(
+                photo=f, caption=caption, parse_mode="Markdown"
+            )
     else:
         await update.message.reply_text(caption, parse_mode="Markdown")
 
@@ -184,13 +189,12 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             complexity_updated = 0
             if games_needing_complexity:
                 # Update status message instead of sending new one
-                try:
+                with contextlib.suppress(Exception):
                     await status_msg.edit_text(
                         f"⏳ Linked BGG account: {bgg_username}\n"
-                        f"• Fetching computed complexity for {len(games_needing_complexity)} games..."
+                        f"• Fetching computed complexity for {len(games_needing_complexity)} "
+                        "games..."
                     )
-                except Exception:
-                    pass  # Ignore edit errors (e.g. message too old)
 
                 import asyncio
                 for game_id in games_needing_complexity:
@@ -218,13 +222,11 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             # Update status for expansion sync
-            try:
+            with contextlib.suppress(Exception):
                 await status_msg.edit_text(
                     f"⏳ Linked BGG account: {bgg_username}\n"
                     f"• Syncing expansions..."
                 )
-            except Exception:
-                pass
 
             expansions_data = await bgg.fetch_expansions(bgg_username)
 
@@ -410,7 +412,7 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
 
         # Clean up orphaned guests from previous session
-        await session.execute(delete(User).where(User.is_guest == True))
+        await session.execute(delete(User).where(User.is_guest))
 
         db_session.is_active = True
         await session.commit()
@@ -424,11 +426,12 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
     banner_path = project_root / "assets" / "welcome_banner.png"
 
     if banner_path.exists():
-        await update.message.reply_photo(
-            photo=open(banner_path, "rb"),
-            caption="🎲 **Game Night Started!**",
-            parse_mode="Markdown",
-        )
+        with open(banner_path, "rb") as f:
+            await update.message.reply_photo(
+                photo=f,
+                caption="🎲 **Game Night Started!**",
+                parse_mode="Markdown",
+            )
 
     keyboard = [
         [
@@ -462,10 +465,12 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     async with db.AsyncSessionLocal() as session:
         # Validate Session Message ID
         session_obj = await session.get(Session, chat_id)
-        if session_obj:
-             if session_obj.message_id and session_obj.message_id != message_id:
-                 await query.answer("This session is expired. Please use the active Game Night message.", show_alert=True)
-                 return
+        if session_obj and session_obj.message_id and session_obj.message_id != message_id:
+            await query.answer(
+                "This session is expired. Please use the active Game Night message.",
+                show_alert=True,
+            )
+            return
 
         stmt = select(User).where(User.telegram_id == user.id)
         result = await session.execute(stmt)
@@ -487,10 +492,10 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     async with db.AsyncSessionLocal() as session:
         # Check if already joined
         # Need to re-fetch user within this session? No, just use ID.
-        stmt = select(SessionPlayer).where(
+        player_stmt = select(SessionPlayer).where(
             SessionPlayer.session_id == chat_id, SessionPlayer.user_id == user.id
         )
-        existing = (await session.execute(stmt)).scalar_one_or_none()
+        existing = (await session.execute(player_stmt)).scalar_one_or_none()
 
         if existing:
             # Already joined
@@ -526,8 +531,6 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # Get session settings
         session_obj = await session.get(Session, chat_id)
-        is_weighted = session_obj.settings_weighted if session_obj else False
-        weight_icon = "✅" if is_weighted else "❌"
 
     keyboard = [
         [
@@ -585,10 +588,9 @@ async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     async with db.AsyncSessionLocal() as session:
         # Validate Session Message ID
         session_obj = await session.get(Session, chat_id)
-        if session_obj:
-             if session_obj.message_id and session_obj.message_id != message_id:
-                 await query.answer("This session is expired.", show_alert=True)
-                 return
+        if session_obj and session_obj.message_id and session_obj.message_id != message_id:
+            await query.answer("This session is expired.", show_alert=True)
+            return
 
         await query.answer()
 
@@ -641,8 +643,6 @@ async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # Get session settings
         session_obj = await session.get(Session, chat_id)
-        is_weighted = session_obj.settings_weighted if session_obj else False
-        weight_icon = "✅" if is_weighted else "❌"
 
 
     keyboard = [
@@ -735,18 +735,21 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not valid_games:
         await context.bot.send_message(
-            chat_id=chat_id, text=f"No games found matching {player_count} players (intersection of collections)."
+            chat_id=chat_id,
+            text=f"No games found matching {player_count} players (intersection of collections).",
         )
         return
 
     # Check Poll Mode
     session_obj = await session.get(Session, chat_id)
     if session_obj and session_obj.poll_type == PollType.CUSTOM:
-        await create_custom_poll(update, context, session, valid_games, priority_game_ids)
+        await create_custom_poll(
+            update, context, session, list(valid_games), priority_game_ids
+        )
         return
 
     # Filter/Sort
-    chunks = split_games(valid_games)
+    chunks = split_games(list(valid_games))
 
     for label, games_chunk in chunks:
         options = []
@@ -1048,13 +1051,15 @@ async def test_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             existing_session = await session.get(Session, chat_id)
             if existing_session:
                 # Clear session players first
-                await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
+                await session.execute(
+                    delete(SessionPlayer).where(SessionPlayer.session_id == chat_id)
+                )
                 # Delete the session itself
                 await session.delete(existing_session)
                 await session.flush()
 
             # Clean up orphaned guests from previous sessions
-            await session.execute(delete(User).where(User.is_guest == True))
+            await session.execute(delete(User).where(User.is_guest))
 
             # Create a fresh new session
             db_session = Session(chat_id=chat_id, is_active=True)
@@ -1155,14 +1160,14 @@ async def guest_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = list(context.args)
-    numeric_values = []
+    numeric_values: list[float] = []
 
     # extracted numeric args from the end (max 3: complexity, max, min)
     # We iterate backwards
     while args and len(numeric_values) < 3:
         last_arg = args[-1]
         try:
-            val = float(last_arg)
+            float(last_arg)
             # If it's the 1st or 2nd arg (min/max), it should be int-able conceptually
             # but float parsing is safe generic check.
             numeric_values.insert(0, args.pop())
@@ -1194,7 +1199,7 @@ async def guest_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stmt = (
             select(User)
             .join(SessionPlayer, User.telegram_id == SessionPlayer.user_id)
-            .where(SessionPlayer.session_id == chat_id, User.is_guest == True)
+            .where(SessionPlayer.session_id == chat_id, User.is_guest)
         )
         guests = (await session.execute(stmt)).scalars().all()
 
@@ -1230,7 +1235,8 @@ async def guest_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not matched_guest:
             names = [g.telegram_name for g in guests]
             await update.message.reply_text(
-                f"Could not find a matching guest in: {full_text}.\nActive guests: {', '.join(names)}"
+                f"Could not find a matching guest in: {full_text}.\n"
+                f"Active guests: {', '.join(names)}"
             )
             return
 
@@ -1253,8 +1259,11 @@ async def guest_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if found_games:
             # Pick the best match? Prioritize real BGG games (positive ID)
-            found_games.sort(key=lambda x: x.id > 0, reverse=True)
-            game = found_games[0]
+            # scalar() returns a Game object, scalars().all() returns a list
+            # We need to sort the list
+            found_list = list(found_games)
+            found_list.sort(key=lambda x: x.id > 0, reverse=True)
+            game = found_list[0]
 
         if not game:
             # Not found, create manual manual game
@@ -1304,7 +1313,8 @@ async def resume_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
     async with db.AsyncSessionLocal() as session:
         session_obj = await session.get(Session, chat_id)
         if session_obj:
-            # Transfer session ownership to this message (handles "Resume" from start_night conflict)
+            # Transfer session ownership to this message
+            # (handles "Resume" from start_night conflict)
             session_obj.message_id = message_id
             await session.commit()
 
@@ -1358,16 +1368,14 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
             # Cancel the OLD lobby message if it exists
             old_message_id = db_session.message_id
             if old_message_id:
-                try:
+                with contextlib.suppress(Exception):
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=old_message_id,
                         text="🎲 **Game Night Cancelled** (A new one was started)",
                         parse_mode="Markdown",
-                        reply_markup=None
+                        reply_markup=None,
                     )
-                except Exception:
-                    pass  # Message might be deleted or inaccessible
 
             # Auto-Close Previous Polls
             existing_polls_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
@@ -1378,7 +1386,7 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
                     try:
                         await context.bot.stop_poll(chat_id, p.message_id)
                     except Exception:
-                        try:
+                        with contextlib.suppress(Exception):
                             await context.bot.edit_message_text(
                                 chat_id=chat_id,
                                 message_id=p.message_id,
@@ -1386,21 +1394,21 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
                                 parse_mode="Markdown",
                                 reply_markup=None
                             )
-                        except Exception:
-                            pass
                     await session.delete(p)
 
             # Clear players
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
 
             # Clean up orphaned guests
-            await session.execute(delete(User).where(User.is_guest == True))
+            await session.execute(delete(User).where(User.is_guest))
 
             db_session.is_active = True
             await session.commit()
 
-    # Get session for settings (not really needed for keyboard anymore but good for consistancy if we add back)
-    # Actually, we don't need to fetch session just to show the basic keyboard anymore if weights are gone
+    # Get session for settings (not really needed for keyboard anymore but good
+    # for consistancy if we add back)
+    # Actually, we don't need to fetch session just to show the basic keyboard
+    # anymore if weights are gone
 
     keyboard = [
         [
@@ -1457,9 +1465,17 @@ async def toggle_weights_callback(update: Update, context: ContextTypes.DEFAULT_
             keyboard = [
                 [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
-                [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
-                [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
-                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")]
+                [
+                    InlineKeyboardButton(
+                        f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit"
+                    )
+                ],
+                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
             ]
 
             await query.edit_message_text(
@@ -1484,10 +1500,9 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     async with db.AsyncSessionLocal() as session:
         # Validate Session Message ID
         session_obj = await session.get(Session, chat_id)
-        if session_obj:
-             if session_obj.message_id and session_obj.message_id != message_id:
-                 await query.answer("This session is expired.", show_alert=True)
-                 return
+        if session_obj and session_obj.message_id and session_obj.message_id != message_id:
+            await query.answer("This session is expired.", show_alert=True)
+            return
 
         # Get Players
         stmt = select(SessionPlayer).where(SessionPlayer.session_id == chat_id)
@@ -1516,16 +1531,14 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                     await context.bot.stop_poll(chat_id, p.message_id)
                 except Exception:
                     # If failed (e.g. not a poll), try to edit message (Custom Poll)
-                    try:
+                    with contextlib.suppress(Exception):
                         await context.bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=p.message_id,
                             text="🛑 **Poll Closed** (New poll started)",
                             parse_mode="Markdown",
-                            reply_markup=None
+                            reply_markup=None,
                         )
-                    except Exception:
-                        pass # Message might be deleted or inaccessible
 
                 await session.delete(p)
             await session.commit()
@@ -1544,7 +1557,10 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if total_games == 0:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="No games in any player's collection! Use /setbgg or /addgame to add games first.",
+                text=(
+                    "No games in any player's collection! "
+                    "Use /setbgg or /addgame to add games first."
+                ),
             )
             return
 
@@ -1585,11 +1601,13 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Check Poll Mode
     session_obj = await session.get(Session, chat_id)
     if session_obj and session_obj.poll_type == PollType.CUSTOM:
-        await create_custom_poll(update, context, session, valid_games, priority_game_ids)
+        await create_custom_poll(
+            update, context, session, list(valid_games), priority_game_ids
+        )
         return
 
     # Filter/Sort
-    chunks = split_games(valid_games)
+    chunks = split_games(list(valid_games))
 
     for label, games_chunk in chunks:
         options = []
@@ -1644,10 +1662,9 @@ async def cancel_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
         db_session = await session.get(Session, chat_id)
 
         # Validate Session Message ID
-        if db_session:
-             if db_session.message_id and db_session.message_id != message_id:
-                 await query.answer("This session is expired.", show_alert=True)
-                 return
+        if db_session and db_session.message_id and db_session.message_id != message_id:
+            await query.answer("This session is expired.", show_alert=True)
+            return
 
         if db_session:
             # Clear players
@@ -1758,7 +1775,9 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
         if voters_count >= players_count:
             # Close the poll!
             try:
-                poll_data = await context.bot.stop_poll(chat_id=chat_id, message_id=game_poll.message_id)
+                poll_data = await context.bot.stop_poll(
+                    chat_id=chat_id, message_id=game_poll.message_id
+                )
 
                 # Calculate Winner using extensible helper
                 scores, modifiers_applied = await calculate_winner_scores(
@@ -1779,7 +1798,10 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
                     if len(winners) == 1:
                         text = f"🗳️ **Poll Closed!**\n\n🏆 The winner is: **{winners[0]}**! 🎉"
                     else:
-                        text = "🗳️ **Poll Closed!**\n\nIt's a tie between:\n" + "\n".join([f"• {w}" for w in winners])
+                        text = (
+                            "🗳️ **Poll Closed!**\n\nIt's a tie between:\n"
+                            + "\n".join([f"• {w}" for w in winners])
+                        )
 
                     if modifiers_applied:
                         text += f"\n_{modifiers_applied}_"
@@ -1795,12 +1817,12 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def calculate_winner_scores(poll_data, chat_id: int, session, is_weighted: bool):
     """
     Calculate scores for each game option, applying modifiers.
-    
+
     Returns:
         tuple: (scores_dict, modifiers_summary_string)
             - scores_dict: {game_name: final_score}
             - modifiers_summary_string: Human-readable string of applied modifiers (or empty)
-    
+
     This function is designed for extensibility. Add new modifiers here.
     """
     scores = {}
@@ -1845,7 +1867,9 @@ async def calculate_winner_scores(poll_data, chat_id: int, session, is_weighted:
         #     loss_count = await get_game_loss_count(game.id, session)
         #     if loss_count > 0:
         #         modifier_score += STARVATION_BOOST * loss_count
-        #         modifiers_info.append(f"Starvation: +{STARVATION_BOOST * loss_count} for {clean_name}")
+        #         modifiers_info.append(
+        #             f"Starvation: +{STARVATION_BOOST * loss_count} for {clean_name}"
+        #         )
 
         scores[clean_name] = base_score + modifier_score
 
@@ -1886,7 +1910,7 @@ async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Build keyboard with first page
-    keyboard, total_pages = _build_manage_keyboard(results, page=0)
+    keyboard, total_pages = _build_manage_keyboard(list(results), page=0)
 
     collection_message = (
         f"📚 **Your Collection** ({len(results)} games)\n"
@@ -1972,12 +1996,12 @@ async def manage_collection_callback(update: Update, context: ContextTypes.DEFAU
     elif action == "toggle":
         # Stay on same page - figure out which page the toggled game is on
         game_id = int(parts[2])
-        for idx, (col, game) in enumerate(results):
+        for idx, (_col, game) in enumerate(results):
             if game.id == game_id:
                 page = idx // GAMES_PER_PAGE
                 break
 
-    keyboard, total_pages = _build_manage_keyboard(results, page)
+    keyboard, total_pages = _build_manage_keyboard(list(results), page)
 
     await query.edit_message_text(
         f"📚 **Your Collection** ({len(results)} games)\n"
@@ -2066,10 +2090,9 @@ async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
     async with db.AsyncSessionLocal() as session:
         session_obj = await session.get(Session, chat_id)
 
-        if session_obj:
-             if session_obj.message_id and session_obj.message_id != message_id:
-                 await query.answer("This session is expired.", show_alert=True)
-                 return
+        if session_obj and session_obj.message_id and session_obj.message_id != message_id:
+            await query.answer("This session is expired.", show_alert=True)
+            return
 
         if not session_obj:
             return
@@ -2086,9 +2109,17 @@ async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
     keyboard = [
         [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
         [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
-        [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
-        [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
-        [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")]
+        [
+            InlineKeyboardButton(
+                f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit"
+            )
+        ],
+        [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
     ]
 
     await query.edit_message_text(
@@ -2137,8 +2168,12 @@ async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAUL
             keyboard = [
                 [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
-                [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
-                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")]
+                [
+                    InlineKeyboardButton(
+                        f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
+                    )
+                ],
+                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
             ]
 
             await query.edit_message_text(
@@ -2183,8 +2218,12 @@ async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFA
             keyboard = [
                 [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
-                [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
-                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")]
+                [
+                    InlineKeyboardButton(
+                        f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
+                    )
+                ],
+                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
             ]
 
             await query.edit_message_text(
@@ -2238,9 +2277,17 @@ async def cycle_vote_limit_callback(update: Update, context: ContextTypes.DEFAUL
             keyboard = [
                 [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
                 [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
-                [InlineKeyboardButton(f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters")],
-                [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
-                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")]
+                [
+                    InlineKeyboardButton(
+                        f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit"
+                    )
+                ],
+                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
             ]
 
             await query.edit_message_text(
@@ -2372,7 +2419,13 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
 
         if valid_games:
             await render_poll_message(
-                context.bot, chat_id, game_poll.message_id, session, poll_id, valid_games, priority_ids
+                context.bot,
+                chat_id,
+                game_poll.message_id,
+                session,
+                poll_id,
+                valid_games,
+                priority_ids,
             )
 
 
@@ -2589,7 +2642,13 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
                 chat_id = game_poll.chat_id
                 valid_games, priority_ids = await get_session_valid_games(session, chat_id)
                 await render_poll_message(
-                    context.bot, chat_id, game_poll.message_id, session, poll_id, valid_games, priority_ids
+                    context.bot,
+                    chat_id,
+                    game_poll.message_id,
+                    session,
+                    poll_id,
+                    valid_games,
+                    priority_ids,
                 )
 
     elif action == "poll_toggle_voters":
@@ -2605,7 +2664,13 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
                 if game_poll:
                     valid_games, priority_ids = await get_session_valid_games(session, chat_id)
                     await render_poll_message(
-                        context.bot, chat_id, game_poll.message_id, session, poll_id, valid_games, priority_ids
+                        context.bot,
+                        chat_id,
+                        game_poll.message_id,
+                        session,
+                        poll_id,
+                        valid_games,
+                        priority_ids,
                     )
         await query.answer("Visibility toggled")
 

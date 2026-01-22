@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import xml.etree.ElementTree as ET
@@ -17,7 +18,10 @@ class BGGClient:
     def _get_headers(self) -> dict:
         """Get headers for BGG API requests."""
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
         }
         if BGG_API_TOKEN:
             headers["Authorization"] = f"Bearer {BGG_API_TOKEN}"
@@ -34,7 +38,7 @@ class BGGClient:
         Returns:
             List of Game objects
         """
-        params = {
+        params: dict[str, str | int] = {
             "username": username,
             "own": 1,
             "stats": 1,  # Needed for play time, num players, rating/weight
@@ -58,7 +62,8 @@ class BGGClient:
                         wait_time = (attempt + 1) * 2  # 2, 4, 6, 8 seconds
                         if attempt < 4:
                             logger.warning(
-                                f"BGG returned 202 (Queued) for {username}. Retrying in {wait_time}s..."
+                                f"BGG returned 202 (Queued) for {username}. "
+                                f"Retrying in {wait_time}s..."
                             )
                             # Use asyncio.sleep
                             import asyncio
@@ -83,8 +88,12 @@ class BGGClient:
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404:
                         logger.warning(f"BGG user not found: {username}")
-                        raise ValueError(f"User '{username}' not found on BoardGameGeek")
-                    logger.error(f"HTTP error fetching BGG collection for {username}: {e}")
+                        raise ValueError(
+                            f"User '{username}' not found on BoardGameGeek"
+                        ) from e
+                    logger.error(
+                        f"HTTP error fetching BGG collection for {username}: {e}"
+                    )
                     raise
                 except httpx.HTTPError as e:
                     logger.error(f"Error fetching BGG collection for {username}: {e}")
@@ -280,10 +289,8 @@ class BGGClient:
                 if ratings is not None:
                     avg_weight = ratings.find("averageweight")
                     if avg_weight is not None:
-                        try:
+                        with contextlib.suppress(ValueError):
                             complexity = float(avg_weight.get("value", 0))
-                        except ValueError:
-                            pass
 
             return Game(
                 id=bgg_id,
@@ -310,7 +317,7 @@ class BGGClient:
         Returns:
             List of dicts: [{id, name}, ...]
         """
-        params = {
+        params: dict[str, str | int] = {
             "username": username,
             "own": 1,
             "subtype": "boardgameexpansion",

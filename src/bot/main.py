@@ -7,9 +7,14 @@ from dotenv import load_dotenv
 # Load env vars first
 load_dotenv()
 
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, PollAnswerHandler
+from telegram.ext import (  # noqa: E402
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    PollAnswerHandler,
+)
 
-from src.bot.handlers import (
+from src.bot.handlers import (  # noqa: E402
     add_game,
     add_guest,
     cancel_night,
@@ -37,7 +42,7 @@ from src.bot.handlers import (
     toggle_poll_mode_callback,
     toggle_weights_callback,
 )
-from src.core.db import init_db
+from src.core.db import init_db  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -77,10 +82,18 @@ def main():
     app.add_handler(CallbackQueryHandler(custom_poll_vote_callback, pattern=r"^vote:"))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_refresh:"))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_close:"))
-    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_random_vote:"))
-    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_toggle_voters:"))
-    app.add_handler(CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$"))
-    app.add_handler(CallbackQueryHandler(cycle_vote_limit_callback, pattern=r"^cycle_vote_limit$"))
+    app.add_handler(
+        CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_random_vote:")
+    )
+    app.add_handler(
+        CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_toggle_voters:")
+    )
+    app.add_handler(
+        CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(cycle_vote_limit_callback, pattern=r"^cycle_vote_limit$")
+    )
     app.add_handler(CallbackQueryHandler(manage_collection_callback, pattern="^manage:"))
     app.add_handler(PollAnswerHandler(receive_poll_answer))
 
