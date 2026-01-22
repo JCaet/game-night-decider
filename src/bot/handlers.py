@@ -1796,6 +1796,16 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
 
                 await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
+                # End the game night session
+                session_obj = await session.get(Session, chat_id)
+                if session_obj:
+                    await session.execute(
+                        delete(SessionPlayer).where(SessionPlayer.session_id == chat_id)
+                    )
+                    await session.execute(delete(User).where(User.is_guest.is_(True)))
+                    session_obj.is_active = False
+                    await session.commit()
+
             except Exception as e:
                 logger.error(f"Failed to auto-close poll: {e}")
 
@@ -2837,3 +2847,13 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=game_poll.message_id, text=text, parse_mode="Markdown"
             )
+
+            # End the game night session
+            session_obj = await session.get(Session, chat_id)
+            if session_obj:
+                await session.execute(
+                    delete(SessionPlayer).where(SessionPlayer.session_id == chat_id)
+                )
+                await session.execute(delete(User).where(User.is_guest.is_(True)))
+                session_obj.is_active = False
+                await session.commit()
