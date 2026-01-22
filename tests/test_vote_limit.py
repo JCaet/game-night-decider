@@ -3,12 +3,16 @@ Tests for the Vote Limit feature.
 
 Tests the configurable vote limit per player in polls.
 """
-import math
 import pytest
-from unittest.mock import AsyncMock, MagicMock
-
 from sqlalchemy import select
 
+from src.bot.handlers import (
+    calculate_auto_vote_limit,
+    custom_poll_vote_callback,
+    cycle_vote_limit_callback,
+    get_vote_limit_display,
+    poll_settings_callback,
+)
 from src.core import db
 from src.core.models import (
     Collection,
@@ -21,15 +25,6 @@ from src.core.models import (
     User,
     VoteLimit,
 )
-from src.bot.handlers import (
-    calculate_auto_vote_limit,
-    get_vote_limit_display,
-    cycle_vote_limit_callback,
-    custom_poll_vote_callback,
-    poll_settings_callback,
-    VOTE_LIMIT_OPTIONS,
-)
-
 
 # ============================================================================
 # Auto Limit Calculation Tests
@@ -183,7 +178,14 @@ async def test_vote_limit_enforced_when_exceeded(mock_update, mock_context):
 
         # Create 3 games
         games = [
-            Game(id=i, name=f"Game{i}", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+            Game(
+                id=i,
+                name=f"Game{i}",
+                min_players=2,
+                max_players=4,
+                playing_time=60,
+                complexity=2.0
+            )
             for i in range(1, 5)
         ]
         session.add_all(games)
@@ -240,7 +242,14 @@ async def test_vote_limit_unlimited_allows_all(mock_update, mock_context):
 
         # Create 5 games
         games = [
-            Game(id=i, name=f"Game{i}", min_players=1, max_players=4, playing_time=60, complexity=2.0)
+            Game(
+                id=i,
+                name=f"Game{i}",
+                min_players=1,
+                max_players=4,
+                playing_time=60,
+                complexity=2.0
+            )
             for i in range(1, 6)
         ]
         session.add_all(games)
