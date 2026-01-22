@@ -4,8 +4,6 @@ import math
 import random
 from collections import namedtuple
 
-ResolvedVote = namedtuple("ResolvedVote", ["game_id", "user_id"])
-
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -13,7 +11,12 @@ from telegram.ext import ContextTypes
 
 from src.core import db
 from src.core.bgg import BGGClient
-from src.core.logic import STAR_BOOST, calculate_poll_winner, group_games_by_complexity, split_games
+from src.core.logic import (
+    STAR_BOOST,
+    calculate_poll_winner,
+    group_games_by_complexity,
+    split_games,
+)
 from src.core.models import (
     Collection,
     Expansion,
@@ -28,6 +31,9 @@ from src.core.models import (
     UserExpansion,
     VoteLimit,
 )
+
+# Named tuple for resolved votes (after category resolution)
+ResolvedVote = namedtuple("ResolvedVote", ["game_id", "user_id"])
 
 logger = logging.getLogger(__name__)
 
@@ -1160,7 +1166,7 @@ async def guest_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = list(context.args)
-    numeric_values: list[float] = []
+    numeric_values: list[str] = []
 
     # extracted numeric args from the end (max 3: complexity, max, min)
     # We iterate backwards
@@ -1428,7 +1434,7 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     async with db.AsyncSessionLocal() as session:
         db_session = await session.get(Session, chat_id)
-        if db_session:
+        if db_session and isinstance(msg, object) and hasattr(msg, "message_id"):
             db_session.message_id = msg.message_id
             await session.commit()
 
@@ -2813,8 +2819,11 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
                             user_id=v.user_id
                         ))
                 else:
-                    # Regular game vote
-                    resolved_votes.append(v)
+                    # Regular game vote - wrap in ResolvedVote
+                    resolved_votes.append(ResolvedVote(
+                        game_id=v.game_id,
+                        user_id=v.user_id
+                    ))
 
             # Apply weights if enabled
             session_obj = await session.get(Session, chat_id)
