@@ -226,11 +226,10 @@ def test_split_games_all_same_complexity():
 # ============================================================================
 
 
-
-
 @dataclass
 class MockVote:
     """Mock vote for testing."""
+
     game_id: int
     user_id: int
 
@@ -306,10 +305,11 @@ def test_calculate_poll_winner_with_star_boost():
     star_collections = {1: [111]}
 
     winners, scores, modifiers = calculate_poll_winner(
-        games, votes,
+        games,
+        votes,
         priority_game_ids={1},  # Game 1 is starred
         is_weighted=True,
-        star_collections=star_collections
+        star_collections=star_collections,
     )
 
     # StarredGame should win due to boost

@@ -13,9 +13,7 @@ def _get_complexity_label(min_c: float, max_c: float) -> str:
         return "Heavy Strategy Games"
 
 
-def _find_best_split(
-    games: list[Game], min_group_size: int = 2
-) -> int | None:
+def _find_best_split(games: list[Game], min_group_size: int = 2) -> int | None:
     """
     Find the best split point in a sorted list of games.
 
@@ -57,9 +55,7 @@ def _find_best_split(
 
     # Filter for valid splits (both sides have at least min_group_size)
     valid_gaps = [
-        (idx, gap)
-        for idx, gap in gaps
-        if idx >= min_group_size and (n - idx) >= min_group_size
+        (idx, gap) for idx, gap in gaps if idx >= min_group_size and (n - idx) >= min_group_size
     ]
 
     if not valid_gaps:
@@ -70,9 +66,7 @@ def _find_best_split(
     return best_split[0]
 
 
-def split_games(
-    games: list[Game], max_per_poll: int = 10
-) -> list[tuple[str, list[Game]]]:
+def split_games(games: list[Game], max_per_poll: int = 10) -> list[tuple[str, list[Game]]]:
     """
     Split games into logical groups using dynamic complexity gap analysis.
 
@@ -137,10 +131,7 @@ def split_games(
             return left_results + right_results
         else:
             # No valid split found, chunk by max_per_poll
-            chunks = [
-                group[i : i + max_per_poll]
-                for i in range(0, len(group), max_per_poll)
-            ]
+            chunks = [group[i : i + max_per_poll] for i in range(0, len(group), max_per_poll)]
 
             # Handle case where last chunk is a single game
             if len(chunks) > 1 and len(chunks[-1]) == 1:
@@ -166,8 +157,7 @@ def split_games(
     if unrated_games:
         unrated_games.sort(key=lambda g: g.name.lower())
         chunks = [
-            unrated_games[i : i + max_per_poll]
-            for i in range(0, len(unrated_games), max_per_poll)
+            unrated_games[i : i + max_per_poll] for i in range(0, len(unrated_games), max_per_poll)
         ]
 
         # Handle single-game chunk at the end
@@ -222,7 +212,6 @@ def group_games_by_complexity(games: list[Game]) -> dict[int, list[Game]]:
     return {k: v for k, v in groups.items() if v}
 
 
-
 # ---------------------------------------------------------------------------- #
 # Poll Winner Calculation
 # ---------------------------------------------------------------------------- #
@@ -236,7 +225,7 @@ def calculate_poll_winner(
     votes: list,
     priority_game_ids: set,
     is_weighted: bool = False,
-    star_collections: dict | None = None
+    star_collections: dict | None = None,
 ) -> tuple[list[str], dict[str, float], list[str]]:
     """
     Calculate the winner(s) of a poll based on votes and optional weighting.

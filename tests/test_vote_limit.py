@@ -3,6 +3,7 @@ Tests for the Vote Limit feature.
 
 Tests the configurable vote limit per player in polls.
 """
+
 import pytest
 from sqlalchemy import select
 
@@ -109,12 +110,14 @@ async def test_cycle_vote_limit_changes_setting(mock_update, mock_context):
     chat_id = 12345
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(
-            chat_id=chat_id,
-            is_active=True,
-            poll_type=PollType.CUSTOM,
-            vote_limit=VoteLimit.AUTO
-        ))
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                vote_limit=VoteLimit.AUTO,
+            )
+        )
         await session.commit()
 
     mock_update.callback_query.message.chat.id = chat_id
@@ -133,12 +136,14 @@ async def test_cycle_vote_limit_wraps_around(mock_update, mock_context):
     chat_id = 12345
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(
-            chat_id=chat_id,
-            is_active=True,
-            poll_type=PollType.CUSTOM,
-            vote_limit=VoteLimit.UNLIMITED  # Last option
-        ))
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                vote_limit=VoteLimit.UNLIMITED,  # Last option
+            )
+        )
         await session.commit()
 
     mock_update.callback_query.message.chat.id = chat_id
@@ -164,12 +169,14 @@ async def test_vote_limit_enforced_when_exceeded(mock_update, mock_context):
     user_id = 111
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(
-            chat_id=chat_id,
-            is_active=True,
-            poll_type=PollType.CUSTOM,
-            vote_limit=3  # Static limit of 3
-        ))
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                vote_limit=3,  # Static limit of 3
+            )
+        )
 
         u1 = User(telegram_id=user_id, telegram_name="Voter")
         u2 = User(telegram_id=222, telegram_name="Other")
@@ -179,12 +186,7 @@ async def test_vote_limit_enforced_when_exceeded(mock_update, mock_context):
         # Create 3 games
         games = [
             Game(
-                id=i,
-                name=f"Game{i}",
-                min_players=2,
-                max_players=4,
-                playing_time=60,
-                complexity=2.0
+                id=i, name=f"Game{i}", min_players=2, max_players=4, playing_time=60, complexity=2.0
             )
             for i in range(1, 5)
         ]
@@ -229,12 +231,14 @@ async def test_vote_limit_unlimited_allows_all(mock_update, mock_context):
     user_id = 111
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(
-            chat_id=chat_id,
-            is_active=True,
-            poll_type=PollType.CUSTOM,
-            vote_limit=VoteLimit.UNLIMITED
-        ))
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                vote_limit=VoteLimit.UNLIMITED,
+            )
+        )
 
         u1 = User(telegram_id=user_id, telegram_name="Voter")
         session.add(u1)
@@ -243,12 +247,7 @@ async def test_vote_limit_unlimited_allows_all(mock_update, mock_context):
         # Create 5 games
         games = [
             Game(
-                id=i,
-                name=f"Game{i}",
-                min_players=1,
-                max_players=4,
-                playing_time=60,
-                complexity=2.0
+                id=i, name=f"Game{i}", min_players=1, max_players=4, playing_time=60, complexity=2.0
             )
             for i in range(1, 6)
         ]
@@ -276,12 +275,15 @@ async def test_vote_limit_unlimited_allows_all(mock_update, mock_context):
 
     # Verify vote was recorded
     async with db.AsyncSessionLocal() as session:
-        votes = (await session.execute(
-            select(PollVote).where(
-                PollVote.poll_id == poll_id,
-                PollVote.user_id == user_id
+        votes = (
+            (
+                await session.execute(
+                    select(PollVote).where(PollVote.poll_id == poll_id, PollVote.user_id == user_id)
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
 
         assert len(votes) == 5
 
@@ -294,12 +296,14 @@ async def test_vote_removal_allows_new_vote(mock_update, mock_context):
     user_id = 111
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(
-            chat_id=chat_id,
-            is_active=True,
-            poll_type=PollType.CUSTOM,
-            vote_limit=2  # Low limit
-        ))
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                vote_limit=2,  # Low limit
+            )
+        )
 
         u1 = User(telegram_id=user_id, telegram_name="Voter")
         session.add(u1)
@@ -340,12 +344,15 @@ async def test_vote_removal_allows_new_vote(mock_update, mock_context):
 
     # Verify new vote recorded
     async with db.AsyncSessionLocal() as session:
-        votes = (await session.execute(
-            select(PollVote).where(
-                PollVote.poll_id == poll_id,
-                PollVote.user_id == user_id
+        votes = (
+            (
+                await session.execute(
+                    select(PollVote).where(PollVote.poll_id == poll_id, PollVote.user_id == user_id)
+                )
             )
-        )).scalars().all()
+            .scalars()
+            .all()
+        )
 
         game_ids = [v.game_id for v in votes]
         assert 1 not in game_ids  # Removed
@@ -364,11 +371,7 @@ async def test_poll_settings_shows_vote_limit_button(mock_update, mock_context):
     chat_id = 12345
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(
-            chat_id=chat_id,
-            is_active=True,
-            vote_limit=VoteLimit.AUTO
-        ))
+        session.add(Session(chat_id=chat_id, is_active=True, vote_limit=VoteLimit.AUTO))
         await session.commit()
 
     mock_update.callback_query.message.chat.id = chat_id

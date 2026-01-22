@@ -24,7 +24,6 @@ async def test_setbgg_no_args(mock_update, mock_context):
     assert "<username>" in call_args
 
 
-
 @pytest.mark.asyncio
 async def test_setbgg_creates_user(mock_update, mock_context):
     """Test /setbgg creates user and updates name."""
@@ -443,11 +442,10 @@ async def test_addgame_uses_cache(mock_update, mock_context):
         assert col is not None
 
 
-
-
 # ============================================================================
 # Auto-Star Feature Tests
 # ============================================================================
+
 
 @pytest.mark.asyncio
 async def test_setbgg_incremental_sync_auto_stars_new_games(mock_update, mock_context):
@@ -469,9 +467,7 @@ async def test_setbgg_incremental_sync_auto_stars_new_games(mock_update, mock_co
         await session.commit()
 
     # Mock BGG: OldGame + NewGame
-    g2 = Game(
-        id=2, name="NewGame", min_players=2, max_players=4, playing_time=60, complexity=2.5
-    )
+    g2 = Game(id=2, name="NewGame", min_players=2, max_players=4, playing_time=60, complexity=2.5)
     mock_games = [
         Game(id=1, name="OldGame", min_players=2, max_players=4, playing_time=60, complexity=2.0),
         g2,
@@ -549,9 +545,7 @@ async def test_setbgg_force_sync_no_auto_star(mock_update, mock_context):
     # So ANY force sync disables auto-starring, even for new games
     # found during it. This matches requirement.
 
-    g2 = Game(
-        id=2, name="NewGame", min_players=2, max_players=4, playing_time=60, complexity=2.5
-    )
+    g2 = Game(id=2, name="NewGame", min_players=2, max_players=4, playing_time=60, complexity=2.5)
     mock_games = [
         Game(id=1, name="OldGame", min_players=2, max_players=4, playing_time=60, complexity=2.0),
         g2,
@@ -574,7 +568,7 @@ async def test_setbgg_force_sync_no_auto_star(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_addgame_manual_auto_stars(mock_update, mock_context):
     """Test /addgame manual entry auto-stars the game."""
-    mock_context.args = ["ManualGame", "2", "4", "2.0"] # Manual args
+    mock_context.args = ["ManualGame", "2", "4", "2.0"]  # Manual args
 
     with patch("src.bot.handlers.BGGClient"):
         await add_game(mock_update, mock_context)

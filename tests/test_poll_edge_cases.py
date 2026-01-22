@@ -1,4 +1,3 @@
-
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -39,6 +38,7 @@ def mock_update():
     update.callback_query.edit_message_text = AsyncMock()
     return update
 
+
 @pytest.fixture
 def mock_context():
     """Create a mock Telegram Context object."""
@@ -47,6 +47,7 @@ def mock_context():
     context.bot.edit_message_text = AsyncMock()
     context.bot.stop_poll = AsyncMock()
     return context
+
 
 @pytest.mark.asyncio
 async def test_anonymous_voting_toggle(mock_update, mock_context):
@@ -57,9 +58,7 @@ async def test_anonymous_voting_toggle(mock_update, mock_context):
     async with db.AsyncSessionLocal() as session:
         # Create session and poll
         session.add(
-            Session(
-                chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_voters=False
-            )
+            Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_voters=False)
         )
         session.add(User(telegram_id=111, telegram_name="Voter1"))
 
@@ -105,12 +104,13 @@ async def test_anonymous_voting_toggle(mock_update, mock_context):
     # Check output text
     calls = mock_context.bot.edit_message_text.call_args_list
     assert len(calls) > 0
-    text = calls[-1].kwargs.get('text', '') or calls[-1].args[0]
+    text = calls[-1].kwargs.get("text", "") or calls[-1].args[0]
 
     # Should NOT show voter name "Voter1"
     assert "Voter1" not in text
     # When hide_voters=True, should show "X voters" instead of names
     assert "1 voters" in text or "voters" in text
+
 
 @pytest.mark.asyncio
 async def test_session_message_id_validation(mock_update, mock_context):
@@ -127,7 +127,7 @@ async def test_session_message_id_validation(mock_update, mock_context):
 
     # User clicks button on OLD message (999)
     mock_update.callback_query.message.message_id = expired_message_id
-    mock_update.callback_query.data = "cancel_night" # or any other session action
+    mock_update.callback_query.data = "cancel_night"  # or any other session action
 
     await cancel_night_callback(mock_update, mock_context)
 
@@ -139,6 +139,7 @@ async def test_session_message_id_validation(mock_update, mock_context):
     async with db.AsyncSessionLocal() as session:
         s = await session.get(Session, chat_id)
         assert s.is_active is True
+
 
 @pytest.mark.asyncio
 async def test_vote_on_non_existent_game(mock_update, mock_context):
@@ -175,6 +176,7 @@ async def test_vote_on_non_existent_game(mock_update, mock_context):
         # It relies on DB constraints.
         pass
 
+
 @pytest.mark.asyncio
 async def test_render_anonymous_poll(mock_update, mock_context):
     """Test explicit rendering of anonymous poll."""
@@ -183,9 +185,7 @@ async def test_render_anonymous_poll(mock_update, mock_context):
 
     async with db.AsyncSessionLocal() as session:
         session.add(
-            Session(
-                chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_voters=True
-            )
+            Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_voters=True)
         )
         session.add(User(telegram_id=222, telegram_name="SecretVoter"))
 
@@ -198,14 +198,12 @@ async def test_render_anonymous_poll(mock_update, mock_context):
         session.add(PollVote(poll_id=poll_id, user_id=222, game_id=2, user_name="SecretVoter"))
         await session.commit()
 
-        await render_poll_message(
-            mock_context.bot, chat_id, 555, session, poll_id, [g1], set()
-        )
+        await render_poll_message(mock_context.bot, chat_id, 555, session, poll_id, [g1], set())
 
     calls = mock_context.bot.edit_message_text.call_args_list
     assert len(calls) > 0
-    text = calls[-1].kwargs.get('text', '')
+    text = calls[-1].kwargs.get("text", "")
 
     assert "SecretGame" in text
     assert "SecretVoter" not in text
-    assert "1 voters" in text # Count should be visible in text
+    assert "1 voters" in text  # Count should be visible in text

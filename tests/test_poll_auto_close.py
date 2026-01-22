@@ -1,4 +1,3 @@
-
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -33,9 +32,7 @@ async def test_poll_auto_close(mock_update, mock_context):
         session.add_all([u1, u2])
 
         # Create Games (need at least 2 for a poll - Telegram requirement)
-        g1 = Game(
-            id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0
-        )
+        g1 = Game(id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0)
         g2 = Game(
             id=2,
             name="Ticket to Ride",
@@ -90,7 +87,7 @@ async def test_poll_auto_close(mock_update, mock_context):
     mock_update.poll_answer.poll_id = poll_id
     mock_update.poll_answer.user.id = 111
     mock_update.poll_answer.user.first_name = "User1"
-    mock_update.poll_answer.option_ids = [0] # Voted for option 0
+    mock_update.poll_answer.option_ids = [0]  # Voted for option 0
 
     # Prepare stop_poll mock (should NOT be called yet)
     mock_context.bot.stop_poll = AsyncMock()
@@ -135,5 +132,5 @@ async def test_poll_auto_close(mock_update, mock_context):
     # Verify Winner Announcement
     mock_context.bot.send_message.assert_called()
     args = mock_context.bot.send_message.call_args[1]
-    assert "Winner" in args['text'] or "winner" in args['text']
-    assert "Catan" in args['text']
+    assert "Winner" in args["text"] or "winner" in args["text"]
+    assert "Catan" in args["text"]

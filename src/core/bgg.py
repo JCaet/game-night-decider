@@ -88,12 +88,8 @@ class BGGClient:
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404:
                         logger.warning(f"BGG user not found: {username}")
-                        raise ValueError(
-                            f"User '{username}' not found on BoardGameGeek"
-                        ) from e
-                    logger.error(
-                        f"HTTP error fetching BGG collection for {username}: {e}"
-                    )
+                        raise ValueError(f"User '{username}' not found on BoardGameGeek") from e
+                    logger.error(f"HTTP error fetching BGG collection for {username}: {e}")
                     raise
                 except httpx.HTTPError as e:
                     logger.error(f"Error fetching BGG collection for {username}: {e}")
@@ -341,6 +337,7 @@ class BGGClient:
                                 f"Retrying in {wait_time}s..."
                             )
                             import asyncio
+
                             await asyncio.sleep(wait_time)
                             continue
                         else:
@@ -441,10 +438,7 @@ class BGGClient:
             base_game_id = None
             for link in item.findall("link"):
                 # inbound="true" means this is the base game that this expansion expands
-                if (
-                    link.get("type") == "boardgameexpansion"
-                    and link.get("inbound") == "true"
-                ):
+                if link.get("type") == "boardgameexpansion" and link.get("inbound") == "true":
                     try:
                         base_game_id = int(link.get("id", 0))
                         break
@@ -476,4 +470,3 @@ class BGGClient:
         except (ValueError, AttributeError) as e:
             logger.warning(f"Failed to parse expansion thing {expansion_id}: {e}")
             return None
-
