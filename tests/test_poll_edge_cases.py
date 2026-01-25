@@ -1,4 +1,3 @@
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select
@@ -18,35 +17,10 @@ from src.core.models import (
     Session,
     SessionPlayer,
     User,
+    VoteType,
 )
 
-
-@pytest.fixture
-def mock_update():
-    """Create a mock Telegram Update object."""
-    update = MagicMock()
-    update.effective_chat.id = 12345
-    update.effective_user.id = 111
-    update.effective_user.first_name = "TestUser"
-    update.callback_query = MagicMock()
-    update.callback_query.message.chat.id = 12345
-    update.callback_query.message.message_id = 999
-    update.callback_query.from_user.id = 111
-    update.callback_query.from_user.first_name = "TestUser"
-    update.callback_query.id = "query_id"
-    update.callback_query.answer = AsyncMock()
-    update.callback_query.edit_message_text = AsyncMock()
-    return update
-
-
-@pytest.fixture
-def mock_context():
-    """Create a mock Telegram Context object."""
-    context = MagicMock()
-    context.bot.send_message = AsyncMock()
-    context.bot.edit_message_text = AsyncMock()
-    context.bot.stop_poll = AsyncMock()
-    return context
+# Note: mock_update and mock_context fixtures are inherited from conftest.py
 
 
 @pytest.mark.asyncio
@@ -69,7 +43,7 @@ async def test_anonymous_voting_toggle(mock_update, mock_context):
         session.add(SessionPlayer(session_id=chat_id, user_id=111))
 
         session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
-        session.add(PollVote(poll_id=poll_id, user_id=111, game_id=1, user_name="Voter1"))
+        session.add(PollVote(poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="Voter1"))
 
         await session.commit()
 
@@ -195,7 +169,7 @@ async def test_render_anonymous_poll(mock_update, mock_context):
         session.add(g1)
         session.add(Collection(user_id=222, game_id=2))
         session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=555))
-        session.add(PollVote(poll_id=poll_id, user_id=222, game_id=2, user_name="SecretVoter"))
+        session.add(PollVote(poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=2, user_name="SecretVoter"))
         await session.commit()
 
         await render_poll_message(mock_context.bot, chat_id, 555, session, poll_id, [g1], set())
