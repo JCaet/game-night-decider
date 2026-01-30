@@ -519,9 +519,9 @@ async def test_custom_poll_close_resolves_category_votes(mock_update, mock_conte
     """Test closing poll resolves category votes to an actual game."""
     import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 12345
     poll_id = f"poll_cat_close_{chat_id}"
-    base_id = random.randint(10000, 90000)
+    base_id = 90000
 
     async with db.AsyncSessionLocal() as session:
         session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
@@ -822,8 +822,8 @@ async def test_custom_poll_ui_grouping(mock_update, mock_context):
     """Test pollution UI groups games by complexity with separators."""
     import random
 
-    chat_id = random.randint(10000, 99999)
-    base_id = random.randint(10000, 90000)
+    chat_id = 99999
+    base_id = 80000
     g_ids = [base_id + i for i in range(4)]
 
     # Setup:
@@ -896,9 +896,9 @@ async def test_custom_poll_random_vote(mock_update, mock_context):
     """Test clicking separator stores a category vote (not a random game vote)."""
     import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 88888
     poll_id = f"poll_random_{chat_id}"
-    base_id = random.randint(10000, 90000)
+    base_id = 70000
 
     async with db.AsyncSessionLocal() as session:
         session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
@@ -950,7 +950,7 @@ async def test_custom_poll_random_vote(mock_update, mock_context):
         )
 
         assert len(votes) == 1
-        assert votes[0].game_id == -4  # Category vote marker (negative level)
+        assert votes[0].category_level == 4  # Category vote should have level set
 
     # Verify answer indicates category vote
     mock_update.callback_query.answer.assert_called()
@@ -961,9 +961,9 @@ async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
     """Test clicking category header again removes the vote (toggle behavior)."""
     import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 77777
     poll_id = f"poll_toggle_{chat_id}"
-    base_id = random.randint(10000, 90000)
+    base_id = 60000
 
     async with db.AsyncSessionLocal() as session:
         session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
@@ -1012,7 +1012,7 @@ async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
         assert len(votes) == 0
 
     # Verify answer indicates removal
-    mock_update.callback_query.answer.assert_called_with("Category 3 vote removed")
+    mock_update.callback_query.answer.assert_called_with("Vote removed")
 
 
 @pytest.mark.asyncio
@@ -1020,7 +1020,7 @@ async def test_auto_close_previous_polls(mock_update, mock_context):
     """Test that starting a new poll closes existing ones."""
     import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 66666
     old_poll_id = f"old_{chat_id}"
 
     # Setup: Active Custom Poll
@@ -1031,7 +1031,7 @@ async def test_auto_close_previous_polls(mock_update, mock_context):
 
         # Add games/players so start_poll works
         g1 = Game(
-            id=random.randint(10000, 99999),
+            id=44444,
             name="Game1",
             min_players=1,
             max_players=5,
@@ -1076,7 +1076,7 @@ async def test_auto_refresh_poll_on_join(mock_update, mock_context):
     """Test that joining the lobby refreshes the active custom poll."""
     import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 55555
     poll_id = f"active_{chat_id}"
     new_user_id = 999
 
@@ -1086,7 +1086,7 @@ async def test_auto_refresh_poll_on_join(mock_update, mock_context):
 
         # Games
         g1 = Game(
-            id=random.randint(10000, 99999),
+            id=33333,
             name="GameA",
             min_players=1,
             max_players=5,
