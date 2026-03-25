@@ -13,6 +13,7 @@ from collections import namedtuple
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from src.core.logic import calculate_poll_winner, group_games_by_complexity
 from src.core.models import (
@@ -82,6 +83,8 @@ class PollService:
         user_name: str,
         vote_limit: int,
         game_count: int,
+        user_last_name: str | None = None,
+        user_tg_username: str | None = None,
     ) -> VoteResult:
         """
         Cast or toggle a vote with limit enforcement.
@@ -111,9 +114,14 @@ class PollService:
         else:
             stmt = stmt.where(PollVote.category_level == target_id)
 
-        # Conditional locking only for Postgres (SQLite generic fallback)
-        if hasattr(session.bind, "dialect") and "postgresql" in session.bind.dialect.name:
-            stmt = stmt.with_for_update()
+        # Row-level lock for PostgreSQL to prevent concurrent toggle races.
+        # Uses sync_session.get_bind() since session.bind is deprecated in SQLAlchemy 2.x.
+        try:
+            bind = session.sync_session.get_bind()
+            if "postgresql" in bind.dialect.name:
+                stmt = stmt.with_for_update()
+        except Exception:
+            pass  # SQLite or unexpected — proceed without lock
 
         existing_vote = (await session.execute(stmt)).scalar_one_or_none()
 
@@ -150,6 +158,8 @@ class PollService:
             user_id=user_id,
             vote_type=vote_type,
             user_name=user_name,
+            user_last_name=user_last_name,
+            user_tg_username=user_tg_username,
         )
 
         if vote_type == VoteType.GAME:
@@ -157,8 +167,13 @@ class PollService:
         else:
             vote.category_level = target_id
 
-        session.add(vote)
-        await session.commit()
+        try:
+            session.add(vote)
+            await session.commit()
+        except IntegrityError:
+            # Concurrent insert beat us — vote already exists, treat as success
+            await session.rollback()
+            return VoteResult(success=True, message="Vote recorded")
 
         # Generate appropriate message
         if vote_type == VoteType.CATEGORY:
