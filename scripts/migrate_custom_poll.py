@@ -66,12 +66,17 @@ async def migrate():
         await conn.execute(text("DROP TABLE IF EXISTS poll_votes"))
         await conn.execute(text("""
             CREATE TABLE poll_votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 poll_id VARCHAR NOT NULL,
                 user_id BIGINT NOT NULL,
+                vote_type VARCHAR NOT NULL,
                 game_id BIGINT,
+                category_level INTEGER,
                 user_name VARCHAR,
-                PRIMARY KEY (poll_id, user_id),
-                FOREIGN KEY (poll_id) REFERENCES game_night_polls (poll_id)
+                version INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (poll_id) REFERENCES game_night_polls (poll_id),
+                FOREIGN KEY (game_id) REFERENCES games (id),
+                UNIQUE (poll_id, user_id, vote_type, game_id, category_level)
             )
         """))
         logger.info("✅ Recreated poll_votes table with nullable game_id")

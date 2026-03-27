@@ -44,9 +44,9 @@ class User(Base):
     __tablename__ = "users"
 
     telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    telegram_name: Mapped[str | None] = mapped_column(
-        String, nullable=True
-    )  # Display name from Telegram
+    telegram_name: Mapped[str | None] = mapped_column(String, nullable=True)  # first name
+    telegram_last_name: Mapped[str | None] = mapped_column(String, nullable=True)  # last name
+    telegram_username: Mapped[str | None] = mapped_column(String, nullable=True)  # @username
     bgg_username: Mapped[str | None] = mapped_column(String, unique=True, nullable=True)
 
     # Guest fields
@@ -178,7 +178,9 @@ class PollVote(Base):
     game_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("games.id"), nullable=True)
     category_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    user_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    user_name: Mapped[str | None] = mapped_column(String, nullable=True)  # first name
+    user_last_name: Mapped[str | None] = mapped_column(String, nullable=True)  # last name
+    user_tg_username: Mapped[str | None] = mapped_column(String, nullable=True)  # @username
 
     # Version column for potential optimistic locking (manual implementation)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)

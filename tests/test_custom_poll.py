@@ -272,6 +272,8 @@ async def test_custom_poll_vote_adds_vote(mock_update, mock_context):
     mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
     mock_update.callback_query.from_user.id = user_id
     mock_update.callback_query.from_user.first_name = "Voter"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     await custom_poll_vote_callback(mock_update, mock_context)
 
@@ -340,6 +342,8 @@ async def test_custom_poll_vote_removes_vote(mock_update, mock_context):
     mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
     mock_update.callback_query.from_user.id = user_id
     mock_update.callback_query.from_user.first_name = "Voter"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     await custom_poll_vote_callback(mock_update, mock_context)
 
@@ -750,6 +754,8 @@ async def test_custom_poll_allows_multiple_votes_per_user(mock_update, mock_cont
     mock_update.callback_query.data = f"vote:{poll_id}:1"
     mock_update.callback_query.from_user.id = user_id
     mock_update.callback_query.from_user.first_name = "MultiVoter"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     await custom_poll_vote_callback(mock_update, mock_context)
 
@@ -935,6 +941,8 @@ async def test_custom_poll_random_vote(mock_update, mock_context):
     mock_update.callback_query.message.message_id = 999
     mock_update.callback_query.from_user.id = 111
     mock_update.callback_query.from_user.first_name = "RandomVoter"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     # Mock bot.edit_message_text to avoid awaiting on Mock if not set up
     mock_context.bot.edit_message_text = AsyncMock()
@@ -996,6 +1004,8 @@ async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
     mock_update.callback_query.message.message_id = 999
     mock_update.callback_query.from_user.id = 111
     mock_update.callback_query.from_user.first_name = "Toggler"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     mock_context.bot.edit_message_text = AsyncMock()
 
@@ -1105,6 +1115,8 @@ async def test_auto_refresh_poll_on_join(mock_update, mock_context):
     mock_update.callback_query.message.chat.id = chat_id
     mock_update.callback_query.from_user.id = new_user_id
     mock_update.callback_query.from_user.first_name = "NewJoiner"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     mock_context.bot.edit_message_text = AsyncMock()  # Used for updating lobby AND refreshing poll
 

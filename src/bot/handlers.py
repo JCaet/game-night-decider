@@ -5,6 +5,7 @@ from collections import namedtuple
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
+import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
@@ -36,6 +37,107 @@ from src.core.poll_service import PollService
 ResolvedVote = namedtuple("ResolvedVote", ["game_id", "user_id"])
 
 logger = logging.getLogger(__name__)
+
+
+_NameEntry = namedtuple("_NameEntry", ["uid", "first", "last", "tg_username", "fallback"])
+
+
+def _disambiguate(entries: list) -> dict[int, str]:
+    """
+    Core disambiguation logic. Accepts a list of _NameEntry namedtuples and returns
+    {uid: display_name}, guaranteeing uniqueness within the group.
+
+    Ladder (stops at first level that yields a unique name):
+      1. First name only
+      2. First name + last initial  ("Alex S.")
+      3. First name + full last name ("Alex Smith")
+      4. First name + @username      ("Alex (@alexs)")
+      5. fallback (bgg_username / "User {id}")
+    """
+    result: dict[int, str] = {}
+    for e in entries:
+        if not e.first:
+            result[e.uid] = e.fallback
+            continue
+
+        conflicts = [o for o in entries if o.first == e.first and o.uid != e.uid]
+        if not conflicts:
+            result[e.uid] = e.first
+            continue
+
+        if e.last:
+            candidate = f"{e.first} {e.last[0]}."
+            conflict_initials = {f"{e.first} {o.last[0]}." for o in conflicts if o.last}
+            if candidate not in conflict_initials:
+                result[e.uid] = candidate
+                continue
+
+            candidate_full = f"{e.first} {e.last}"
+            conflict_full = {f"{e.first} {o.last}" for o in conflicts if o.last}
+            if candidate_full not in conflict_full:
+                result[e.uid] = candidate_full
+                continue
+
+        if e.tg_username:
+            result[e.uid] = f"{e.first} (@{e.tg_username})"
+            continue
+
+        result[e.uid] = e.fallback
+
+    return result
+
+
+def disambiguate_names(users: list) -> dict[int, str]:
+    """Return disambiguated display names for a list of User objects."""
+    entries = [
+        _NameEntry(
+            uid=u.telegram_id,
+            first=u.telegram_name,
+            last=u.telegram_last_name,
+            tg_username=u.telegram_username,
+            fallback=u.bgg_username or f"User {u.telegram_id}",
+        )
+        for u in users
+    ]
+    return _disambiguate(entries)
+
+
+def disambiguate_voter_names(votes: list) -> dict[int, str]:
+    """
+    Return disambiguated display names derived from PollVote snapshot fields.
+
+    Uses only the data captured at vote time so that a new voter joining later
+    never retroactively renames an existing voter in the poll display.
+    """
+    # Deduplicate: one entry per unique voter (keep first occurrence)
+    seen: set[int] = set()
+    entries = []
+    for v in votes:
+        if v.user_id not in seen:
+            seen.add(v.user_id)
+            entries.append(
+                _NameEntry(
+                    uid=v.user_id,
+                    first=v.user_name,
+                    last=v.user_last_name,
+                    tg_username=v.user_tg_username,
+                    fallback=f"User {v.user_id}",
+                )
+            )
+    return _disambiguate(entries)
+
+
+def build_player_names(players: list) -> list[str]:
+    """Build disambiguated display names for a list of SessionPlayer objects."""
+    users = [p.user for p in players]
+    name_map = disambiguate_names(users)
+    names = []
+    for p in players:
+        name = name_map.get(p.user_id, p.user.bgg_username or f"User {p.user_id}")
+        if p.user.is_guest:
+            name += " 👤"
+        names.append(name)
+    return names
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,8 +212,11 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user = User(telegram_id=telegram_id, telegram_name=update.effective_user.first_name)
             session.add(user)
 
+        tg_user = update.effective_user
         user.bgg_username = bgg_username
-        user.telegram_name = update.effective_user.first_name  # Update name on each call
+        user.telegram_name = tg_user.first_name
+        user.telegram_last_name = tg_user.last_name
+        user.telegram_username = tg_user.username
         await session.commit()
 
     # Show initial feedback and keep reference to message to update it
@@ -363,6 +468,26 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _close_existing_polls(session, context, chat_id, reason="Poll Closed"):
+    """Close all active polls for a chat: edit/stop messages and delete DB records."""
+    existing_polls_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
+    existing_polls = (await session.execute(existing_polls_stmt)).scalars().all()
+
+    for p in existing_polls:
+        try:
+            await context.bot.stop_poll(chat_id, p.message_id)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=p.message_id,
+                    text=f"🛑 **{reason}**",
+                    parse_mode="Markdown",
+                    reply_markup=None,
+                )
+        await session.delete(p)
+
+
 async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start a lobby."""
     chat_id = update.effective_chat.id
@@ -383,12 +508,7 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if players:
                 # There's an active game night with players - ask for confirmation
-                names = []
-                for p in players:
-                    name = p.user.telegram_name or p.user.bgg_username or f"User {p.user_id}"
-                    if p.user.is_guest:
-                        name += " 👤"
-                    names.append(name)
+                names = build_player_names(players)
 
                 keyboard = [
                     [
@@ -410,6 +530,9 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not db_session:
             db_session = Session(chat_id=chat_id)
             session.add(db_session)
+
+        # Close any leftover polls from previous session
+        await _close_existing_polls(session, context, chat_id, reason="Poll Closed (New Game Night)")
 
         # Clear players
         await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
@@ -456,10 +579,86 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await session.commit()
 
 
+async def _prune_stale_votes(session, context, chat_id):
+    """Delete votes for games no longer in the valid set and notify the chat."""
+    active_poll_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
+    active_poll = (await session.execute(active_poll_stmt)).scalars().first()
+    if not active_poll:
+        return
+
+    # Safety: skip pruning if no players in session (cleanup transition)
+    players_stmt = select(SessionPlayer).where(SessionPlayer.session_id == chat_id)
+    players = (await session.execute(players_stmt)).scalars().all()
+    if not players:
+        return
+
+    valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+    valid_game_ids = {g.id for g in valid_games}
+
+    # Find stale game votes (voted game no longer in valid set)
+    stale_game_votes_stmt = select(PollVote).where(
+        PollVote.poll_id == active_poll.poll_id,
+        PollVote.vote_type == VoteType.GAME,
+        PollVote.game_id.notin_(valid_game_ids) if valid_game_ids else PollVote.vote_type == VoteType.GAME,
+    )
+    stale_game_votes = (await session.execute(stale_game_votes_stmt)).scalars().all()
+
+    # Find stale category votes (complexity level has no games left)
+    from src.core.logic import group_games_by_complexity
+
+    active_levels = set(group_games_by_complexity(valid_games).keys()) if valid_games else set()
+    stale_cat_votes_stmt = select(PollVote).where(
+        PollVote.poll_id == active_poll.poll_id,
+        PollVote.vote_type == VoteType.CATEGORY,
+        PollVote.category_level.notin_(active_levels) if active_levels else PollVote.vote_type == VoteType.CATEGORY,
+    )
+    stale_cat_votes = (await session.execute(stale_cat_votes_stmt)).scalars().all()
+
+    total_pruned = len(stale_game_votes) + len(stale_cat_votes)
+    if total_pruned > 0:
+        for v in stale_game_votes:
+            await session.delete(v)
+        for v in stale_cat_votes:
+            await session.delete(v)
+        await session.commit()
+
+        with contextlib.suppress(Exception):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ Game list updated ({len(valid_games)} games). "
+                    f"{total_pruned} stale vote(s) removed."
+                ),
+            )
+
+
+async def _auto_refresh_poll(session, context, chat_id):
+    """Refresh the custom poll UI if one is active."""
+    active_poll_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
+    active_poll = (await session.execute(active_poll_stmt)).scalars().first()
+    if not active_poll:
+        return
+
+    session_obj = await session.get(Session, chat_id)
+    if session_obj and session_obj.poll_type == PollType.CUSTOM:
+        try:
+            valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+            await render_poll_message(
+                context.bot,
+                chat_id,
+                active_poll.message_id,
+                session,
+                active_poll.poll_id,
+                valid_games,
+                priority_ids,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to auto-refresh poll: {e}")
+
+
 async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle join button."""
     query = update.callback_query
-    # await query.answer() # Moved below for conditional answering
 
     user = query.from_user
     chat_id = query.message.chat.id
@@ -469,11 +668,16 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Validate Session Message ID
         session_obj = await session.get(Session, chat_id)
         if session_obj and session_obj.message_id and session_obj.message_id != message_id:
-            await query.answer(
-                "This session is expired. Please use the active Game Night message.",
-                show_alert=True,
-            )
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer(
+                    "This session is expired. Please use the active Game Night message.",
+                    show_alert=True,
+                )
             return
+
+        # Answer callback query early to avoid "query is too old" errors
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer()
 
         stmt = select(User).where(User.telegram_id == user.id)
         result = await session.execute(stmt)
@@ -481,16 +685,25 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if not db_user:
             # Create user if not exists
-            db_user = User(telegram_id=user.id, telegram_name=user.first_name)
+            db_user = User(
+                telegram_id=user.id,
+                telegram_name=user.first_name,
+                telegram_last_name=user.last_name,
+                telegram_username=user.username,
+            )
             session.add(db_user)
             await session.commit()
-        elif db_user.telegram_name != user.first_name:
-            # Update name if changed
+        elif (
+            db_user.telegram_name != user.first_name
+            or db_user.telegram_last_name != user.last_name
+            or db_user.telegram_username != user.username
+        ):
+            # Update name fields if anything changed
             db_user.telegram_name = user.first_name
+            db_user.telegram_last_name = user.last_name
+            db_user.telegram_username = user.username
             session.add(db_user)
             await session.commit()
-
-    await query.answer()
 
     async with db.AsyncSessionLocal() as session:
         # Check if already joined
@@ -525,12 +738,7 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         players = (await session.execute(players_stmt)).scalars().all()
 
-        names = []
-        for p in players:
-            name = p.user.telegram_name or p.user.bgg_username or f"User {p.user_id}"
-            if p.user.is_guest:
-                name += " 👤"
-            names.append(name)
+        names = build_player_names(players)
 
         # Get session settings
         session_obj = await session.get(Session, chat_id)
@@ -552,35 +760,10 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown",
     )
 
-    # Auto-Refresh Custom Poll if active
-    # We open a new session to check for any active polls and update them if needed
+    # Prune stale votes and auto-refresh custom poll if active
     async with db.AsyncSessionLocal() as session:
-        active_poll_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
-        # Handle potential multiple polls gracefully by taking the most recent (or first)
-        # Ideally only one exists, but we don't want to crash.
-        active_poll = (await session.execute(active_poll_stmt)).scalars().first()
-
-        if active_poll:
-            # Check if session is in Custom mode (heuristic to decide if we should update message)
-            # Or just try to update it regardless?
-            # If it's a native poll, render_poll_message might fail if we pass a native poll ID?
-            # Native IDs are long integers usually? Custom are message IDs (int).
-            # Let's check session type.
-            session_obj = await session.get(Session, chat_id)
-            if session_obj and session_obj.poll_type == PollType.CUSTOM:
-                try:
-                    valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-                    await render_poll_message(
-                        context.bot,
-                        chat_id,
-                        active_poll.message_id,
-                        session,
-                        active_poll.poll_id,
-                        valid_games,
-                        priority_ids,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to auto-refresh poll on join: {e}")
+        await _prune_stale_votes(session, context, chat_id)
+        await _auto_refresh_poll(session, context, chat_id)
 
 
 async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -597,10 +780,13 @@ async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         # Validate Session Message ID
         session_obj = await session.get(Session, chat_id)
         if session_obj and session_obj.message_id and session_obj.message_id != message_id:
-            await query.answer("This session is expired.", show_alert=True)
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("This session is expired.", show_alert=True)
             return
 
-        await query.answer()
+        # Answer callback query early to avoid "query is too old" errors
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer()
 
         # Check if user is in the session
         stmt = select(SessionPlayer).where(
@@ -642,12 +828,7 @@ async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         players = (await session.execute(players_stmt)).scalars().all()
 
         # Build names list
-        names = []
-        for p in players:
-            name = p.user.telegram_name or p.user.bgg_username or f"User {p.user_id}"
-            if p.user.is_guest:
-                name += " 👤"
-            names.append(name)
+        names = build_player_names(players)
 
         # Get session settings
         session_obj = await session.get(Session, chat_id)
@@ -672,6 +853,11 @@ async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
+
+    # Prune stale votes and auto-refresh custom poll if active
+    async with db.AsyncSessionLocal() as session:
+        await _prune_stale_votes(session, context, chat_id)
+        await _auto_refresh_poll(session, context, chat_id)
 
 
 async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1304,7 +1490,8 @@ async def guest_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def resume_night_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle resume button - just show current lobby state."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -1324,12 +1511,7 @@ async def resume_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
         players = (await session.execute(players_stmt)).scalars().all()
 
-        names = []
-        for p in players:
-            name = p.user.telegram_name or p.user.bgg_username or f"User {p.user_id}"
-            if p.user.is_guest:
-                name += " 👤"
-            names.append(name)
+        names = build_player_names(players)
 
     keyboard = [
         [
@@ -1356,7 +1538,8 @@ async def resume_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle restart button - clear and start fresh."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
 
@@ -1377,23 +1560,7 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
                     )
 
             # Auto-Close Previous Polls
-            existing_polls_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
-            existing_polls = (await session.execute(existing_polls_stmt)).scalars().all()
-
-            if existing_polls:
-                for p in existing_polls:
-                    try:
-                        await context.bot.stop_poll(chat_id, p.message_id)
-                    except Exception:
-                        with contextlib.suppress(Exception):
-                            await context.bot.edit_message_text(
-                                chat_id=chat_id,
-                                message_id=p.message_id,
-                                text="🛑 **Poll Closed** (Game Night Restarted)",
-                                parse_mode="Markdown",
-                                reply_markup=None,
-                            )
-                    await session.delete(p)
+            await _close_existing_polls(session, context, chat_id, reason="Poll Closed (Game Night Restarted)")
 
             # Clear players
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
@@ -1435,7 +1602,8 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def toggle_weights_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle toggle weights button."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -1444,7 +1612,8 @@ async def toggle_weights_callback(update: Update, context: ContextTypes.DEFAULT_
         session_obj = await session.get(Session, chat_id)
         if session_obj:
             if session_obj.message_id and session_obj.message_id != message_id:
-                await query.answer("This session is expired.", show_alert=True)
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer("This session is expired.", show_alert=True)
                 return
 
             session_obj.settings_weighted = not session_obj.settings_weighted
@@ -1491,7 +1660,8 @@ async def toggle_weights_callback(update: Update, context: ContextTypes.DEFAULT_
 async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle poll button - create poll from callback."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -1500,7 +1670,8 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Validate Session Message ID
         session_obj = await session.get(Session, chat_id)
         if session_obj and session_obj.message_id and session_obj.message_id != message_id:
-            await query.answer("This session is expired.", show_alert=True)
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("This session is expired.", show_alert=True)
             return
 
         # Get Players
@@ -1520,27 +1691,8 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         # Auto-Close Existing Polls for this session
-        existing_polls_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
-        existing_polls = (await session.execute(existing_polls_stmt)).scalars().all()
-
-        if existing_polls:
-            for p in existing_polls:
-                try:
-                    # Try to stop native poll
-                    await context.bot.stop_poll(chat_id, p.message_id)
-                except Exception:
-                    # If failed (e.g. not a poll), try to edit message (Custom Poll)
-                    with contextlib.suppress(Exception):
-                        await context.bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=p.message_id,
-                            text="🛑 **Poll Closed** (New poll started)",
-                            parse_mode="Markdown",
-                            reply_markup=None,
-                        )
-
-                await session.delete(p)
-            await session.commit()
+        await _close_existing_polls(session, context, chat_id, reason="Poll Closed (New poll started)")
+        await session.commit()
 
         player_count = len(players)
         player_ids = [p.user_id for p in players]
@@ -1644,7 +1796,8 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cancel_night_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle cancel button - end the game night."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -1654,10 +1807,14 @@ async def cancel_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Validate Session Message ID
         if db_session and db_session.message_id and db_session.message_id != message_id:
-            await query.answer("This session is expired.", show_alert=True)
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("This session is expired.", show_alert=True)
             return
 
         if db_session:
+            # Close any active polls
+            await _close_existing_polls(session, context, chat_id, reason="Poll Closed (Game Night Cancelled)")
+
             # Clear players
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
 
@@ -1739,7 +1896,12 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
             vote = (await session.execute(vote_stmt)).scalar_one_or_none()
 
             if not vote:
-                vote = PollVote(poll_id=poll_id, user_id=user_id, user_name=user_name)
+                vote = PollVote(
+                    poll_id=poll_id,
+                    user_id=user_id,
+                    user_name=user_name,
+                    vote_type=VoteType.GAME,
+                )
                 session.add(vote)
 
         await session.commit()
@@ -1950,7 +2112,8 @@ async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def manage_collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle manage collection button clicks."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     data = query.data  # "manage:toggle:<game_id>" or "manage:page:<page_num>"
     parts = data.split(":")
@@ -2123,7 +2286,8 @@ POLL_SETTINGS_TEXT = (
 async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show poll settings."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -2132,7 +2296,8 @@ async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
         session_obj = await session.get(Session, chat_id)
 
         if session_obj and session_obj.message_id and session_obj.message_id != message_id:
-            await query.answer("This session is expired.", show_alert=True)
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("This session is expired.", show_alert=True)
             return
 
         if not session_obj:
@@ -2150,7 +2315,8 @@ async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle between Custom and Native poll modes."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -2160,7 +2326,8 @@ async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAUL
 
         if session_obj:
             if session_obj.message_id and session_obj.message_id != message_id:
-                await query.answer("This session is expired.", show_alert=True)
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer("This session is expired.", show_alert=True)
                 return
 
             # Toggle poll type
@@ -2182,7 +2349,8 @@ async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAUL
 async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle anonymous voting setting."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -2192,7 +2360,8 @@ async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFA
 
         if session_obj:
             if session_obj.message_id and session_obj.message_id != message_id:
-                await query.answer("This session is expired.", show_alert=True)
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer("This session is expired.", show_alert=True)
                 return
 
             session_obj.hide_voters = not session_obj.hide_voters
@@ -2210,7 +2379,8 @@ async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFA
 async def cycle_vote_limit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cycle through vote limit options."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -2220,7 +2390,8 @@ async def cycle_vote_limit_callback(update: Update, context: ContextTypes.DEFAUL
 
         if session_obj:
             if session_obj.message_id and session_obj.message_id != message_id:
-                await query.answer("This session is expired.", show_alert=True)
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer("This session is expired.", show_alert=True)
                 return
 
             # Cycle to next option
@@ -2280,13 +2451,16 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
     # Split data: "vote:<poll_id>:<game_id>"
     parts = query.data.split(":")
     if len(parts) < 3:
-        await query.answer("Invalid vote data")
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer("Invalid vote data")
         return
 
     poll_id = parts[1]
     game_id = int(parts[2])
     user_id = query.from_user.id
     user_name = query.from_user.first_name
+    user_last_name = query.from_user.last_name
+    user_tg_username = query.from_user.username
 
     async with db.AsyncSessionLocal() as session:
         # Get poll and session info for vote limit
@@ -2314,10 +2488,13 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
             user_name=user_name,
             vote_limit=vote_limit,
             game_count=game_count,
+            user_last_name=user_last_name,
+            user_tg_username=user_tg_username,
         )
 
         await session.commit()
-        await query.answer(result.message)
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer(result.message)
 
         if result.success:
             # Refresh UI
@@ -2386,21 +2563,26 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
     total_votes = 0
     unique_voters = set()
 
+    # Build disambiguated names from vote snapshots — isolates existing voters
+    # from lobby changes (a new joiner can't rename someone who already voted)
+    voter_name_map = disambiguate_voter_names(all_votes)
+
     for v in all_votes:
+        voter_display = voter_name_map.get(v.user_id, v.user_name or f"User {v.user_id}")
         if v.vote_type == VoteType.CATEGORY:
             # Category vote: target_id (category_level)
             level = v.category_level
             category_vote_counts[level] = category_vote_counts.get(level, 0) + 1
             if level not in category_voters:
                 category_voters[level] = []
-            category_voters[level].append(v.user_name)
+            category_voters[level].append(voter_display)
             total_votes += 1
             unique_voters.add(v.user_id)
         elif v.vote_type == VoteType.GAME:
             game_id = v.game_id
             if game_id in vote_counts:
                 vote_counts[game_id] += 1
-                voters_by_game[game_id].append(v.user_name)
+                voters_by_game[game_id].append(voter_display)
                 total_votes += 1
                 unique_voters.add(v.user_id)
 
@@ -2550,7 +2732,8 @@ async def _handle_poll_refresh(
     query, context: ContextTypes.DEFAULT_TYPE, poll_id: str
 ) -> None:
     """Refresh the custom poll message with current vote state."""
-    await query.answer("Refreshing...")
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer("Refreshing...")
     async with db.AsyncSessionLocal() as session:
         game_poll = await session.get(GameNightPoll, poll_id)
         if game_poll:
@@ -2591,7 +2774,8 @@ async def _handle_poll_toggle_voters(
                     valid_games,
                     priority_ids,
                 )
-    await query.answer("Visibility toggled")
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer("Visibility toggled")
 
 
 async def _handle_poll_category_vote(
@@ -2606,6 +2790,8 @@ async def _handle_poll_category_vote(
     chat_id = query.message.chat.id
     user_id = query.from_user.id
     user_name = query.from_user.first_name
+    user_last_name = query.from_user.last_name
+    user_tg_username = query.from_user.username
 
 
 
@@ -2621,7 +2807,8 @@ async def _handle_poll_category_vote(
 
         target_group = groups.get(level, [])
         if not target_group:
-            await query.answer("No games in this group!")
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("No games in this group!")
             return
 
         # Use PollService for vote casting
@@ -2640,6 +2827,8 @@ async def _handle_poll_category_vote(
             user_name=user_name,
             vote_limit=vote_limit,
             game_count=game_count,
+            user_last_name=user_last_name,
+            user_tg_username=user_tg_username,
         )
 
         await session.commit()
@@ -2703,6 +2892,10 @@ async def _handle_poll_close(
             chat_id=chat_id, message_id=game_poll.message_id, text=text, parse_mode="Markdown"
         )
 
+        # Delete the poll record (cascade deletes all PollVote rows)
+        # The result message above remains visible in chat.
+        await session.delete(game_poll)
+
         # End the game night session
         session_obj = await session.get(Session, chat_id)
         if session_obj:
@@ -2738,7 +2931,8 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
 
     elif action == "poll_random_vote":
         if len(parts) < 3:
-            await query.answer("Invalid data")
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("Invalid data")
             return
         level = int(parts[2])
         await _handle_poll_category_vote(query, context, poll_id, level)
