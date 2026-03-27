@@ -53,6 +53,8 @@ def mock_update():
     update.effective_chat.id = 12345
     update.effective_user.id = 111
     update.effective_user.first_name = "TestUser"
+    update.effective_user.last_name = None
+    update.effective_user.username = None
     update.message = MagicMock(spec=Message)
 
     # Configure reply_text to return a proper message with message_id
@@ -65,6 +67,8 @@ def mock_update():
     update.callback_query.message.chat.id = 12345
     update.callback_query.from_user.id = 111
     update.callback_query.from_user.first_name = "TestUser"
+    update.callback_query.from_user.last_name = None
+    update.callback_query.from_user.username = None
     update.callback_query.answer = AsyncMock()
     update.callback_query.edit_message_text = AsyncMock()
     return update

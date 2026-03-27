@@ -1,9 +1,10 @@
 import contextlib
 import logging
 import math
-import random
 from collections import namedtuple
+from collections.abc import Sequence
 
+import telegram
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -13,7 +14,6 @@ from src.core import db
 from src.core.bgg import BGGClient
 from src.core.logic import (
     STAR_BOOST,
-    calculate_poll_winner,
     group_games_by_complexity,
     split_games,
 )
@@ -30,12 +30,115 @@ from src.core.models import (
     User,
     UserExpansion,
     VoteLimit,
+    VoteType,
 )
+from src.core.poll_service import PollService
 
 # Named tuple for resolved votes (after category resolution)
 ResolvedVote = namedtuple("ResolvedVote", ["game_id", "user_id"])
 
 logger = logging.getLogger(__name__)
+
+
+_NameEntry = namedtuple("_NameEntry", ["uid", "first", "last", "tg_username", "fallback"])
+
+
+def _disambiguate(entries: list) -> dict[int, str]:
+    """
+    Core disambiguation logic. Accepts a list of _NameEntry namedtuples and returns
+    {uid: display_name}, guaranteeing uniqueness within the group.
+
+    Ladder (stops at first level that yields a unique name):
+      1. First name only
+      2. First name + last initial  ("Alex S.")
+      3. First name + full last name ("Alex Smith")
+      4. First name + @username      ("Alex (@alexs)")
+      5. fallback (bgg_username / "User {id}")
+    """
+    result: dict[int, str] = {}
+    for e in entries:
+        if not e.first:
+            result[e.uid] = e.fallback
+            continue
+
+        conflicts = [o for o in entries if o.first == e.first and o.uid != e.uid]
+        if not conflicts:
+            result[e.uid] = e.first
+            continue
+
+        if e.last:
+            candidate = f"{e.first} {e.last[0]}."
+            conflict_initials = {f"{e.first} {o.last[0]}." for o in conflicts if o.last}
+            if candidate not in conflict_initials:
+                result[e.uid] = candidate
+                continue
+
+            candidate_full = f"{e.first} {e.last}"
+            conflict_full = {f"{e.first} {o.last}" for o in conflicts if o.last}
+            if candidate_full not in conflict_full:
+                result[e.uid] = candidate_full
+                continue
+
+        if e.tg_username:
+            result[e.uid] = f"{e.first} (@{e.tg_username})"
+            continue
+
+        result[e.uid] = e.fallback
+
+    return result
+
+
+def disambiguate_names(users: list) -> dict[int, str]:
+    """Return disambiguated display names for a list of User objects."""
+    entries = [
+        _NameEntry(
+            uid=u.telegram_id,
+            first=u.telegram_name,
+            last=u.telegram_last_name,
+            tg_username=u.telegram_username,
+            fallback=u.bgg_username or f"User {u.telegram_id}",
+        )
+        for u in users
+    ]
+    return _disambiguate(entries)
+
+
+def disambiguate_voter_names(votes: list) -> dict[int, str]:
+    """
+    Return disambiguated display names derived from PollVote snapshot fields.
+
+    Uses only the data captured at vote time so that a new voter joining later
+    never retroactively renames an existing voter in the poll display.
+    """
+    # Deduplicate: one entry per unique voter (keep first occurrence)
+    seen: set[int] = set()
+    entries = []
+    for v in votes:
+        if v.user_id not in seen:
+            seen.add(v.user_id)
+            entries.append(
+                _NameEntry(
+                    uid=v.user_id,
+                    first=v.user_name,
+                    last=v.user_last_name,
+                    tg_username=v.user_tg_username,
+                    fallback=f"User {v.user_id}",
+                )
+            )
+    return _disambiguate(entries)
+
+
+def build_player_names(players: Sequence[SessionPlayer]) -> list[str]:
+    """Build disambiguated display names for a list of SessionPlayer objects."""
+    users = [p.user for p in players]
+    name_map = disambiguate_names(users)
+    names = []
+    for p in players:
+        name = name_map.get(p.user_id, p.user.bgg_username or f"User {p.user_id}")
+        if p.user.is_guest:
+            name += " 👤"
+        names.append(name)
+    return names
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,8 +213,11 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user = User(telegram_id=telegram_id, telegram_name=update.effective_user.first_name)
             session.add(user)
 
+        tg_user = update.effective_user
         user.bgg_username = bgg_username
-        user.telegram_name = update.effective_user.first_name  # Update name on each call
+        user.telegram_name = tg_user.first_name
+        user.telegram_last_name = tg_user.last_name
+        user.telegram_username = tg_user.username
         await session.commit()
 
     # Show initial feedback and keep reference to message to update it
@@ -363,6 +469,26 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _close_existing_polls(session, context, chat_id, reason="Poll Closed"):
+    """Close all active polls for a chat: edit/stop messages and delete DB records."""
+    existing_polls_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
+    existing_polls = (await session.execute(existing_polls_stmt)).scalars().all()
+
+    for p in existing_polls:
+        try:
+            await context.bot.stop_poll(chat_id, p.message_id)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=p.message_id,
+                    text=f"🛑 **{reason}**",
+                    parse_mode="Markdown",
+                    reply_markup=None,
+                )
+        await session.delete(p)
+
+
 async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start a lobby."""
     chat_id = update.effective_chat.id
@@ -383,12 +509,7 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if players:
                 # There's an active game night with players - ask for confirmation
-                names = []
-                for p in players:
-                    name = p.user.telegram_name or p.user.bgg_username or f"User {p.user_id}"
-                    if p.user.is_guest:
-                        name += " 👤"
-                    names.append(name)
+                names = build_player_names(players)
 
                 keyboard = [
                     [
@@ -410,6 +531,11 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not db_session:
             db_session = Session(chat_id=chat_id)
             session.add(db_session)
+
+        # Close any leftover polls from previous session
+        await _close_existing_polls(
+            session, context, chat_id, reason="Poll Closed (New Game Night)"
+        )
 
         # Clear players
         await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
@@ -456,10 +582,85 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await session.commit()
 
 
+async def _prune_stale_votes(session, context, chat_id):
+    """Delete votes for games no longer in the valid set and notify the chat."""
+    active_poll_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
+    active_poll = (await session.execute(active_poll_stmt)).scalars().first()
+    if not active_poll:
+        return
+
+    # Safety: skip pruning if no players in session (cleanup transition)
+    players_stmt = select(SessionPlayer).where(SessionPlayer.session_id == chat_id)
+    players = (await session.execute(players_stmt)).scalars().all()
+    if not players:
+        return
+
+    valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+    valid_game_ids = {g.id for g in valid_games}
+
+    # Find stale game votes (voted game no longer in valid set)
+    stale_game_votes_stmt = select(PollVote).where(
+        PollVote.poll_id == active_poll.poll_id,
+        PollVote.vote_type == VoteType.GAME,
+        PollVote.game_id.notin_(valid_game_ids)
+        if valid_game_ids
+        else PollVote.vote_type == VoteType.GAME,
+    )
+    stale_game_votes = (await session.execute(stale_game_votes_stmt)).scalars().all()
+
+    # Find stale category votes (complexity level has no games left)
+    from src.core.logic import group_games_by_complexity
+
+    active_levels = set(group_games_by_complexity(valid_games).keys()) if valid_games else set()
+    stale_cat_votes_stmt = select(PollVote).where(
+        PollVote.poll_id == active_poll.poll_id,
+        PollVote.vote_type == VoteType.CATEGORY,
+        PollVote.category_level.notin_(active_levels)
+        if active_levels
+        else PollVote.vote_type == VoteType.CATEGORY,
+    )
+    stale_cat_votes = (await session.execute(stale_cat_votes_stmt)).scalars().all()
+
+    total_suspended = len(stale_game_votes) + len(stale_cat_votes)
+    if total_suspended > 0:
+        with contextlib.suppress(Exception):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ Game list updated ({len(valid_games)} games). "
+                    f"{total_suspended} vote(s) suspended "
+                    f"(will resume if games become eligible again)."
+                ),
+            )
+
+
+async def _auto_refresh_poll(session, context, chat_id):
+    """Refresh the custom poll UI if one is active."""
+    active_poll_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
+    active_poll = (await session.execute(active_poll_stmt)).scalars().first()
+    if not active_poll:
+        return
+
+    session_obj = await session.get(Session, chat_id)
+    if session_obj and session_obj.poll_type == PollType.CUSTOM:
+        try:
+            valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+            await render_poll_message(
+                context.bot,
+                chat_id,
+                active_poll.message_id,
+                session,
+                active_poll.poll_id,
+                valid_games,
+                priority_ids,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to auto-refresh poll: {e}")
+
+
 async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle join button."""
     query = update.callback_query
-    # await query.answer() # Moved below for conditional answering
 
     user = query.from_user
     chat_id = query.message.chat.id
@@ -469,11 +670,16 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Validate Session Message ID
         session_obj = await session.get(Session, chat_id)
         if session_obj and session_obj.message_id and session_obj.message_id != message_id:
-            await query.answer(
-                "This session is expired. Please use the active Game Night message.",
-                show_alert=True,
-            )
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer(
+                    "This session is expired. Please use the active Game Night message.",
+                    show_alert=True,
+                )
             return
+
+        # Answer callback query early to avoid "query is too old" errors
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer()
 
         stmt = select(User).where(User.telegram_id == user.id)
         result = await session.execute(stmt)
@@ -481,16 +687,25 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if not db_user:
             # Create user if not exists
-            db_user = User(telegram_id=user.id, telegram_name=user.first_name)
+            db_user = User(
+                telegram_id=user.id,
+                telegram_name=user.first_name,
+                telegram_last_name=user.last_name,
+                telegram_username=user.username,
+            )
             session.add(db_user)
             await session.commit()
-        elif db_user.telegram_name != user.first_name:
-            # Update name if changed
+        elif (
+            db_user.telegram_name != user.first_name
+            or db_user.telegram_last_name != user.last_name
+            or db_user.telegram_username != user.username
+        ):
+            # Update name fields if anything changed
             db_user.telegram_name = user.first_name
+            db_user.telegram_last_name = user.last_name
+            db_user.telegram_username = user.username
             session.add(db_user)
             await session.commit()
-
-    await query.answer()
 
     async with db.AsyncSessionLocal() as session:
         # Check if already joined
@@ -525,12 +740,7 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         players = (await session.execute(players_stmt)).scalars().all()
 
-        names = []
-        for p in players:
-            name = p.user.telegram_name or p.user.bgg_username or f"User {p.user_id}"
-            if p.user.is_guest:
-                name += " 👤"
-            names.append(name)
+        names = build_player_names(players)
 
         # Get session settings
         session_obj = await session.get(Session, chat_id)
@@ -552,35 +762,10 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown",
     )
 
-    # Auto-Refresh Custom Poll if active
-    # We open a new session to check for any active polls and update them if needed
+    # Prune stale votes and auto-refresh custom poll if active
     async with db.AsyncSessionLocal() as session:
-        active_poll_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
-        # Handle potential multiple polls gracefully by taking the most recent (or first)
-        # Ideally only one exists, but we don't want to crash.
-        active_poll = (await session.execute(active_poll_stmt)).scalars().first()
-
-        if active_poll:
-            # Check if session is in Custom mode (heuristic to decide if we should update message)
-            # Or just try to update it regardless?
-            # If it's a native poll, render_poll_message might fail if we pass a native poll ID?
-            # Native IDs are long integers usually? Custom are message IDs (int).
-            # Let's check session type.
-            session_obj = await session.get(Session, chat_id)
-            if session_obj and session_obj.poll_type == PollType.CUSTOM:
-                try:
-                    valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-                    await render_poll_message(
-                        context.bot,
-                        chat_id,
-                        active_poll.message_id,
-                        session,
-                        active_poll.poll_id,
-                        valid_games,
-                        priority_ids,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to auto-refresh poll on join: {e}")
+        await _prune_stale_votes(session, context, chat_id)
+        await _auto_refresh_poll(session, context, chat_id)
 
 
 async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -597,10 +782,13 @@ async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         # Validate Session Message ID
         session_obj = await session.get(Session, chat_id)
         if session_obj and session_obj.message_id and session_obj.message_id != message_id:
-            await query.answer("This session is expired.", show_alert=True)
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("This session is expired.", show_alert=True)
             return
 
-        await query.answer()
+        # Answer callback query early to avoid "query is too old" errors
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer()
 
         # Check if user is in the session
         stmt = select(SessionPlayer).where(
@@ -642,12 +830,7 @@ async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         players = (await session.execute(players_stmt)).scalars().all()
 
         # Build names list
-        names = []
-        for p in players:
-            name = p.user.telegram_name or p.user.bgg_username or f"User {p.user_id}"
-            if p.user.is_guest:
-                name += " 👤"
-            names.append(name)
+        names = build_player_names(players)
 
         # Get session settings
         session_obj = await session.get(Session, chat_id)
@@ -672,6 +855,11 @@ async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
     )
+
+    # Prune stale votes and auto-refresh custom poll if active
+    async with db.AsyncSessionLocal() as session:
+        await _prune_stale_votes(session, context, chat_id)
+        await _auto_refresh_poll(session, context, chat_id)
 
 
 async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1304,7 +1492,8 @@ async def guest_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def resume_night_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle resume button - just show current lobby state."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -1324,12 +1513,7 @@ async def resume_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
         players = (await session.execute(players_stmt)).scalars().all()
 
-        names = []
-        for p in players:
-            name = p.user.telegram_name or p.user.bgg_username or f"User {p.user_id}"
-            if p.user.is_guest:
-                name += " 👤"
-            names.append(name)
+        names = build_player_names(players)
 
     keyboard = [
         [
@@ -1356,7 +1540,8 @@ async def resume_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle restart button - clear and start fresh."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
 
@@ -1377,23 +1562,9 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
                     )
 
             # Auto-Close Previous Polls
-            existing_polls_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
-            existing_polls = (await session.execute(existing_polls_stmt)).scalars().all()
-
-            if existing_polls:
-                for p in existing_polls:
-                    try:
-                        await context.bot.stop_poll(chat_id, p.message_id)
-                    except Exception:
-                        with contextlib.suppress(Exception):
-                            await context.bot.edit_message_text(
-                                chat_id=chat_id,
-                                message_id=p.message_id,
-                                text="🛑 **Poll Closed** (Game Night Restarted)",
-                                parse_mode="Markdown",
-                                reply_markup=None,
-                            )
-                    await session.delete(p)
+            await _close_existing_polls(
+                session, context, chat_id, reason="Poll Closed (Game Night Restarted)"
+            )
 
             # Clear players
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
@@ -1435,7 +1606,8 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def toggle_weights_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle toggle weights button."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -1444,7 +1616,8 @@ async def toggle_weights_callback(update: Update, context: ContextTypes.DEFAULT_
         session_obj = await session.get(Session, chat_id)
         if session_obj:
             if session_obj.message_id and session_obj.message_id != message_id:
-                await query.answer("This session is expired.", show_alert=True)
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer("This session is expired.", show_alert=True)
                 return
 
             session_obj.settings_weighted = not session_obj.settings_weighted
@@ -1491,7 +1664,8 @@ async def toggle_weights_callback(update: Update, context: ContextTypes.DEFAULT_
 async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle poll button - create poll from callback."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -1500,7 +1674,8 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Validate Session Message ID
         session_obj = await session.get(Session, chat_id)
         if session_obj and session_obj.message_id and session_obj.message_id != message_id:
-            await query.answer("This session is expired.", show_alert=True)
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("This session is expired.", show_alert=True)
             return
 
         # Get Players
@@ -1520,27 +1695,10 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         # Auto-Close Existing Polls for this session
-        existing_polls_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
-        existing_polls = (await session.execute(existing_polls_stmt)).scalars().all()
-
-        if existing_polls:
-            for p in existing_polls:
-                try:
-                    # Try to stop native poll
-                    await context.bot.stop_poll(chat_id, p.message_id)
-                except Exception:
-                    # If failed (e.g. not a poll), try to edit message (Custom Poll)
-                    with contextlib.suppress(Exception):
-                        await context.bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=p.message_id,
-                            text="🛑 **Poll Closed** (New poll started)",
-                            parse_mode="Markdown",
-                            reply_markup=None,
-                        )
-
-                await session.delete(p)
-            await session.commit()
+        await _close_existing_polls(
+            session, context, chat_id, reason="Poll Closed (New poll started)"
+        )
+        await session.commit()
 
         player_count = len(players)
         player_ids = [p.user_id for p in players]
@@ -1644,7 +1802,8 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cancel_night_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle cancel button - end the game night."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -1654,10 +1813,16 @@ async def cancel_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Validate Session Message ID
         if db_session and db_session.message_id and db_session.message_id != message_id:
-            await query.answer("This session is expired.", show_alert=True)
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("This session is expired.", show_alert=True)
             return
 
         if db_session:
+            # Close any active polls
+            await _close_existing_polls(
+                session, context, chat_id, reason="Poll Closed (Game Night Cancelled)"
+            )
+
             # Clear players
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
 
@@ -1739,7 +1904,12 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
             vote = (await session.execute(vote_stmt)).scalar_one_or_none()
 
             if not vote:
-                vote = PollVote(poll_id=poll_id, user_id=user_id, user_name=user_name)
+                vote = PollVote(
+                    poll_id=poll_id,
+                    user_id=user_id,
+                    user_name=user_name,
+                    vote_type=VoteType.GAME,
+                )
                 session.add(vote)
 
         await session.commit()
@@ -1950,7 +2120,8 @@ async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def manage_collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle manage collection button clicks."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     data = query.data  # "manage:toggle:<game_id>" or "manage:page:<page_num>"
     parts = data.split(":")
@@ -2075,34 +2246,26 @@ def get_vote_limit_display(vote_limit: int, game_count: int = 0) -> str:
         return str(vote_limit)
 
 
-async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show poll settings."""
-    query = update.callback_query
-    await query.answer()
+def _build_settings_keyboard(
+    session_obj, vote_limit_text: str | None = None
+) -> list[list[InlineKeyboardButton]]:
+    """
+    Build the poll settings inline keyboard.
 
-    chat_id = query.message.chat.id
-    message_id = query.message.message_id
+    Args:
+        session_obj: The Session ORM object with poll settings.
+        vote_limit_text: Optional pre-computed vote limit display text.
 
-    async with db.AsyncSessionLocal() as session:
-        session_obj = await session.get(Session, chat_id)
+    Returns:
+        List of button rows for InlineKeyboardMarkup.
+    """
+    is_custom = session_obj.poll_type == PollType.CUSTOM
+    mode_text = "Custom (Single)" if is_custom else "Native (Multiple)"
+    weight_icon = "✅" if session_obj.settings_weighted else "❌"
+    hide_icon = "✅" if session_obj.hide_voters else "❌"
+    limit_text = vote_limit_text or get_vote_limit_display(session_obj.vote_limit)
 
-        if session_obj and session_obj.message_id and session_obj.message_id != message_id:
-            await query.answer("This session is expired.", show_alert=True)
-            return
-
-        if not session_obj:
-            return
-
-        is_custom = session_obj.poll_type == PollType.CUSTOM
-        is_weighted = session_obj.settings_weighted
-        hide_voters = session_obj.hide_voters
-        vote_limit = session_obj.vote_limit
-        mode_text = "Custom (Single)" if is_custom else "Native (Multiple)"
-        weight_icon = "✅" if is_weighted else "❌"
-        hide_icon = "✅" if hide_voters else "❌"
-        limit_text = get_vote_limit_display(vote_limit)
-
-    keyboard = [
+    return [
         [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
         [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
         [
@@ -2114,12 +2277,40 @@ async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
     ]
 
+
+POLL_SETTINGS_TEXT = (
+    "**Poll Settings**\n\n"
+    "• **Custom (Single)**: One message with buttons. Good for large lists.\n"
+    "• **Native (Multiple)**: Standard Telegram polls. Split if >10 games.\n"
+    "• **Weights**: Starred games get +0.5 votes.\n"
+    "• **Vote Limit**: Max votes per player (Auto scales with game count)."
+)
+
+
+async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show poll settings."""
+    query = update.callback_query
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
+
+    chat_id = query.message.chat.id
+    message_id = query.message.message_id
+
+    async with db.AsyncSessionLocal() as session:
+        session_obj = await session.get(Session, chat_id)
+
+        if session_obj and session_obj.message_id and session_obj.message_id != message_id:
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("This session is expired.", show_alert=True)
+            return
+
+        if not session_obj:
+            return
+
+        keyboard = _build_settings_keyboard(session_obj)
+
     await query.edit_message_text(
-        "**Poll Settings**\n\n"
-        "• **Custom (Single)**: One message with buttons. Good for large lists.\n"
-        "• **Native (Multiple)**: Standard Telegram polls. Split if >10 games.\n"
-        "• **Weights**: Starred games get +0.5 votes.\n"
-        "• **Vote Limit**: Max votes per player (Auto scales with game count).",
+        POLL_SETTINGS_TEXT,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -2128,7 +2319,8 @@ async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle between Custom and Native poll modes."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -2138,7 +2330,8 @@ async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAUL
 
         if session_obj:
             if session_obj.message_id and session_obj.message_id != message_id:
-                await query.answer("This session is expired.", show_alert=True)
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer("This session is expired.", show_alert=True)
                 return
 
             # Toggle poll type
@@ -2148,32 +2341,10 @@ async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAUL
                 session_obj.poll_type = PollType.CUSTOM
             await session.commit()
 
-            # Refresh settings view
-            is_custom = session_obj.poll_type == PollType.CUSTOM
-            is_weighted = session_obj.settings_weighted
-            hide_voters = session_obj.hide_voters
-
-            mode_text = "Custom (Single)" if is_custom else "Native (Multiple)"
-            weight_icon = "✅" if is_weighted else "❌"
-            hide_icon = "✅" if hide_voters else "❌"
-
-            keyboard = [
-                [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
-                [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
-                [
-                    InlineKeyboardButton(
-                        f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
-                    )
-                ],
-                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
-            ]
+            keyboard = _build_settings_keyboard(session_obj)
 
             await query.edit_message_text(
-                "**Poll Settings**\n\n"
-                "• **Custom (Single)**: One message with buttons. Good for large lists.\n"
-                "• **Native (Multiple)**: Standard Telegram polls. Split if >10 games.\n"
-                "• **Weights**: Starred games get +0.5 votes.\n"
-                "• **Anonymous**: Hide voter names (show counts only).",
+                POLL_SETTINGS_TEXT,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown",
             )
@@ -2182,7 +2353,8 @@ async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAUL
 async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle anonymous voting setting."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -2192,38 +2364,17 @@ async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFA
 
         if session_obj:
             if session_obj.message_id and session_obj.message_id != message_id:
-                await query.answer("This session is expired.", show_alert=True)
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer("This session is expired.", show_alert=True)
                 return
 
             session_obj.hide_voters = not session_obj.hide_voters
             await session.commit()
 
-            # Refresh settings view
-            is_custom = session_obj.poll_type == PollType.CUSTOM
-            is_weighted = session_obj.settings_weighted
-            hide_voters = session_obj.hide_voters
-
-            mode_text = "Custom (Single)" if is_custom else "Native (Multiple)"
-            weight_icon = "✅" if is_weighted else "❌"
-            hide_icon = "✅" if hide_voters else "❌"
-
-            keyboard = [
-                [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
-                [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
-                [
-                    InlineKeyboardButton(
-                        f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
-                    )
-                ],
-                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
-            ]
+            keyboard = _build_settings_keyboard(session_obj)
 
             await query.edit_message_text(
-                "**Poll Settings**\n\n"
-                "• **Custom (Single)**: One message with buttons. Good for large lists.\n"
-                "• **Native (Multiple)**: Standard Telegram polls. Split if >10 games.\n"
-                "• **Weights**: Starred games get +0.5 votes.\n"
-                "• **Anonymous**: Hide voter names (show counts only).",
+                POLL_SETTINGS_TEXT,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown",
             )
@@ -2232,7 +2383,8 @@ async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFA
 async def cycle_vote_limit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cycle through vote limit options."""
     query = update.callback_query
-    await query.answer()
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
 
     chat_id = query.message.chat.id
     message_id = query.message.message_id
@@ -2242,7 +2394,8 @@ async def cycle_vote_limit_callback(update: Update, context: ContextTypes.DEFAUL
 
         if session_obj:
             if session_obj.message_id and session_obj.message_id != message_id:
-                await query.answer("This session is expired.", show_alert=True)
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer("This session is expired.", show_alert=True)
                 return
 
             # Cycle to next option
@@ -2256,38 +2409,10 @@ async def cycle_vote_limit_callback(update: Update, context: ContextTypes.DEFAUL
             session_obj.vote_limit = VOTE_LIMIT_OPTIONS[next_idx]
             await session.commit()
 
-            # Refresh settings view
-            is_custom = session_obj.poll_type == PollType.CUSTOM
-            is_weighted = session_obj.settings_weighted
-            hide_voters = session_obj.hide_voters
-
-            mode_text = "Custom (Single)" if is_custom else "Native (Multiple)"
-            weight_icon = "✅" if is_weighted else "❌"
-            hide_icon = "✅" if hide_voters else "❌"
-            limit_text = get_vote_limit_display(session_obj.vote_limit)
-
-            keyboard = [
-                [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
-                [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
-                [
-                    InlineKeyboardButton(
-                        f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit"
-                    )
-                ],
-                [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
-            ]
+            keyboard = _build_settings_keyboard(session_obj)
 
             await query.edit_message_text(
-                "**Poll Settings**\n\n"
-                "• **Custom (Single)**: One message with buttons. Good for large lists.\n"
-                "• **Native (Multiple)**: Standard Telegram polls. Split if >10 games.\n"
-                "• **Weights**: Starred games get +0.5 votes.\n"
-                "• **Vote Limit**: Max votes per player (Auto scales with game count).",
+                POLL_SETTINGS_TEXT,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown",
             )
@@ -2330,13 +2455,16 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
     # Split data: "vote:<poll_id>:<game_id>"
     parts = query.data.split(":")
     if len(parts) < 3:
-        await query.answer("Invalid vote data")
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer("Invalid vote data")
         return
 
     poll_id = parts[1]
     game_id = int(parts[2])
     user_id = query.from_user.id
     user_name = query.from_user.first_name
+    user_last_name = query.from_user.last_name
+    user_tg_username = query.from_user.username
 
     async with db.AsyncSessionLocal() as session:
         # Get poll and session info for vote limit
@@ -2348,55 +2476,41 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
         chat_id = game_poll.chat_id
         session_obj = await session.get(Session, chat_id)
 
-        # Toggle Vote
-        stmt = select(PollVote).where(
-            PollVote.poll_id == poll_id, PollVote.user_id == user_id, PollVote.game_id == game_id
+        # Use PollService for vote casting
+        vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
+
+        # Calculate valid games count for auto-limit
+        valid_games, _ = await get_session_valid_games(session, chat_id)
+        game_count = len(valid_games) if valid_games else 0
+        valid_game_ids = {g.id for g in valid_games}
+        valid_category_levels = (
+            set(group_games_by_complexity(valid_games).keys()) if valid_games else set()
         )
-        existing_vote = (await session.execute(stmt)).scalar_one_or_none()
 
-        if existing_vote:
-            await session.delete(existing_vote)
-            msg = "Vote removed"
-        else:
-            # Check vote limit before adding
-            if session_obj:
-                vote_limit = session_obj.vote_limit
-
-                # Get user's current vote count for this poll
-                user_votes_stmt = select(func.count(PollVote.game_id)).where(
-                    PollVote.poll_id == poll_id, PollVote.user_id == user_id
-                )
-                user_vote_count = await session.scalar(user_votes_stmt) or 0
-
-                # Calculate effective limit
-                if vote_limit == VoteLimit.AUTO:
-                    valid_games, _ = await get_session_valid_games(session, chat_id)
-                    effective_limit = calculate_auto_vote_limit(len(valid_games))
-                elif vote_limit == VoteLimit.UNLIMITED:
-                    effective_limit = None  # No limit
-                else:
-                    effective_limit = vote_limit
-
-                # Enforce limit
-                if effective_limit is not None and user_vote_count >= effective_limit:
-                    await query.answer(
-                        f"Vote limit reached ({user_vote_count}/{effective_limit}). "
-                        "Remove a vote first!",
-                        show_alert=True,
-                    )
-                    return
-
-            vote = PollVote(poll_id=poll_id, user_id=user_id, game_id=game_id, user_name=user_name)
-            session.add(vote)
-            msg = "Vote recorded"
+        result = await PollService.cast_vote(
+            session=session,
+            poll_id=poll_id,
+            user_id=user_id,
+            target_id=game_id,
+            vote_type=VoteType.GAME,
+            user_name=user_name,
+            vote_limit=vote_limit,
+            game_count=game_count,
+            user_last_name=user_last_name,
+            user_tg_username=user_tg_username,
+            valid_game_ids=valid_game_ids,
+            valid_category_levels=valid_category_levels,
+        )
 
         await session.commit()
-        await query.answer(msg)
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer(result.message)
 
-        # Recalculate valid games
-        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        if result.success:
+            # Refresh UI
+            priority_ids = set()  # Optimized: re-fetch inside get_session_valid_games
+            valid_games, priority_ids = await get_session_valid_games(session, chat_id)
 
-        if valid_games:
             await render_poll_message(
                 context.bot,
                 chat_id,
@@ -2459,21 +2573,33 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
     total_votes = 0
     unique_voters = set()
 
+    # Build disambiguated names from vote snapshots — isolates existing voters
+    # from lobby changes (a new joiner can't rename someone who already voted)
+    voter_name_map = disambiguate_voter_names(all_votes)
+
+    # Pre-compute active complexity levels so suspended category votes are excluded
+    # from totals (mirrors the same guard used for game votes via `vote_counts` keys).
+    active_levels = set(group_games_by_complexity(games).keys()) if games else set()
+
     for v in all_votes:
-        if v.game_id is not None and v.game_id < 0:
-            # Category vote: game_id = -level
-            level = -v.game_id
+        voter_display = voter_name_map.get(v.user_id, v.user_name or f"User {v.user_id}")
+        if v.vote_type == VoteType.CATEGORY:
+            level = v.category_level
+            if level not in active_levels:
+                continue  # suspended — complexity level has no valid games right now
             category_vote_counts[level] = category_vote_counts.get(level, 0) + 1
             if level not in category_voters:
                 category_voters[level] = []
-            category_voters[level].append(v.user_name)
+            category_voters[level].append(voter_display)
             total_votes += 1
             unique_voters.add(v.user_id)
-        elif v.game_id in vote_counts:
-            vote_counts[v.game_id] += 1
-            voters_by_game[v.game_id].append(v.user_name)
-            total_votes += 1
-            unique_voters.add(v.user_id)
+        elif v.vote_type == VoteType.GAME:
+            game_id = v.game_id
+            if game_id in vote_counts:
+                vote_counts[game_id] += 1
+                voters_by_game[game_id].append(voter_display)
+                total_votes += 1
+                unique_voters.add(v.user_id)
 
     # Sort games: Most votes -> Starred -> Name
     def sort_key(g):
@@ -2605,20 +2731,53 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
             logger.warning(f"Failed to update poll message: {e}")
 
 
-async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Refresh/Close/Toggle actions for custom poll."""
-    query = update.callback_query
-    data = query.data
-    parts = data.split(":")
-    action = parts[0]
-    poll_id = parts[1]
+# ---------------------------------------------------------------------------- #
+# Poll Action Handlers (extracted from custom_poll_action_callback)
+# ---------------------------------------------------------------------------- #
 
-    if action == "poll_refresh":
+# DESIGN NOTE: Category Voting Convention
+# ----------------------------------------
+# Category votes use a negative game_id as a semantic marker:
+#   game_id = -level (e.g., -4 means "vote for complexity level 4 category")
+# At poll close time, category votes are resolved to a random game within
+# that complexity group. This allows voting on groups of games without
+# pre-selecting which specific game will be played.
+
+
+async def _handle_poll_refresh(query, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
+    """Refresh the custom poll message with current vote state."""
+    with contextlib.suppress(telegram.error.BadRequest):
         await query.answer("Refreshing...")
-        async with db.AsyncSessionLocal() as session:
+    async with db.AsyncSessionLocal() as session:
+        game_poll = await session.get(GameNightPoll, poll_id)
+        if game_poll:
+            chat_id = game_poll.chat_id
+            valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+            await render_poll_message(
+                context.bot,
+                chat_id,
+                game_poll.message_id,
+                session,
+                poll_id,
+                valid_games,
+                priority_ids,
+            )
+
+
+async def _handle_poll_toggle_voters(
+    query, context: ContextTypes.DEFAULT_TYPE, poll_id: str
+) -> None:
+    """Toggle voter name visibility in poll results."""
+    chat_id = query.message.chat.id
+    async with db.AsyncSessionLocal() as session:
+        session_obj = await session.get(Session, chat_id)
+        if session_obj:
+            session_obj.hide_voters = not session_obj.hide_voters
+            await session.commit()
+
+            # Refresh UI
             game_poll = await session.get(GameNightPoll, poll_id)
             if game_poll:
-                chat_id = game_poll.chat_id
                 valid_games, priority_ids = await get_session_valid_games(session, chat_id)
                 await render_poll_message(
                     context.bot,
@@ -2629,115 +2788,69 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
                     valid_games,
                     priority_ids,
                 )
-
-    elif action == "poll_toggle_voters":
-        chat_id = query.message.chat.id
-        async with db.AsyncSessionLocal() as session:
-            session_obj = await session.get(Session, chat_id)
-            if session_obj:
-                session_obj.hide_voters = not session_obj.hide_voters
-                await session.commit()
-
-                # Refresh UI
-                game_poll = await session.get(GameNightPoll, poll_id)
-                if game_poll:
-                    valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-                    await render_poll_message(
-                        context.bot,
-                        chat_id,
-                        game_poll.message_id,
-                        session,
-                        poll_id,
-                        valid_games,
-                        priority_ids,
-                    )
+    with contextlib.suppress(telegram.error.BadRequest):
         await query.answer("Visibility toggled")
 
-    elif action == "poll_random_vote":
-        # Format: poll_random_vote:<poll_id>:<level>
-        # Category votes are stored with game_id = -level (negative = category marker)
-        # Actual game selection happens at poll close time
-        if len(parts) < 3:
-            await query.answer("Invalid data")
+
+async def _handle_poll_category_vote(
+    query, context: ContextTypes.DEFAULT_TYPE, poll_id: str, level: int
+) -> None:
+    """
+    Handle voting for a complexity category.
+
+    Category votes use game_id = -level as the marker. At poll close time,
+    these are resolved to a randomly selected game from that category.
+    """
+    chat_id = query.message.chat.id
+    user_id = query.from_user.id
+    user_name = query.from_user.first_name
+    user_last_name = query.from_user.last_name
+    user_tg_username = query.from_user.username
+
+    async with db.AsyncSessionLocal() as session:
+        # Get session for vote limit
+        session_obj = await session.get(Session, chat_id)
+
+        # Re-fetch games to ensure validity
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+
+        # Use ALL valid games for grouping
+        groups = group_games_by_complexity(valid_games)
+
+        target_group = groups.get(level, [])
+        if not target_group:
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("No games in this group!")
             return
 
-        level = int(parts[2])
-        chat_id = query.message.chat.id
-        user_id = query.from_user.id
-        user_name = query.from_user.first_name
+        # Use PollService for vote casting
+        vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
 
-        # Use negative level as category marker
-        category_marker = -level
+        # Calculate valid games count for auto-limit
+        # (valid_games is already fetched above)
+        game_count = len(valid_games) if valid_games else 0
+        valid_game_ids = {g.id for g in valid_games}
+        valid_category_levels = set(groups.keys())
 
-        async with db.AsyncSessionLocal() as session:
-            # Get session for vote limit
-            session_obj = await session.get(Session, chat_id)
+        result = await PollService.cast_vote(
+            session=session,
+            poll_id=poll_id,
+            user_id=user_id,
+            target_id=level,
+            vote_type=VoteType.CATEGORY,
+            user_name=user_name,
+            vote_limit=vote_limit,
+            game_count=game_count,
+            user_last_name=user_last_name,
+            user_tg_username=user_tg_username,
+            valid_game_ids=valid_game_ids,
+            valid_category_levels=valid_category_levels,
+        )
 
-            # Re-fetch games to ensure validity
-            valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        await session.commit()
+        await query.answer(result.message)
 
-            # Use ALL valid games for grouping
-            groups = group_games_by_complexity(valid_games)
-
-            target_group = groups.get(level, [])
-            if not target_group:
-                await query.answer("No games in this group!")
-                return
-
-            # Check if user already voted on this category (toggle behavior)
-            existing_vote = await session.get(PollVote, (poll_id, user_id, category_marker))
-
-            if existing_vote:
-                # Toggle off - remove the category vote
-                await session.delete(existing_vote)
-                await session.commit()
-
-                await render_poll_message(
-                    context.bot,
-                    chat_id,
-                    query.message.message_id,
-                    session,
-                    poll_id,
-                    valid_games,
-                    priority_ids,
-                )
-                await query.answer(f"Category {level} vote removed")
-                return
-
-            # Check vote limit before adding
-            if session_obj:
-                vote_limit = session_obj.vote_limit
-
-                # Get user's current vote count for this poll
-                user_votes_stmt = select(func.count(PollVote.game_id)).where(
-                    PollVote.poll_id == poll_id, PollVote.user_id == user_id
-                )
-                user_vote_count = await session.scalar(user_votes_stmt) or 0
-
-                # Calculate effective limit
-                if vote_limit == VoteLimit.AUTO:
-                    effective_limit = calculate_auto_vote_limit(len(valid_games))
-                elif vote_limit == VoteLimit.UNLIMITED:
-                    effective_limit = None
-                else:
-                    effective_limit = vote_limit
-
-                # Enforce limit
-                if effective_limit is not None and user_vote_count >= effective_limit:
-                    await query.answer(
-                        f"Vote limit reached ({user_vote_count}/{effective_limit}). "
-                        "Remove a vote first!",
-                        show_alert=True,
-                    )
-                    return
-
-            # Add category vote (game_id = -level)
-            vote = PollVote(
-                poll_id=poll_id, user_id=user_id, game_id=category_marker, user_name=user_name
-            )
-            session.add(vote)
-            await session.commit()
-
+        if result.success:
             # Refresh UI
             await render_poll_message(
                 context.bot,
@@ -2749,111 +2862,91 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
                 priority_ids,
             )
 
-            await query.answer(f"🎲 Voted on Category {level}!")
+
+async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
+    """Close the poll, resolve category votes, calculate winner, and end session."""
+    await query.answer("Closing poll...")
+    chat_id = query.message.chat.id
+
+    async with db.AsyncSessionLocal() as session:
+        game_poll = await session.get(GameNightPoll, poll_id)
+        if not game_poll:
+            return
+
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+
+        # Use PollService for centralized winner calculation
+        winners, scores, modifiers_log = await PollService.close_poll(
+            session, poll_id, chat_id, valid_games, priority_ids
+        )
+
+        # Build result message
+        text = "🗳️ **Poll Closed!**\n\n"
+        if winners:
+            if len(winners) == 1:
+                text += f"🏆 The winner is: **{winners[0]}**! 🎉"
+            else:
+                text += "It's a tie between:\n" + "\n".join([f"• {w}" for w in winners])
+
+            # Build Top 5 leaderboard from scores
+            sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            top_5 = sorted_scores[:5]
+
+            if len(top_5) > 1:
+                text += "\n\n**Top 5:**"
+                for i, (name, score) in enumerate(top_5):
+                    medal = ["🥇", "🥈", "🥉", "", ""][i]
+                    text += f"\n{medal} {name}: {score:.1f} pts"
+        else:
+            text += "No votes cast?"
+
+        # Edit message to remove buttons and show result
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=game_poll.message_id, text=text, parse_mode="Markdown"
+        )
+
+        # Delete the poll record (cascade deletes all PollVote rows)
+        # The result message above remains visible in chat.
+        await session.delete(game_poll)
+
+        # End the game night session
+        session_obj = await session.get(Session, chat_id)
+        if session_obj:
+            await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
+            await session.execute(delete(User).where(User.is_guest.is_(True)))
+            session_obj.is_active = False
+            await session.commit()
+
+
+async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Dispatcher for custom poll actions: Refresh, Close, Toggle visibility, Category vote.
+
+    Callback data formats:
+    - poll_refresh:<poll_id>
+    - poll_toggle_voters:<poll_id>
+    - poll_random_vote:<poll_id>:<level>
+    - poll_close:<poll_id>
+    """
+    query = update.callback_query
+    data = query.data
+    parts = data.split(":")
+    action = parts[0]
+    poll_id = parts[1]
+
+    if action == "poll_refresh":
+        await _handle_poll_refresh(query, context, poll_id)
+
+    elif action == "poll_toggle_voters":
+        await _handle_poll_toggle_voters(query, context, poll_id)
+
+    elif action == "poll_random_vote":
+        if len(parts) < 3:
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("Invalid data")
+            return
+        level = int(parts[2])
+        await _handle_poll_category_vote(query, context, poll_id, level)
 
     elif action == "poll_close":
-        await query.answer("Closing poll...")
-        chat_id = query.message.chat.id
-
-        async with db.AsyncSessionLocal() as session:
-            game_poll = await session.get(GameNightPoll, poll_id)
-            if not game_poll:
-                return
-
-            valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-
-            # Fetch votes
-            votes_stmt = select(PollVote).where(PollVote.poll_id == poll_id)
-            all_votes = (await session.execute(votes_stmt)).scalars().all()
-
-            # Resolve category votes: pick one random game per category
-            # Category votes have negative game_id = -level
-            groups = group_games_by_complexity(valid_games)
-            category_resolutions = {}  # level -> selected game
-
-            for v in all_votes:
-                if v.game_id is not None and v.game_id < 0:
-                    level = -v.game_id
-                    if level not in category_resolutions:
-                        # First vote for this category - pick a random game
-                        target_group = groups.get(level, [])
-                        if target_group:
-                            category_resolutions[level] = random.choice(target_group)
-
-            # Create resolved votes list (convert category votes to game votes)
-            class ResolvedVote:
-                """Wrapper to provide game_id and user_id for resolved votes."""
-
-                def __init__(self, game_id, user_id):
-                    self.game_id = game_id
-                    self.user_id = user_id
-
-            resolved_votes = []
-            for v in all_votes:
-                if v.game_id is not None and v.game_id < 0:
-                    # Category vote - resolve to selected game
-                    level = -v.game_id
-                    if level in category_resolutions:
-                        resolved_votes.append(
-                            ResolvedVote(game_id=category_resolutions[level].id, user_id=v.user_id)
-                        )
-                else:
-                    # Regular game vote - wrap in ResolvedVote
-                    resolved_votes.append(ResolvedVote(game_id=v.game_id, user_id=v.user_id))
-
-            # Apply weights if enabled
-            session_obj = await session.get(Session, chat_id)
-            is_weighted = session_obj.settings_weighted if session_obj else False
-
-            # Build star_collections for weighted voting
-            star_collections = None
-            if is_weighted:
-                star_collections = {}
-                for g in valid_games:
-                    if g.id in priority_ids:
-                        # Find which users starred this game
-                        starred_stmt = select(Collection.user_id).where(
-                            Collection.game_id == g.id, Collection.state == GameState.STARRED
-                        )
-                        starred_users = (await session.execute(starred_stmt)).scalars().all()
-                        star_collections[g.id] = list(starred_users)
-
-            # Use shared utility for winner calculation with RESOLVED votes
-            winners, scores, modifiers_log = calculate_poll_winner(
-                valid_games, resolved_votes, priority_ids, is_weighted, star_collections
-            )
-
-            # Final update
-            text = "🗳️ **Poll Closed!**\n\n"
-            if winners:
-                if len(winners) == 1:
-                    text += f"🏆 The winner is: **{winners[0]}**! 🎉"
-                else:
-                    text += "It's a tie between:\n" + "\n".join([f"• {w}" for w in winners])
-
-                # Build Top 5 leaderboard from scores
-                sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-                top_5 = sorted_scores[:5]
-
-                if len(top_5) > 1:
-                    text += "\n\n**Top 5:**"
-                    for i, (name, score) in enumerate(top_5):
-                        medal = ["🥇", "🥈", "🥉", "", ""][i]
-                        text += f"\n{medal} {name}: {score:.1f} pts"
-            else:
-                text += "No votes cast?"
-
-            # Edit message to remove buttons and show result
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=game_poll.message_id, text=text, parse_mode="Markdown"
-            )
-
-            # End the game night session
-            session_obj = await session.get(Session, chat_id)
-            if session_obj:
-                await session.execute(
-                    delete(SessionPlayer).where(SessionPlayer.session_id == chat_id)
-                )
-                await session.execute(delete(User).where(User.is_guest.is_(True)))
-                session_obj.is_active = False
-                await session.commit()
+        await _handle_poll_close(query, context, poll_id)

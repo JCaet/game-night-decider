@@ -31,6 +31,7 @@ from src.core.models import (
     Session,
     SessionPlayer,
     User,
+    VoteType,
 )
 
 # ============================================================================
@@ -271,6 +272,8 @@ async def test_custom_poll_vote_adds_vote(mock_update, mock_context):
     mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
     mock_update.callback_query.from_user.id = user_id
     mock_update.callback_query.from_user.first_name = "Voter"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     await custom_poll_vote_callback(mock_update, mock_context)
 
@@ -326,13 +329,21 @@ async def test_custom_poll_vote_removes_vote(mock_update, mock_context):
         session.add(poll)
 
         # Pre-existing vote
-        vote = PollVote(poll_id=poll_id, user_id=user_id, game_id=game_id, user_name="Voter")
+        vote = PollVote(
+            poll_id=poll_id,
+            user_id=user_id,
+            vote_type=VoteType.GAME,
+            game_id=game_id,
+            user_name="Voter",
+        )
         session.add(vote)
         await session.commit()
 
     mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
     mock_update.callback_query.from_user.id = user_id
     mock_update.callback_query.from_user.first_name = "Voter"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     await custom_poll_vote_callback(mock_update, mock_context)
 
@@ -436,8 +447,12 @@ async def test_custom_poll_close_announces_winner(mock_update, mock_context):
         session.add(poll)
 
         # Two votes for Winner Game
-        v1 = PollVote(poll_id=poll_id, user_id=111, game_id=1, user_name="User1")
-        v2 = PollVote(poll_id=poll_id, user_id=222, game_id=1, user_name="User2")
+        v1 = PollVote(
+            poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="User1"
+        )
+        v2 = PollVote(
+            poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=1, user_name="User2"
+        )
         session.add_all([v1, v2])
         await session.commit()
 
@@ -490,8 +505,12 @@ async def test_custom_poll_close_tie(mock_update, mock_context):
         session.add(poll)
 
         # One vote each - tie!
-        v1 = PollVote(poll_id=poll_id, user_id=111, game_id=1, user_name="User1")
-        v2 = PollVote(poll_id=poll_id, user_id=222, game_id=2, user_name="User2")
+        v1 = PollVote(
+            poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="User1"
+        )
+        v2 = PollVote(
+            poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=2, user_name="User2"
+        )
         session.add_all([v1, v2])
         await session.commit()
 
@@ -510,11 +529,10 @@ async def test_custom_poll_close_tie(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_custom_poll_close_resolves_category_votes(mock_update, mock_context):
     """Test closing poll resolves category votes to an actual game."""
-    import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 12345
     poll_id = f"poll_cat_close_{chat_id}"
-    base_id = random.randint(10000, 90000)
+    base_id = 90000
 
     async with db.AsyncSessionLocal() as session:
         session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
@@ -556,8 +574,20 @@ async def test_custom_poll_close_resolves_category_votes(mock_update, mock_conte
         session.add(poll)
 
         # Both users voted on category 4 (game_id = -4)
-        v1 = PollVote(poll_id=poll_id, user_id=111, game_id=-4, user_name="User1")
-        v2 = PollVote(poll_id=poll_id, user_id=222, game_id=-4, user_name="User2")
+        v1 = PollVote(
+            poll_id=poll_id,
+            user_id=111,
+            vote_type=VoteType.CATEGORY,
+            category_level=4,
+            user_name="User1",
+        )
+        v2 = PollVote(
+            poll_id=poll_id,
+            user_id=222,
+            vote_type=VoteType.CATEGORY,
+            category_level=4,
+            user_name="User2",
+        )
         session.add_all([v1, v2])
         await session.commit()
 
@@ -658,8 +688,12 @@ async def test_custom_poll_close_with_weighted_voting(mock_update, mock_context)
         session.add(poll)
 
         # One vote each, but StarredGame should get boost from User1
-        v1 = PollVote(poll_id=poll_id, user_id=111, game_id=1, user_name="User1")
-        v2 = PollVote(poll_id=poll_id, user_id=222, game_id=2, user_name="User2")
+        v1 = PollVote(
+            poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="User1"
+        )
+        v2 = PollVote(
+            poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=2, user_name="User2"
+        )
         session.add_all([v1, v2])
         await session.commit()
 
@@ -739,6 +773,8 @@ async def test_custom_poll_allows_multiple_votes_per_user(mock_update, mock_cont
     mock_update.callback_query.data = f"vote:{poll_id}:1"
     mock_update.callback_query.from_user.id = user_id
     mock_update.callback_query.from_user.first_name = "MultiVoter"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     await custom_poll_vote_callback(mock_update, mock_context)
 
@@ -809,10 +845,9 @@ async def test_toggle_weights_updates_setting_and_refresh_menu(mock_update, mock
 @pytest.mark.asyncio
 async def test_custom_poll_ui_grouping(mock_update, mock_context):
     """Test pollution UI groups games by complexity with separators."""
-    import random
 
-    chat_id = random.randint(10000, 99999)
-    base_id = random.randint(10000, 90000)
+    chat_id = 99999
+    base_id = 80000
     g_ids = [base_id + i for i in range(4)]
 
     # Setup:
@@ -883,11 +918,10 @@ async def test_custom_poll_ui_grouping(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_custom_poll_random_vote(mock_update, mock_context):
     """Test clicking separator stores a category vote (not a random game vote)."""
-    import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 88888
     poll_id = f"poll_random_{chat_id}"
-    base_id = random.randint(10000, 90000)
+    base_id = 70000
 
     async with db.AsyncSessionLocal() as session:
         session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
@@ -924,6 +958,8 @@ async def test_custom_poll_random_vote(mock_update, mock_context):
     mock_update.callback_query.message.message_id = 999
     mock_update.callback_query.from_user.id = 111
     mock_update.callback_query.from_user.first_name = "RandomVoter"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     # Mock bot.edit_message_text to avoid awaiting on Mock if not set up
     mock_context.bot.edit_message_text = AsyncMock()
@@ -939,7 +975,7 @@ async def test_custom_poll_random_vote(mock_update, mock_context):
         )
 
         assert len(votes) == 1
-        assert votes[0].game_id == -4  # Category vote marker (negative level)
+        assert votes[0].category_level == 4  # Category vote should have level set
 
     # Verify answer indicates category vote
     mock_update.callback_query.answer.assert_called()
@@ -948,11 +984,10 @@ async def test_custom_poll_random_vote(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
     """Test clicking category header again removes the vote (toggle behavior)."""
-    import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 77777
     poll_id = f"poll_toggle_{chat_id}"
-    base_id = random.randint(10000, 90000)
+    base_id = 60000
 
     async with db.AsyncSessionLocal() as session:
         session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
@@ -975,7 +1010,15 @@ async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
         session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
 
         # Pre-existing category vote
-        session.add(PollVote(poll_id=poll_id, user_id=111, game_id=-3, user_name="Toggler"))
+        session.add(
+            PollVote(
+                poll_id=poll_id,
+                user_id=111,
+                vote_type=VoteType.CATEGORY,
+                category_level=3,
+                user_name="Toggler",
+            )
+        )
         await session.commit()
 
     mock_update.callback_query.data = f"poll_random_vote:{poll_id}:3"
@@ -983,6 +1026,8 @@ async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
     mock_update.callback_query.message.message_id = 999
     mock_update.callback_query.from_user.id = 111
     mock_update.callback_query.from_user.first_name = "Toggler"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     mock_context.bot.edit_message_text = AsyncMock()
 
@@ -999,15 +1044,14 @@ async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
         assert len(votes) == 0
 
     # Verify answer indicates removal
-    mock_update.callback_query.answer.assert_called_with("Category 3 vote removed")
+    mock_update.callback_query.answer.assert_called_with("Vote removed")
 
 
 @pytest.mark.asyncio
 async def test_auto_close_previous_polls(mock_update, mock_context):
     """Test that starting a new poll closes existing ones."""
-    import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 66666
     old_poll_id = f"old_{chat_id}"
 
     # Setup: Active Custom Poll
@@ -1018,7 +1062,7 @@ async def test_auto_close_previous_polls(mock_update, mock_context):
 
         # Add games/players so start_poll works
         g1 = Game(
-            id=random.randint(10000, 99999),
+            id=44444,
             name="Game1",
             min_players=1,
             max_players=5,
@@ -1061,9 +1105,8 @@ async def test_auto_close_previous_polls(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_auto_refresh_poll_on_join(mock_update, mock_context):
     """Test that joining the lobby refreshes the active custom poll."""
-    import random
 
-    chat_id = random.randint(10000, 99999)
+    chat_id = 55555
     poll_id = f"active_{chat_id}"
     new_user_id = 999
 
@@ -1073,7 +1116,7 @@ async def test_auto_refresh_poll_on_join(mock_update, mock_context):
 
         # Games
         g1 = Game(
-            id=random.randint(10000, 99999),
+            id=33333,
             name="GameA",
             min_players=1,
             max_players=5,
@@ -1092,6 +1135,8 @@ async def test_auto_refresh_poll_on_join(mock_update, mock_context):
     mock_update.callback_query.message.chat.id = chat_id
     mock_update.callback_query.from_user.id = new_user_id
     mock_update.callback_query.from_user.first_name = "NewJoiner"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
 
     mock_context.bot.edit_message_text = AsyncMock()  # Used for updating lobby AND refreshing poll
 

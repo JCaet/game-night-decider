@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import Enum as PyEnum
 
 from sqlalchemy import (
     BigInteger,
@@ -44,9 +45,9 @@ class User(Base):
     __tablename__ = "users"
 
     telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    telegram_name: Mapped[str | None] = mapped_column(
-        String, nullable=True
-    )  # Display name from Telegram
+    telegram_name: Mapped[str | None] = mapped_column(String, nullable=True)  # first name
+    telegram_last_name: Mapped[str | None] = mapped_column(String, nullable=True)  # last name
+    telegram_username: Mapped[str | None] = mapped_column(String, nullable=True)  # @username
     bgg_username: Mapped[str | None] = mapped_column(String, unique=True, nullable=True)
 
     # Guest fields
@@ -153,18 +154,48 @@ class GameNightPoll(Base):
     )
 
 
+class VoteType(str, PyEnum):
+    GAME = "game"
+    CATEGORY = "category"
+
+
 class PollVote(Base):
     """Track who voted in a poll"""
 
     __tablename__ = "poll_votes"
 
-    poll_id: Mapped[str] = mapped_column(ForeignKey("game_night_polls.poll_id"), primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    # game_id is nullable: NULL for native polls, set for custom polls
-    game_id: Mapped[int | None] = mapped_column(
-        BigInteger, primary_key=True, nullable=True, default=None
+    # Surrogate key for better Postgres compatibility (nullable parts in composite PK are tricky)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    poll_id: Mapped[str] = mapped_column(ForeignKey("game_night_polls.poll_id"), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+
+    vote_type: Mapped[str] = mapped_column(String)  # 'game' or 'category'
+
+    # Target of the vote
+    game_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("games.id"), nullable=True)
+    category_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    user_name: Mapped[str | None] = mapped_column(String, nullable=True)  # first name
+    user_last_name: Mapped[str | None] = mapped_column(String, nullable=True)  # last name
+    user_tg_username: Mapped[str | None] = mapped_column(String, nullable=True)  # @username
+
+    # Version column for potential optimistic locking (manual implementation)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    # Ensure uniqueness of a specific vote
+    # SQLite treats NULLs as distinct in unique constraints usually, but for our logic
+    # a user voting for the SAME game/category should be blocked/toggled.
+    __table_args__ = (
+        UniqueConstraint(
+            "poll_id",
+            "user_id",
+            "vote_type",
+            "game_id",
+            "category_level",
+            name="uq_poll_vote",
+        ),
     )
-    user_name: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Relationships
     poll: Mapped["GameNightPoll"] = relationship(back_populates="votes")
