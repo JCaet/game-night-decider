@@ -334,7 +334,7 @@ async def test_custom_poll_vote_removes_vote(mock_update, mock_context):
             user_id=user_id,
             vote_type=VoteType.GAME,
             game_id=game_id,
-            user_name="Voter"
+            user_name="Voter",
         )
         session.add(vote)
         await session.commit()
@@ -447,10 +447,12 @@ async def test_custom_poll_close_announces_winner(mock_update, mock_context):
         session.add(poll)
 
         # Two votes for Winner Game
-        v1 = PollVote(poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1,
-                      user_name="User1")
-        v2 = PollVote(poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=1,
-                      user_name="User2")
+        v1 = PollVote(
+            poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="User1"
+        )
+        v2 = PollVote(
+            poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=1, user_name="User2"
+        )
         session.add_all([v1, v2])
         await session.commit()
 
@@ -573,12 +575,18 @@ async def test_custom_poll_close_resolves_category_votes(mock_update, mock_conte
 
         # Both users voted on category 4 (game_id = -4)
         v1 = PollVote(
-            poll_id=poll_id, user_id=111, vote_type=VoteType.CATEGORY,
-            category_level=4, user_name="User1"
+            poll_id=poll_id,
+            user_id=111,
+            vote_type=VoteType.CATEGORY,
+            category_level=4,
+            user_name="User1",
         )
         v2 = PollVote(
-            poll_id=poll_id, user_id=222, vote_type=VoteType.CATEGORY,
-            category_level=4, user_name="User2"
+            poll_id=poll_id,
+            user_id=222,
+            vote_type=VoteType.CATEGORY,
+            category_level=4,
+            user_name="User2",
         )
         session.add_all([v1, v2])
         await session.commit()
@@ -1002,10 +1010,15 @@ async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
         session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
 
         # Pre-existing category vote
-        session.add(PollVote(
-            poll_id=poll_id, user_id=111, vote_type=VoteType.CATEGORY,
-            category_level=3, user_name="Toggler"
-        ))
+        session.add(
+            PollVote(
+                poll_id=poll_id,
+                user_id=111,
+                vote_type=VoteType.CATEGORY,
+                category_level=3,
+                user_name="Toggler",
+            )
+        )
         await session.commit()
 
     mock_update.callback_query.data = f"poll_random_vote:{poll_id}:3"

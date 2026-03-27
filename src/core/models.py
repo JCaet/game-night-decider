@@ -188,16 +188,17 @@ class PollVote(Base):
     # a user voting for the SAME game/category should be blocked/toggled.
     __table_args__ = (
         UniqueConstraint(
-            "poll_id", "user_id", "vote_type", "game_id", "category_level",
+            "poll_id",
+            "user_id",
+            "vote_type",
+            "game_id",
+            "category_level",
             name="uq_poll_vote",
         ),
     )
 
     # Relationships
     poll: Mapped["GameNightPoll"] = relationship(back_populates="votes")
-
-
-
 
 
 class Expansion(Base):

@@ -345,9 +345,7 @@ async def test_render_does_not_count_suspended_game_votes(mock_update, mock_cont
     last_render_text = calls[-1].kwargs.get("text") or calls[-1].args[0]
 
     # SmallGame must NOT appear in the render (not valid with 5 players)
-    assert "SmallGame" not in last_render_text, (
-        "SmallGame should not appear in poll when suspended"
-    )
+    assert "SmallGame" not in last_render_text, "SmallGame should not appear in poll when suspended"
 
     # Only 1 active vote (BigGame) must be reflected in the count header
     assert "1 votes" in last_render_text or "1 vote" in last_render_text, (
@@ -547,10 +545,7 @@ async def test_suspension_notification_sent(mock_update, mock_context):
     await join_lobby_callback(mock_update, mock_context)
 
     send_calls = mock_context.bot.send_message.call_args_list
-    suspension_notification = [
-        c for c in send_calls
-        if "suspended" in str(c).lower()
-    ]
+    suspension_notification = [c for c in send_calls if "suspended" in str(c).lower()]
     assert len(suspension_notification) > 0, "Should send notification about suspended votes"
 
 
@@ -605,8 +600,5 @@ async def test_no_notification_when_no_votes_suspended(mock_update, mock_context
 
     # No "suspended" notification should be sent
     send_calls = mock_context.bot.send_message.call_args_list
-    suspension_notification = [
-        c for c in send_calls
-        if "suspended" in str(c).lower()
-    ]
+    suspension_notification = [c for c in send_calls if "suspended" in str(c).lower()]
     assert len(suspension_notification) == 0, "Should NOT send suspension notification"

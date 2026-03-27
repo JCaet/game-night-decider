@@ -2273,11 +2273,7 @@ def _build_settings_keyboard(
                 f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
             )
         ],
-        [
-            InlineKeyboardButton(
-                f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit"
-            )
-        ],
+        [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
         [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
     ]
 
@@ -2512,7 +2508,7 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
 
         if result.success:
             # Refresh UI
-            priority_ids = set() # Optimized: re-fetch inside get_session_valid_games
+            priority_ids = set()  # Optimized: re-fetch inside get_session_valid_games
             valid_games, priority_ids = await get_session_valid_games(session, chat_id)
 
             await render_poll_message(
@@ -2734,6 +2730,7 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
         if "Message is not modified" not in str(e):
             logger.warning(f"Failed to update poll message: {e}")
 
+
 # ---------------------------------------------------------------------------- #
 # Poll Action Handlers (extracted from custom_poll_action_callback)
 # ---------------------------------------------------------------------------- #
@@ -2747,9 +2744,7 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
 # pre-selecting which specific game will be played.
 
 
-async def _handle_poll_refresh(
-    query, context: ContextTypes.DEFAULT_TYPE, poll_id: str
-) -> None:
+async def _handle_poll_refresh(query, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
     """Refresh the custom poll message with current vote state."""
     with contextlib.suppress(telegram.error.BadRequest):
         await query.answer("Refreshing...")
@@ -2812,8 +2807,6 @@ async def _handle_poll_category_vote(
     user_last_name = query.from_user.last_name
     user_tg_username = query.from_user.username
 
-
-
     async with db.AsyncSessionLocal() as session:
         # Get session for vote limit
         session_obj = await session.get(Session, chat_id)
@@ -2870,9 +2863,7 @@ async def _handle_poll_category_vote(
             )
 
 
-async def _handle_poll_close(
-    query, context: ContextTypes.DEFAULT_TYPE, poll_id: str
-) -> None:
+async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
     """Close the poll, resolve category votes, calculate winner, and end session."""
     await query.answer("Closing poll...")
     chat_id = query.message.chat.id
@@ -2909,7 +2900,6 @@ async def _handle_poll_close(
         else:
             text += "No votes cast?"
 
-
         # Edit message to remove buttons and show result
         await context.bot.edit_message_text(
             chat_id=chat_id, message_id=game_poll.message_id, text=text, parse_mode="Markdown"
@@ -2922,9 +2912,7 @@ async def _handle_poll_close(
         # End the game night session
         session_obj = await session.get(Session, chat_id)
         if session_obj:
-            await session.execute(
-                delete(SessionPlayer).where(SessionPlayer.session_id == chat_id)
-            )
+            await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
             await session.execute(delete(User).where(User.is_guest.is_(True)))
             session_obj.is_active = False
             await session.commit()

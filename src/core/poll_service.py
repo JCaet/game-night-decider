@@ -239,9 +239,7 @@ class PollService:
                         )
                     )
             elif v.vote_type == VoteType.GAME:
-                resolved_votes.append(
-                    ResolvedVote(game_id=v.game_id, user_id=v.user_id)
-                )
+                resolved_votes.append(ResolvedVote(game_id=v.game_id, user_id=v.user_id))
 
         return resolved_votes
 
