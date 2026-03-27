@@ -1,9 +1,10 @@
 """
-Tests for vote pruning when player count changes.
+Tests for vote suspension when player count changes.
 
 When a player joins or leaves mid-poll, the list of valid games may change
-(filtered by player count). Votes for removed games become "stale" and must
-be pruned so they don't block the vote limit.
+(filtered by player count).  Votes for removed games become "suspended":
+they remain in the database so they can resume automatically if the game
+becomes eligible again (e.g. the player who caused the count change leaves).
 """
 
 import pytest
@@ -11,6 +12,7 @@ from sqlalchemy import select
 
 from src.bot.handlers import join_lobby_callback, leave_lobby_callback
 from src.core import db
+from src.core.logic import group_games_by_complexity
 from src.core.models import (
     Collection,
     Game,
@@ -23,6 +25,7 @@ from src.core.models import (
     VoteLimit,
     VoteType,
 )
+from src.core.poll_service import PollService
 
 # ============================================================================
 # Helper to set up common test data
@@ -65,7 +68,6 @@ async def _setup_poll_scenario(
         )
 
         for uid in players:
-            # Create user if referenced
             session.add(User(telegram_id=uid, telegram_name=f"User{uid}"))
 
         await session.flush()
@@ -87,7 +89,7 @@ async def _setup_poll_scenario(
 
         await session.flush()
 
-        # Add all games to first player's collection
+        # Add all games to every player's collection
         for g in games:
             for uid in players:
                 session.add(Collection(user_id=uid, game_id=g["id"]))
@@ -110,17 +112,17 @@ async def _setup_poll_scenario(
 
 
 # ============================================================================
-# Test: Join prunes stale votes
+# Test: Join suspends (not deletes) stale votes
 # ============================================================================
 
 
 @pytest.mark.asyncio
-async def test_join_prunes_stale_votes(mock_update, mock_context):
-    """Player has votes on 4-max games. 5th player joins -> those games removed -> votes pruned."""
+async def test_join_suspends_stale_votes(mock_update, mock_context):
+    """Player has votes on 4-max games. 5th player joins -> those games removed.
+    Votes MUST remain in the DB (suspended, not deleted)."""
     chat_id = 12345
     poll_id = "poll_prune_test"
 
-    # Games: two support 2-4 players, two support 2-6 players
     await _setup_poll_scenario(
         chat_id=chat_id,
         poll_id=poll_id,
@@ -139,13 +141,11 @@ async def test_join_prunes_stale_votes(mock_update, mock_context):
         vote_limit=3,
     )
 
-    # 5th player joins -> SmallGame1 and SmallGame2 (max 4) should be removed
-    # Create the 5th user
+    # 5th player joins -> SmallGame1 and SmallGame2 (max 4) suspended
     async with db.AsyncSessionLocal() as session:
         session.add(User(telegram_id=555, telegram_name="User555"))
         await session.commit()
 
-    # Configure mock for join
     mock_update.callback_query.from_user.id = 555
     mock_update.callback_query.from_user.first_name = "User555"
     mock_update.callback_query.message.chat.id = chat_id
@@ -153,33 +153,33 @@ async def test_join_prunes_stale_votes(mock_update, mock_context):
 
     await join_lobby_callback(mock_update, mock_context)
 
-    # Verify: votes for game 1 and 2 should be pruned, vote for game 3 survives
+    # All 3 votes must still be in the database — none deleted
     async with db.AsyncSessionLocal() as session:
-        remaining_votes = (
+        all_votes = (
             (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
             .scalars()
             .all()
         )
+        game_ids_in_db = {v.game_id for v in all_votes}
 
-        remaining_game_ids = [v.game_id for v in remaining_votes]
-        assert 1 not in remaining_game_ids, "Vote for SmallGame1 should be pruned"
-        assert 2 not in remaining_game_ids, "Vote for SmallGame2 should be pruned"
-        assert 3 in remaining_game_ids, "Vote for BigGame1 should survive"
-        assert len(remaining_votes) == 1
+        assert 1 in game_ids_in_db, "Vote for SmallGame1 must survive (suspended, not deleted)"
+        assert 2 in game_ids_in_db, "Vote for SmallGame2 must survive (suspended, not deleted)"
+        assert 3 in game_ids_in_db, "Vote for BigGame1 must survive"
+        assert len(all_votes) == 3
 
 
 # ============================================================================
-# Test: Leave prunes stale votes
+# Test: Leave suspends (not deletes) stale votes
 # ============================================================================
 
 
 @pytest.mark.asyncio
-async def test_leave_prunes_stale_votes(mock_update, mock_context):
-    """Player leaves -> games with higher min_players removed -> stale votes pruned."""
+async def test_leave_suspends_stale_votes(mock_update, mock_context):
+    """Player leaves, reducing count -> games with higher min_players removed.
+    Votes MUST remain in the DB (suspended, not deleted)."""
     chat_id = 12345
     poll_id = "poll_prune_test"
 
-    # Games: one requires min 3 players, one requires min 2
     await _setup_poll_scenario(
         chat_id=chat_id,
         poll_id=poll_id,
@@ -196,7 +196,7 @@ async def test_leave_prunes_stale_votes(mock_update, mock_context):
         vote_limit=VoteLimit.UNLIMITED,
     )
 
-    # Player 333 leaves -> only 2 players -> BigGroupGame (min 3) invalid
+    # Player 333 leaves -> only 2 players -> BigGroupGame (min 3) suspended
     mock_update.callback_query.from_user.id = 333
     mock_update.callback_query.from_user.first_name = "User333"
     mock_update.callback_query.message.chat.id = chat_id
@@ -204,18 +204,273 @@ async def test_leave_prunes_stale_votes(mock_update, mock_context):
 
     await leave_lobby_callback(mock_update, mock_context)
 
-    # Verify: votes for game 1 pruned, vote for game 2 survives
+    # All 3 votes must still be in the database
     async with db.AsyncSessionLocal() as session:
+        all_votes = (
+            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
+            .scalars()
+            .all()
+        )
+        game_ids_in_db = {v.game_id for v in all_votes}
+
+        assert 1 in game_ids_in_db, "Votes for BigGroupGame must survive (suspended)"
+        assert 2 in game_ids_in_db, "Vote for SmallGroupGame must survive"
+        assert len(all_votes) == 3
+
+
+# ============================================================================
+# Test: KEY SCENARIO — join then leave restores votes
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_votes_restored_after_player_joins_then_leaves(mock_update, mock_context):
+    """
+    Core regression test for the join-then-leave vote loss bug.
+
+    Timeline:
+      1. 4 players. User 111 votes for SmallGame (max 4).
+      2. 5th player joins -> SmallGame suspended -> vote stays in DB.
+      3. 5th player leaves -> SmallGame eligible again.
+      4. The vote for SmallGame must be counted again (it was never lost).
+    """
+    chat_id = 12345
+    poll_id = "poll_prune_test"
+
+    await _setup_poll_scenario(
+        chat_id=chat_id,
+        poll_id=poll_id,
+        games=[
+            {"id": 1, "name": "SmallGame", "min_players": 2, "max_players": 4},
+            {"id": 2, "name": "BigGame", "min_players": 2, "max_players": 6},
+        ],
+        players=[111, 222, 333, 444],
+        votes=[
+            {"user_id": 111, "game_id": 1},  # The vote that must survive
+            {"user_id": 222, "game_id": 2},
+        ],
+        vote_limit=VoteLimit.UNLIMITED,
+    )
+
+    # Step 2: 5th player joins
+    async with db.AsyncSessionLocal() as session:
+        session.add(User(telegram_id=555, telegram_name="User555"))
+        await session.commit()
+
+    mock_update.callback_query.from_user.id = 555
+    mock_update.callback_query.from_user.first_name = "User555"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 888
+    await join_lobby_callback(mock_update, mock_context)
+
+    # Verify vote still in DB after join (suspended)
+    async with db.AsyncSessionLocal() as session:
+        votes = (
+            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
+            .scalars()
+            .all()
+        )
+        assert any(v.game_id == 1 for v in votes), (
+            "Vote for SmallGame must remain in DB after join (suspended)"
+        )
+
+    # Step 3: 5th player leaves
+    mock_update.callback_query.from_user.id = 555
+    mock_update.callback_query.from_user.first_name = "User555"
+    await leave_lobby_callback(mock_update, mock_context)
+
+    # Step 4: SmallGame must be valid again and its vote must be counted
+    async with db.AsyncSessionLocal() as session:
+        from src.bot.handlers import get_session_valid_games
+
+        valid_games, _ = await get_session_valid_games(session, chat_id)
+        valid_game_ids = {g.id for g in valid_games}
+
+        assert 1 in valid_game_ids, "SmallGame must be valid again after 5th player leaves"
+
         remaining_votes = (
             (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
             .scalars()
             .all()
         )
+        small_game_votes = [v for v in remaining_votes if v.game_id == 1]
+        assert len(small_game_votes) == 1, (
+            "Vote for SmallGame must be in DB and countable after player leaves"
+        )
+        assert small_game_votes[0].user_id == 111
 
-        remaining_game_ids = [v.game_id for v in remaining_votes]
-        assert 1 not in remaining_game_ids, "Votes for BigGroupGame should be pruned"
-        assert 2 in remaining_game_ids, "Vote for SmallGroupGame should survive"
-        assert len(remaining_votes) == 1
+
+# ============================================================================
+# Test: Render excludes suspended game votes from displayed totals
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_render_does_not_count_suspended_game_votes(mock_update, mock_context):
+    """render_poll_message must not count a vote whose game is not in the
+    current valid_games list — even though the vote is still in the DB."""
+    chat_id = 12345
+    poll_id = "poll_prune_test"
+
+    await _setup_poll_scenario(
+        chat_id=chat_id,
+        poll_id=poll_id,
+        games=[
+            {"id": 1, "name": "SmallGame", "min_players": 2, "max_players": 4},
+            {"id": 2, "name": "BigGame", "min_players": 2, "max_players": 6},
+        ],
+        players=[111, 222, 333, 444],
+        votes=[
+            {"user_id": 111, "game_id": 1},  # Will be suspended when 5th joins
+            {"user_id": 111, "game_id": 2},
+        ],
+        vote_limit=VoteLimit.UNLIMITED,
+    )
+
+    # 5th player joins — SmallGame suspended, vote stays in DB
+    async with db.AsyncSessionLocal() as session:
+        session.add(User(telegram_id=555, telegram_name="User555"))
+        await session.commit()
+
+    mock_update.callback_query.from_user.id = 555
+    mock_update.callback_query.from_user.first_name = "User555"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 888
+    await join_lobby_callback(mock_update, mock_context)
+
+    # Capture the edit_message_text call made by render_poll_message
+    calls = mock_context.bot.edit_message_text.call_args_list
+    assert calls, "render_poll_message should have been called"
+
+    last_render_text = calls[-1].kwargs.get("text") or calls[-1].args[0]
+
+    # SmallGame must NOT appear in the render (not valid with 5 players)
+    assert "SmallGame" not in last_render_text, (
+        "SmallGame should not appear in poll when suspended"
+    )
+
+    # Only 1 active vote (BigGame) must be reflected in the count header
+    assert "1 votes" in last_render_text or "1 vote" in last_render_text, (
+        "Only the active BigGame vote should be counted in the total"
+    )
+
+
+# ============================================================================
+# Test: Close poll ignores suspended game votes in winner calculation
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_close_poll_ignores_suspended_game_votes():
+    """When closing a poll, votes for games not in valid_games must not
+    influence the winner — even when those votes are still in the DB."""
+    chat_id = 12345
+    poll_id = "poll_close_suspended"
+
+    await _setup_poll_scenario(
+        chat_id=chat_id,
+        poll_id=poll_id,
+        games=[
+            {"id": 1, "name": "SmallGame", "min_players": 2, "max_players": 4},
+            {"id": 2, "name": "BigGame", "min_players": 2, "max_players": 6},
+        ],
+        players=[111, 222, 333, 444, 555],  # 5 players
+        votes=[
+            # SmallGame has 3 votes but is invalid for 5 players
+            {"user_id": 111, "game_id": 1},
+            {"user_id": 222, "game_id": 1},
+            {"user_id": 333, "game_id": 1},
+            # BigGame has 1 vote and IS valid
+            {"user_id": 444, "game_id": 2},
+        ],
+        vote_limit=VoteLimit.UNLIMITED,
+    )
+
+    async with db.AsyncSessionLocal() as session:
+        from src.bot.handlers import get_session_valid_games
+
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        valid_names = {g.name for g in valid_games}
+        assert "SmallGame" not in valid_names, "SmallGame must not be valid with 5 players"
+        assert "BigGame" in valid_names
+
+        winners, scores, _ = await PollService.close_poll(
+            session, poll_id, chat_id, valid_games, priority_ids
+        )
+
+    # BigGame (1 active vote) must win; SmallGame's 3 suspended votes must not count
+    assert winners == ["BigGame"], (
+        f"BigGame should win; suspended SmallGame votes must not count. Got: {winners}"
+    )
+    assert scores.get("SmallGame", 0) == 0 or "SmallGame" not in scores
+
+
+# ============================================================================
+# Test: Vote limit counts only active votes
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_vote_limit_ignores_suspended_votes(mock_update, mock_context):
+    """A user whose votes are entirely suspended must NOT be blocked from
+    voting for currently-valid games."""
+    chat_id = 12345
+    poll_id = "poll_prune_test"
+
+    # vote_limit=2; user 111 has 2 votes that will both be suspended
+    await _setup_poll_scenario(
+        chat_id=chat_id,
+        poll_id=poll_id,
+        games=[
+            {"id": 1, "name": "SmallGame1", "min_players": 2, "max_players": 4},
+            {"id": 2, "name": "SmallGame2", "min_players": 2, "max_players": 4},
+            {"id": 3, "name": "BigGame", "min_players": 2, "max_players": 6},
+        ],
+        players=[111, 222, 333, 444],
+        votes=[
+            {"user_id": 111, "game_id": 1},
+            {"user_id": 111, "game_id": 2},
+        ],
+        vote_limit=2,
+    )
+
+    # 5th player joins -> SmallGame1 and SmallGame2 suspended for user 111
+    async with db.AsyncSessionLocal() as session:
+        session.add(User(telegram_id=555, telegram_name="User555"))
+        await session.commit()
+
+    mock_update.callback_query.from_user.id = 555
+    mock_update.callback_query.from_user.first_name = "User555"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 888
+    await join_lobby_callback(mock_update, mock_context)
+
+    # User 111 tries to vote for BigGame — must succeed despite 2 suspended votes in DB
+    async with db.AsyncSessionLocal() as session:
+        from src.bot.handlers import get_session_valid_games
+
+        valid_games, _ = await get_session_valid_games(session, chat_id)
+        valid_game_ids = {g.id for g in valid_games}
+        valid_category_levels = set(group_games_by_complexity(valid_games).keys())
+
+        result = await PollService.cast_vote(
+            session=session,
+            poll_id=poll_id,
+            user_id=111,
+            target_id=3,
+            vote_type=VoteType.GAME,
+            user_name="User111",
+            vote_limit=2,
+            game_count=len(valid_games),
+            valid_game_ids=valid_game_ids,
+            valid_category_levels=valid_category_levels,
+        )
+
+    assert result.success, (
+        f"Voting for an active game must succeed when existing votes are all suspended. "
+        f"Got: {result.message}"
+    )
+    assert not result.is_removal
 
 
 # ============================================================================
@@ -248,21 +503,19 @@ async def test_leave_auto_refreshes_poll(mock_update, mock_context):
 
     await leave_lobby_callback(mock_update, mock_context)
 
-    # context.bot.edit_message_text should be called at least once for the poll refresh
-    # (the lobby message update goes through query.edit_message_text, not bot.edit_message_text)
     assert mock_context.bot.edit_message_text.call_count >= 1, (
         "Poll should be auto-refreshed on leave"
     )
 
 
 # ============================================================================
-# Test: Prune notification sent
+# Test: Suspension notification sent
 # ============================================================================
 
 
 @pytest.mark.asyncio
-async def test_prune_notification_sent(mock_update, mock_context):
-    """Verify send_message is called with stale vote notification text."""
+async def test_suspension_notification_sent(mock_update, mock_context):
+    """Verify send_message is called with 'suspended' text when votes are affected."""
     chat_id = 12345
     poll_id = "poll_prune_test"
 
@@ -275,12 +528,11 @@ async def test_prune_notification_sent(mock_update, mock_context):
         ],
         players=[111, 222, 333, 444],
         votes=[
-            {"user_id": 111, "game_id": 1},  # Will become stale
+            {"user_id": 111, "game_id": 1},  # Will be suspended
         ],
         vote_limit=3,
     )
 
-    # 5th player joins -> SmallGame removed -> 1 stale vote
     async with db.AsyncSessionLocal() as session:
         session.add(User(telegram_id=555, telegram_name="User555"))
         await session.commit()
@@ -294,23 +546,22 @@ async def test_prune_notification_sent(mock_update, mock_context):
 
     await join_lobby_callback(mock_update, mock_context)
 
-    # Check that a notification about stale votes was sent
     send_calls = mock_context.bot.send_message.call_args_list
-    stale_notification = [
+    suspension_notification = [
         c for c in send_calls
-        if "stale vote" in str(c).lower()
+        if "suspended" in str(c).lower()
     ]
-    assert len(stale_notification) > 0, "Should send notification about pruned stale votes"
+    assert len(suspension_notification) > 0, "Should send notification about suspended votes"
 
 
 # ============================================================================
-# Test: No prune when no stale votes
+# Test: No notification when no votes are affected
 # ============================================================================
 
 
 @pytest.mark.asyncio
-async def test_no_prune_when_no_stale_votes(mock_update, mock_context):
-    """Player joins but all votes remain valid -> no notification, no deletions."""
+async def test_no_notification_when_no_votes_suspended(mock_update, mock_context):
+    """Player joins but all votes remain valid -> no suspension notification, no deletions."""
     chat_id = 12345
     poll_id = "poll_prune_test"
 
@@ -343,7 +594,7 @@ async def test_no_prune_when_no_stale_votes(mock_update, mock_context):
 
     await join_lobby_callback(mock_update, mock_context)
 
-    # All votes should survive
+    # All votes should still be in DB
     async with db.AsyncSessionLocal() as session:
         remaining_votes = (
             (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
@@ -352,10 +603,10 @@ async def test_no_prune_when_no_stale_votes(mock_update, mock_context):
         )
         assert len(remaining_votes) == 2, "All votes should survive"
 
-    # No "stale vote" notification should be sent
+    # No "suspended" notification should be sent
     send_calls = mock_context.bot.send_message.call_args_list
-    stale_notification = [
+    suspension_notification = [
         c for c in send_calls
-        if "stale vote" in str(c).lower()
+        if "suspended" in str(c).lower()
     ]
-    assert len(stale_notification) == 0, "Should NOT send stale vote notification"
+    assert len(suspension_notification) == 0, "Should NOT send suspension notification"

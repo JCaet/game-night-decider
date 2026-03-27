@@ -621,20 +621,15 @@ async def _prune_stale_votes(session, context, chat_id):
     )
     stale_cat_votes = (await session.execute(stale_cat_votes_stmt)).scalars().all()
 
-    total_pruned = len(stale_game_votes) + len(stale_cat_votes)
-    if total_pruned > 0:
-        for v in stale_game_votes:
-            await session.delete(v)
-        for v in stale_cat_votes:
-            await session.delete(v)
-        await session.commit()
-
+    total_suspended = len(stale_game_votes) + len(stale_cat_votes)
+    if total_suspended > 0:
         with contextlib.suppress(Exception):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"⚠️ Game list updated ({len(valid_games)} games). "
-                    f"{total_pruned} stale vote(s) removed."
+                    f"{total_suspended} vote(s) suspended "
+                    f"(will resume if games become eligible again)."
                 ),
             )
 
@@ -2491,6 +2486,10 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
         # Calculate valid games count for auto-limit
         valid_games, _ = await get_session_valid_games(session, chat_id)
         game_count = len(valid_games) if valid_games else 0
+        valid_game_ids = {g.id for g in valid_games}
+        valid_category_levels = (
+            set(group_games_by_complexity(valid_games).keys()) if valid_games else set()
+        )
 
         result = await PollService.cast_vote(
             session=session,
@@ -2503,6 +2502,8 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
             game_count=game_count,
             user_last_name=user_last_name,
             user_tg_username=user_tg_username,
+            valid_game_ids=valid_game_ids,
+            valid_category_levels=valid_category_levels,
         )
 
         await session.commit()
@@ -2580,11 +2581,16 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
     # from lobby changes (a new joiner can't rename someone who already voted)
     voter_name_map = disambiguate_voter_names(all_votes)
 
+    # Pre-compute active complexity levels so suspended category votes are excluded
+    # from totals (mirrors the same guard used for game votes via `vote_counts` keys).
+    active_levels = set(group_games_by_complexity(games).keys()) if games else set()
+
     for v in all_votes:
         voter_display = voter_name_map.get(v.user_id, v.user_name or f"User {v.user_id}")
         if v.vote_type == VoteType.CATEGORY:
-            # Category vote: target_id (category_level)
             level = v.category_level
+            if level not in active_levels:
+                continue  # suspended — complexity level has no valid games right now
             category_vote_counts[level] = category_vote_counts.get(level, 0) + 1
             if level not in category_voters:
                 category_voters[level] = []
@@ -2830,6 +2836,8 @@ async def _handle_poll_category_vote(
         # Calculate valid games count for auto-limit
         # (valid_games is already fetched above)
         game_count = len(valid_games) if valid_games else 0
+        valid_game_ids = {g.id for g in valid_games}
+        valid_category_levels = set(groups.keys())
 
         result = await PollService.cast_vote(
             session=session,
@@ -2842,6 +2850,8 @@ async def _handle_poll_category_vote(
             game_count=game_count,
             user_last_name=user_last_name,
             user_tg_username=user_tg_username,
+            valid_game_ids=valid_game_ids,
+            valid_category_levels=valid_category_levels,
         )
 
         await session.commit()

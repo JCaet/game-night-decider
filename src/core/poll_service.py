@@ -12,7 +12,7 @@ import random
 from collections import namedtuple
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from src.core.logic import calculate_poll_winner, group_games_by_complexity
@@ -85,6 +85,8 @@ class PollService:
         game_count: int,
         user_last_name: str | None = None,
         user_tg_username: str | None = None,
+        valid_game_ids: set[int] | None = None,
+        valid_category_levels: set[int] | None = None,
     ) -> VoteResult:
         """
         Cast or toggle a vote with limit enforcement.
@@ -135,12 +137,26 @@ class PollService:
         effective_limit = PollService.calculate_effective_limit(vote_limit, game_count)
 
         if effective_limit is not None:
-            # Get user's current vote count for this poll
-            # We count total votes (games + categories)
+            # Count only *active* votes against the limit — votes for games/levels
+            # that are currently invalid (suspended) are excluded so that a player-count
+            # change doesn't silently block the user from voting for eligible games.
             user_votes_stmt = select(func.count(PollVote.id)).where(
                 PollVote.poll_id == poll_id,
                 PollVote.user_id == user_id,
             )
+            if valid_game_ids is not None and valid_category_levels is not None:
+                user_votes_stmt = user_votes_stmt.where(
+                    or_(
+                        and_(
+                            PollVote.vote_type == VoteType.GAME,
+                            PollVote.game_id.in_(valid_game_ids),
+                        ),
+                        and_(
+                            PollVote.vote_type == VoteType.CATEGORY,
+                            PollVote.category_level.in_(valid_category_levels),
+                        ),
+                    )
+                )
             user_vote_count = await session.scalar(user_votes_stmt) or 0
 
             if user_vote_count >= effective_limit:
