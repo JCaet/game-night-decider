@@ -43,7 +43,9 @@ async def test_anonymous_voting_toggle(mock_update, mock_context):
         session.add(SessionPlayer(session_id=chat_id, user_id=111))
 
         session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
-        session.add(PollVote(poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="Voter1"))
+        session.add(PollVote(
+            poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="Voter1"
+        ))
 
         await session.commit()
 
@@ -169,7 +171,10 @@ async def test_render_anonymous_poll(mock_update, mock_context):
         session.add(g1)
         session.add(Collection(user_id=222, game_id=2))
         session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=555))
-        session.add(PollVote(poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=2, user_name="SecretVoter"))
+        session.add(PollVote(
+            poll_id=poll_id, user_id=222, vote_type=VoteType.GAME,
+            game_id=2, user_name="SecretVoter"
+        ))
         await session.commit()
 
         await render_poll_message(mock_context.bot, chat_id, 555, session, poll_id, [g1], set())

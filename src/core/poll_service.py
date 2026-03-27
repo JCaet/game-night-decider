@@ -234,7 +234,7 @@ class PollService:
         """Fetch all votes for a poll."""
         stmt = select(PollVote).where(PollVote.poll_id == poll_id)
         result = await session.execute(stmt)
-        return result.scalars().all()
+        return list(result.scalars().all())
 
     @staticmethod
     async def build_star_collections(

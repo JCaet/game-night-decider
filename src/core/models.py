@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import Enum as PyEnum
 
 from sqlalchemy import (
     BigInteger,
@@ -153,9 +154,6 @@ class GameNightPoll(Base):
     )
 
 
-from enum import Enum as PyEnum
-
-
 class VoteType(str, PyEnum):
     GAME = "game"
     CATEGORY = "category"
@@ -189,7 +187,10 @@ class PollVote(Base):
     # SQLite treats NULLs as distinct in unique constraints usually, but for our logic
     # a user voting for the SAME game/category should be blocked/toggled.
     __table_args__ = (
-        UniqueConstraint("poll_id", "user_id", "vote_type", "game_id", "category_level", name="uq_poll_vote"),
+        UniqueConstraint(
+            "poll_id", "user_id", "vote_type", "game_id", "category_level",
+            name="uq_poll_vote",
+        ),
     )
 
     # Relationships

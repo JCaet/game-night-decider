@@ -2,10 +2,11 @@ import contextlib
 import logging
 import math
 from collections import namedtuple
+from collections.abc import Sequence
 
+import telegram
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
-import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
@@ -127,7 +128,7 @@ def disambiguate_voter_names(votes: list) -> dict[int, str]:
     return _disambiguate(entries)
 
 
-def build_player_names(players: list) -> list[str]:
+def build_player_names(players: Sequence[SessionPlayer]) -> list[str]:
     """Build disambiguated display names for a list of SessionPlayer objects."""
     users = [p.user for p in players]
     name_map = disambiguate_names(users)
@@ -532,7 +533,9 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.add(db_session)
 
         # Close any leftover polls from previous session
-        await _close_existing_polls(session, context, chat_id, reason="Poll Closed (New Game Night)")
+        await _close_existing_polls(
+            session, context, chat_id, reason="Poll Closed (New Game Night)"
+        )
 
         # Clear players
         await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
@@ -599,7 +602,9 @@ async def _prune_stale_votes(session, context, chat_id):
     stale_game_votes_stmt = select(PollVote).where(
         PollVote.poll_id == active_poll.poll_id,
         PollVote.vote_type == VoteType.GAME,
-        PollVote.game_id.notin_(valid_game_ids) if valid_game_ids else PollVote.vote_type == VoteType.GAME,
+        PollVote.game_id.notin_(valid_game_ids)
+        if valid_game_ids
+        else PollVote.vote_type == VoteType.GAME,
     )
     stale_game_votes = (await session.execute(stale_game_votes_stmt)).scalars().all()
 
@@ -610,7 +615,9 @@ async def _prune_stale_votes(session, context, chat_id):
     stale_cat_votes_stmt = select(PollVote).where(
         PollVote.poll_id == active_poll.poll_id,
         PollVote.vote_type == VoteType.CATEGORY,
-        PollVote.category_level.notin_(active_levels) if active_levels else PollVote.vote_type == VoteType.CATEGORY,
+        PollVote.category_level.notin_(active_levels)
+        if active_levels
+        else PollVote.vote_type == VoteType.CATEGORY,
     )
     stale_cat_votes = (await session.execute(stale_cat_votes_stmt)).scalars().all()
 
@@ -1560,7 +1567,9 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
                     )
 
             # Auto-Close Previous Polls
-            await _close_existing_polls(session, context, chat_id, reason="Poll Closed (Game Night Restarted)")
+            await _close_existing_polls(
+                session, context, chat_id, reason="Poll Closed (Game Night Restarted)"
+            )
 
             # Clear players
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
@@ -1691,7 +1700,9 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         # Auto-Close Existing Polls for this session
-        await _close_existing_polls(session, context, chat_id, reason="Poll Closed (New poll started)")
+        await _close_existing_polls(
+            session, context, chat_id, reason="Poll Closed (New poll started)"
+        )
         await session.commit()
 
         player_count = len(players)
@@ -1813,7 +1824,9 @@ async def cancel_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         if db_session:
             # Close any active polls
-            await _close_existing_polls(session, context, chat_id, reason="Poll Closed (Game Night Cancelled)")
+            await _close_existing_polls(
+                session, context, chat_id, reason="Poll Closed (Game Night Cancelled)"
+            )
 
             # Clear players
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))

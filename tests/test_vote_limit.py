@@ -335,8 +335,12 @@ async def test_vote_removal_allows_new_vote(mock_update, mock_context):
         session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
 
         # At limit: 2 votes
-        session.add(PollVote(poll_id=poll_id, user_id=user_id, vote_type=VoteType.GAME, game_id=1, user_name="Voter"))
-        session.add(PollVote(poll_id=poll_id, user_id=user_id, vote_type=VoteType.GAME, game_id=2, user_name="Voter"))
+        session.add(PollVote(
+            poll_id=poll_id, user_id=user_id, vote_type=VoteType.GAME, game_id=1, user_name="Voter"
+        ))
+        session.add(PollVote(
+            poll_id=poll_id, user_id=user_id, vote_type=VoteType.GAME, game_id=2, user_name="Voter"
+        ))
 
         await session.commit()
 

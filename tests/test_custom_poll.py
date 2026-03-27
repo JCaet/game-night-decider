@@ -447,8 +447,10 @@ async def test_custom_poll_close_announces_winner(mock_update, mock_context):
         session.add(poll)
 
         # Two votes for Winner Game
-        v1 = PollVote(poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="User1")
-        v2 = PollVote(poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=1, user_name="User2")
+        v1 = PollVote(poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1,
+                      user_name="User1")
+        v2 = PollVote(poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=1,
+                      user_name="User2")
         session.add_all([v1, v2])
         await session.commit()
 
@@ -501,8 +503,12 @@ async def test_custom_poll_close_tie(mock_update, mock_context):
         session.add(poll)
 
         # One vote each - tie!
-        v1 = PollVote(poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="User1")
-        v2 = PollVote(poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=2, user_name="User2")
+        v1 = PollVote(
+            poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="User1"
+        )
+        v2 = PollVote(
+            poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=2, user_name="User2"
+        )
         session.add_all([v1, v2])
         await session.commit()
 
@@ -521,7 +527,6 @@ async def test_custom_poll_close_tie(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_custom_poll_close_resolves_category_votes(mock_update, mock_context):
     """Test closing poll resolves category votes to an actual game."""
-    import random
 
     chat_id = 12345
     poll_id = f"poll_cat_close_{chat_id}"
@@ -568,10 +573,12 @@ async def test_custom_poll_close_resolves_category_votes(mock_update, mock_conte
 
         # Both users voted on category 4 (game_id = -4)
         v1 = PollVote(
-            poll_id=poll_id, user_id=111, vote_type=VoteType.CATEGORY, category_level=4, user_name="User1"
+            poll_id=poll_id, user_id=111, vote_type=VoteType.CATEGORY,
+            category_level=4, user_name="User1"
         )
         v2 = PollVote(
-            poll_id=poll_id, user_id=222, vote_type=VoteType.CATEGORY, category_level=4, user_name="User2"
+            poll_id=poll_id, user_id=222, vote_type=VoteType.CATEGORY,
+            category_level=4, user_name="User2"
         )
         session.add_all([v1, v2])
         await session.commit()
@@ -673,8 +680,12 @@ async def test_custom_poll_close_with_weighted_voting(mock_update, mock_context)
         session.add(poll)
 
         # One vote each, but StarredGame should get boost from User1
-        v1 = PollVote(poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="User1")
-        v2 = PollVote(poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=2, user_name="User2")
+        v1 = PollVote(
+            poll_id=poll_id, user_id=111, vote_type=VoteType.GAME, game_id=1, user_name="User1"
+        )
+        v2 = PollVote(
+            poll_id=poll_id, user_id=222, vote_type=VoteType.GAME, game_id=2, user_name="User2"
+        )
         session.add_all([v1, v2])
         await session.commit()
 
@@ -826,7 +837,6 @@ async def test_toggle_weights_updates_setting_and_refresh_menu(mock_update, mock
 @pytest.mark.asyncio
 async def test_custom_poll_ui_grouping(mock_update, mock_context):
     """Test pollution UI groups games by complexity with separators."""
-    import random
 
     chat_id = 99999
     base_id = 80000
@@ -900,7 +910,6 @@ async def test_custom_poll_ui_grouping(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_custom_poll_random_vote(mock_update, mock_context):
     """Test clicking separator stores a category vote (not a random game vote)."""
-    import random
 
     chat_id = 88888
     poll_id = f"poll_random_{chat_id}"
@@ -967,7 +976,6 @@ async def test_custom_poll_random_vote(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
     """Test clicking category header again removes the vote (toggle behavior)."""
-    import random
 
     chat_id = 77777
     poll_id = f"poll_toggle_{chat_id}"
@@ -995,7 +1003,8 @@ async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
 
         # Pre-existing category vote
         session.add(PollVote(
-            poll_id=poll_id, user_id=111, vote_type=VoteType.CATEGORY, category_level=3, user_name="Toggler"
+            poll_id=poll_id, user_id=111, vote_type=VoteType.CATEGORY,
+            category_level=3, user_name="Toggler"
         ))
         await session.commit()
 
@@ -1028,7 +1037,6 @@ async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_auto_close_previous_polls(mock_update, mock_context):
     """Test that starting a new poll closes existing ones."""
-    import random
 
     chat_id = 66666
     old_poll_id = f"old_{chat_id}"
@@ -1084,7 +1092,6 @@ async def test_auto_close_previous_polls(mock_update, mock_context):
 @pytest.mark.asyncio
 async def test_auto_refresh_poll_on_join(mock_update, mock_context):
     """Test that joining the lobby refreshes the active custom poll."""
-    import random
 
     chat_id = 55555
     poll_id = f"active_{chat_id}"

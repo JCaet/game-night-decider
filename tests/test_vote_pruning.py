@@ -24,7 +24,6 @@ from src.core.models import (
     VoteType,
 )
 
-
 # ============================================================================
 # Helper to set up common test data
 # ============================================================================
@@ -176,7 +175,7 @@ async def test_join_prunes_stale_votes(mock_update, mock_context):
 
 @pytest.mark.asyncio
 async def test_leave_prunes_stale_votes(mock_update, mock_context):
-    """Player leaves, reducing count -> games with higher min_players removed -> stale votes pruned."""
+    """Player leaves -> games with higher min_players removed -> stale votes pruned."""
     chat_id = 12345
     poll_id = "poll_prune_test"
 
