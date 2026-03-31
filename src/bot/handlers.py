@@ -938,9 +938,11 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Check Poll Mode
-    session_obj = await session.get(Session, chat_id)
+    async with db.AsyncSessionLocal() as session:
+        session_obj = await session.get(Session, chat_id)
     if session_obj and session_obj.poll_type == PollType.CUSTOM:
-        await create_custom_poll(update, context, session, list(valid_games), priority_game_ids)
+        async with db.AsyncSessionLocal() as session:
+            await create_custom_poll(update, context, session, list(valid_games), priority_game_ids)
         return
 
     # Filter/Sort
