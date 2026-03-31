@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 from telegram import CallbackQuery, Message, Update
 from telegram.ext import ContextTypes
 
@@ -20,7 +21,12 @@ async def setup_test_db():
     This ensures tests are isolated and don't affect the file-based DB.
     """
     # Create in-memory engine
-    test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    test_engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        echo=False,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
 
     # Patch the global engine and sessionmaker in src.core.db
     # Since handlers.py imports 'db' and calls 'db.AsyncSessionLocal()', this works!
