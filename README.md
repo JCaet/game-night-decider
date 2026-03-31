@@ -4,25 +4,30 @@ A Telegram bot that helps your group decide what board game to play on game nigh
 
 ## Features
 
-- **BGG Integration**: Syncs your collection from BoardGameGeek
-- **Lobby System**: Create a lobby for players to join
-- **Smart Filtering**: Only shows games that support the player count
+- **BGG Integration**: Syncs your collection from BoardGameGeek (with force-refresh option)
+- **Lobby System**: Create a lobby for players to join, with resume/restart if a night is already active
+- **Smart Filtering**: Only shows games that support the current player count
 - **Complexity Splitting**: Polls are split by game weight (Light/Medium/Heavy)
-- **New Game Flags**: Mark games as "new" to promote trying them
-- **Exclusions**: Temporarily exclude games you don't want to play
+- **Collection Management**: Three-state toggle per game (⬜ Included → 🌟 Starred → ❌ Excluded) plus custom max player overrides
+- **Poll Settings**: Choose between Custom (single-vote buttons) or Native (Telegram polls), toggle weighted voting, anonymous voting, and vote limits
+- **Weighted Voting**: Starred (🌟) games get a +0.5 vote boost per player who starred them
+- **Auto-Close Polls**: Polls close automatically once every player has voted
+- **Guest Support**: Add guest players and assign games to them
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `/start` | Welcome message |
-| `/setbgg <username>` | Link your BoardGameGeek account |
-| `/gamenight` | Start a new game night lobby |
-| `/poll` | Generate voting polls |
-| `/addguest <name>` | Add a guest player |
-| `/guestgame <name> <game>` | Add a game for a guest |
-| `/markplayed <game>` | Mark a game as played (removes "new" flag) |
-| `/exclude <game>` | Toggle game exclusion from polls |
+| `/help` | Show all available commands |
+| `/setbgg <username> [force]` | Sync your BoardGameGeek collection (`force` re-fetches existing games) |
+| `/addgame <name>` | Search BGG and add a game to your collection |
+| `/manage` | Manage your collection: cycle game states and set custom max players (sent via DM in groups) |
+| `/gamenight` | Start a new game night lobby (or resume/restart an existing one) |
+| `/poll` | Generate voting polls from joined players' collections |
+| `/addguest <name>` | Add a guest player to the current lobby |
+| `/guestgame <name> <game>` | Add a game to a guest's collection |
+| `/cancel` | Cancel the current game night |
 
 ## Setup
 
