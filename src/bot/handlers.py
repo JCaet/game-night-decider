@@ -7,7 +7,7 @@ from collections.abc import Sequence
 import telegram
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import selectinload
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.core import db
@@ -399,7 +399,10 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 collection_entry = (
                                     await session.execute(col_stmt)
                                 ).scalar_one_or_none()
-                                if collection_entry:
+                                if (
+                                    collection_entry
+                                    and not collection_entry.is_manual_player_override
+                                ):
                                     # Update if new max is higher than current effective
                                     current_eff = (
                                         collection_entry.effective_max_players
@@ -935,9 +938,11 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Check Poll Mode
-    session_obj = await session.get(Session, chat_id)
+    async with db.AsyncSessionLocal() as session:
+        session_obj = await session.get(Session, chat_id)
     if session_obj and session_obj.poll_type == PollType.CUSTOM:
-        await create_custom_poll(update, context, session, list(valid_games), priority_game_ids)
+        async with db.AsyncSessionLocal() as session:
+            await create_custom_poll(update, context, session, list(valid_games), priority_game_ids)
         return
 
     # Filter/Sort
@@ -2075,24 +2080,35 @@ async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Clean up previous manage message if one exists
+    old_manage_msg_id = context.user_data.pop("manage_message_id", None)
+    if old_manage_msg_id:
+        with contextlib.suppress(Exception):
+            await context.bot.delete_message(
+                chat_id=user_id,
+                message_id=old_manage_msg_id,
+            )
+
     # Build keyboard with first page
     keyboard, total_pages = _build_manage_keyboard(list(results), page=0)
 
     collection_message = (
         f"📚 **Your Collection** ({len(results)} games)\n"
-        "Tap a game to toggle availability for game nights.\n"
-        "✅ = Available | ❌ = Excluded"
+        "Tap a game to cycle its state:\n"
+        "⬜ Included → 🌟 Starred → ❌ Excluded\n"
+        "Tap ⚙️ to set custom max players."
     )
 
     # If in a group chat, send via DM and post playful message in group
     if chat_type in ("group", "supergroup"):
         try:
-            await context.bot.send_message(
+            msg = await context.bot.send_message(
                 chat_id=user_id,
                 text=collection_message,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown",
             )
+            context.user_data["manage_message_id"] = msg.message_id
             # Playful message in group
             await update.message.reply_text(
                 f"🤫 Psst, {user_name}! Your collection is *top secret* stuff.\n"
@@ -2110,11 +2126,41 @@ async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     else:
         # Already in private chat, just reply normally
-        await update.message.reply_text(
+        msg = await update.message.reply_text(
             collection_message,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
+        context.user_data["manage_message_id"] = msg.message_id
+
+
+async def _render_detail_view(query: CallbackQuery, user_id: int, game_id: int) -> None:
+    """Render the per-game detail view with player count stepper."""
+    async with db.AsyncSessionLocal() as session:
+        stmt = (
+            select(Collection, Game)
+            .join(Game)
+            .where(Collection.user_id == user_id, Collection.game_id == game_id)
+        )
+        result = (await session.execute(stmt)).one_or_none()
+    if not result:
+        await query.edit_message_text("Game not found in your collection.")
+        return
+    col, game = result
+    keyboard = _build_detail_keyboard(col, game)
+    override_text = (
+        f"Override: **{col.effective_max_players}** players (manual)"
+        if col.is_manual_player_override and col.effective_max_players
+        else "No override set"
+    )
+    await query.edit_message_text(
+        f"⚙️ **{game.name}**\n"
+        f"Players: {game.min_players}–{game.max_players} (BGG default)\n"
+        f"{override_text}\n\n"
+        "Set a custom max player count below:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
 
 
 async def manage_collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2123,11 +2169,66 @@ async def manage_collection_callback(update: Update, context: ContextTypes.DEFAU
     with contextlib.suppress(telegram.error.BadRequest):
         await query.answer()
 
-    data = query.data  # "manage:toggle:<game_id>" or "manage:page:<page_num>"
+    data = query.data  # "manage:<action>:<game_id>[:<extra>]"
     parts = data.split(":")
     action = parts[1]
     user_id = query.from_user.id
 
+    # Reject button presses on stale/outdated manage messages
+    current_manage_msg = context.user_data.get("manage_message_id")
+    if current_manage_msg and current_manage_msg != query.message.message_id:
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer(
+                "This collection view is outdated. Use /manage for the current one.",
+                show_alert=True,
+            )
+        return
+
+    # --- Close the collection manager ---
+    if action == "close":
+        context.user_data.pop("manage_message_id", None)
+        with contextlib.suppress(Exception):
+            await query.delete_message()
+        return
+
+    # --- Set max players override ---
+    if action == "setmax":
+        game_id = int(parts[2])
+        new_max = int(parts[3])
+        async with db.AsyncSessionLocal() as session:
+            col_stmt = select(Collection).where(
+                Collection.user_id == user_id, Collection.game_id == game_id
+            )
+            col = (await session.execute(col_stmt)).scalar_one_or_none()
+            if col:
+                col.effective_max_players = new_max
+                col.is_manual_player_override = True
+                await session.commit()
+        await _render_detail_view(query, user_id, game_id)
+        return
+
+    # --- Clear max players override ---
+    if action == "clearmax":
+        game_id = int(parts[2])
+        async with db.AsyncSessionLocal() as session:
+            col_stmt = select(Collection).where(
+                Collection.user_id == user_id, Collection.game_id == game_id
+            )
+            col = (await session.execute(col_stmt)).scalar_one_or_none()
+            if col:
+                col.effective_max_players = None
+                col.is_manual_player_override = False
+                await session.commit()
+        await _render_detail_view(query, user_id, game_id)
+        return
+
+    # --- Detail view: show per-game settings ---
+    if action == "detail":
+        game_id = int(parts[2])
+        await _render_detail_view(query, user_id, game_id)
+        return
+
+    # --- Toggle / Page (existing collection list view) ---
     async with db.AsyncSessionLocal() as session:
         if action == "toggle":
             game_id = int(parts[2])
@@ -2173,10 +2274,42 @@ async def manage_collection_callback(update: Update, context: ContextTypes.DEFAU
     await query.edit_message_text(
         f"📚 **Your Collection** ({len(results)} games)\n"
         "Tap a game to cycle its state:\n"
-        "⬜ Included → 🌟 Starred → ❌ Excluded",
+        "⬜ Included → 🌟 Starred → ❌ Excluded\n"
+        "Tap ⚙️ to set custom max players.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
+
+
+def _build_detail_keyboard(col: Collection, game: Game) -> list[list[InlineKeyboardButton]]:
+    """Build keyboard for per-game detail view with +/- player count stepper."""
+    keyboard: list[list[InlineKeyboardButton]] = []
+    current = col.effective_max_players or game.max_players
+    gid = game.id
+
+    # +/- stepper row
+    row: list[InlineKeyboardButton] = []
+    if current > game.min_players:
+        row.append(InlineKeyboardButton("➖", callback_data=f"manage:setmax:{gid}:{current - 1}"))
+    row.append(InlineKeyboardButton(f"  {current} players  ", callback_data="manage:noop"))
+    row.append(InlineKeyboardButton("➕", callback_data=f"manage:setmax:{gid}:{current + 1}"))
+    keyboard.append(row)
+
+    # Clear override (only if one exists)
+    if col.is_manual_player_override and col.effective_max_players:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "🔄 Reset to BGG default",
+                    callback_data=f"manage:clearmax:{game.id}",
+                )
+            ]
+        )
+
+    # Back to collection list
+    keyboard.append([InlineKeyboardButton("◀️ Back to collection", callback_data="manage:page:0")])
+
+    return keyboard
 
 
 def _build_manage_keyboard(
@@ -2196,10 +2329,21 @@ def _build_manage_keyboard(
         # State icons: 0=included (⬜), 1=starred (🌟), 2=excluded (❌)
         state_icons = {GameState.INCLUDED: "⬜", GameState.STARRED: "🌟", GameState.EXCLUDED: "❌"}
         status = state_icons.get(col.state, "⬜")
-        # Truncate long names
-        name = game.name[:25] + "…" if len(game.name) > 26 else game.name
+        # Show manual player override indicator
+        override_label = ""
+        if col.is_manual_player_override and col.effective_max_players:
+            override_label = f" [{col.effective_max_players}p]"
+        # Truncate long names (account for override label width)
+        max_name_len = 25 - len(override_label)
+        name = game.name[:max_name_len] + "…" if len(game.name) > max_name_len + 1 else game.name
         keyboard.append(
-            [InlineKeyboardButton(f"{status} {name}", callback_data=f"manage:toggle:{game.id}")]
+            [
+                InlineKeyboardButton(
+                    f"{status} {name}{override_label}",
+                    callback_data=f"manage:toggle:{game.id}",
+                ),
+                InlineKeyboardButton("⚙️", callback_data=f"manage:detail:{game.id}"),
+            ]
         )
 
     # Navigation row
@@ -2216,6 +2360,9 @@ def _build_manage_keyboard(
         keyboard.append(
             [InlineKeyboardButton(f"Page {page + 1}/{total_pages}", callback_data="manage:noop")]
         )
+
+    # Done button to close the manager
+    keyboard.append([InlineKeyboardButton("✅ Done", callback_data="manage:close")])
 
     return keyboard, total_pages
 

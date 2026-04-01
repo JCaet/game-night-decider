@@ -99,6 +99,9 @@ class Collection(Base):
     effective_max_players: Mapped[int | None] = mapped_column(Integer, nullable=True)
     effective_complexity: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # True when effective_max_players was set manually by the user (not by expansion sync)
+    is_manual_player_override: Mapped[bool] = mapped_column(Boolean, default=False)
+
     # Relationships
     user: Mapped["User"] = relationship(back_populates="collection")
     game: Mapped["Game"] = relationship(lazy="joined")
