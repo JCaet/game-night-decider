@@ -40,6 +40,27 @@ ResolvedVote = namedtuple("ResolvedVote", ["game_id", "user_id"])
 logger = logging.getLogger(__name__)
 
 
+async def _try_pin_message(bot, chat_id: int, message_id: int) -> bool:
+    """Attempt to pin a message. Returns True on success, False if bot lacks permissions."""
+    try:
+        await bot.pin_chat_message(
+            chat_id=chat_id, message_id=message_id, disable_notification=True
+        )
+        return True
+    except telegram.error.BadRequest as e:
+        logger.info("Cannot pin message in chat %s: %s", chat_id, e)
+        return False
+    except telegram.error.Forbidden as e:
+        logger.info("No permission to pin in chat %s: %s", chat_id, e)
+        return False
+
+
+async def _try_unpin_message(bot, chat_id: int, message_id: int) -> None:
+    """Attempt to unpin a message. Silently ignores permission errors."""
+    with contextlib.suppress(telegram.error.BadRequest, telegram.error.Forbidden):
+        await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
+
+
 _NameEntry = namedtuple("_NameEntry", ["uid", "first", "last", "tg_username", "fallback"])
 
 
@@ -489,6 +510,7 @@ async def _close_existing_polls(session, context, chat_id, reason="Poll Closed")
                     parse_mode="Markdown",
                     reply_markup=None,
                 )
+        await _try_unpin_message(context.bot, chat_id, p.message_id)
         await session.delete(p)
 
 
@@ -981,6 +1003,18 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             session.add(poll)
             await session.commit()
+
+        # Pin poll message for visibility
+        pinned = await _try_pin_message(context.bot, chat_id, message.message_id)
+        if not pinned:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "💡 *Tip:* Promote this bot to admin with"
+                    " 'Pin Messages' permission to auto-pin polls."
+                ),
+                parse_mode="Markdown",
+            )
 
 
 async def add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1803,6 +1837,18 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             session.add(poll)
             await session.commit()
 
+        # Pin poll message for visibility
+        pinned = await _try_pin_message(context.bot, chat_id, message.message_id)
+        if not pinned:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "💡 *Tip:* Promote this bot to admin with"
+                    " 'Pin Messages' permission to auto-pin polls."
+                ),
+                parse_mode="Markdown",
+            )
+
 
 async def cancel_night_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle cancel button - end the game night."""
@@ -1878,6 +1924,8 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
     poll_id = answer.poll_id
     user_id = answer.user.id
     user_name = answer.user.first_name
+    user_last_name = answer.user.last_name
+    user_tg_username = answer.user.username
 
     # Store vote
     async with db.AsyncSessionLocal() as session:
@@ -1913,6 +1961,8 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
                     poll_id=poll_id,
                     user_id=user_id,
                     user_name=user_name,
+                    user_last_name=user_last_name,
+                    user_tg_username=user_tg_username,
                     vote_type=VoteType.GAME,
                 )
                 session.add(vote)
@@ -1970,6 +2020,9 @@ async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE
                     text = "🗳️ **Poll Closed!**\n\nNo votes cast?"
 
                 await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
+                # Unpin the poll message
+                await _try_unpin_message(context.bot, chat_id, game_poll.message_id)
 
                 # End the game night session
                 session_obj = await session.get(Session, chat_id)
@@ -2595,6 +2648,18 @@ async def create_custom_poll(
         context.bot, chat_id, message.message_id, session, poll_id, valid_games, priority_game_ids
     )
 
+    # Pin poll message for visibility
+    pinned = await _try_pin_message(context.bot, chat_id, message.message_id)
+    if not pinned:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "💡 *Tip:* Promote this bot to admin with"
+                " 'Pin Messages' permission to auto-pin polls."
+            ),
+            parse_mode="Markdown",
+        )
+
 
 async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle votes on custom poll."""
@@ -3051,6 +3116,9 @@ async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id:
         await context.bot.edit_message_text(
             chat_id=chat_id, message_id=game_poll.message_id, text=text, parse_mode="Markdown"
         )
+
+        # Unpin the poll message
+        await _try_unpin_message(context.bot, chat_id, game_poll.message_id)
 
         # Delete the poll record (cascade deletes all PollVote rows)
         # The result message above remains visible in chat.

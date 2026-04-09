@@ -74,6 +74,8 @@ async def test_weighted_voting_logic(mock_update, mock_context):
     mock_update.poll_answer.poll_id = poll_id
     mock_update.poll_answer.user.id = 111
     mock_update.poll_answer.user.first_name = "User1"
+    mock_update.poll_answer.user.last_name = None
+    mock_update.poll_answer.user.username = None
     mock_update.poll_answer.option_ids = [0]  # Normal Game
 
     mock_context.bot.stop_poll = AsyncMock()
@@ -83,6 +85,8 @@ async def test_weighted_voting_logic(mock_update, mock_context):
     # User 2 Votes for Starred Game
     mock_update.poll_answer.user.id = 222
     mock_update.poll_answer.user.first_name = "User2"
+    mock_update.poll_answer.user.last_name = None
+    mock_update.poll_answer.user.username = None
     mock_update.poll_answer.option_ids = [1]  # Starred Game
 
     mock_poll_data = MagicMock()
@@ -176,18 +180,24 @@ async def test_per_user_star_boost(mock_update, mock_context):
     # Player 1 votes Normal
     mock_update.poll_answer.user.id = 301
     mock_update.poll_answer.user.first_name = "Player1"
+    mock_update.poll_answer.user.last_name = None
+    mock_update.poll_answer.user.username = None
     mock_update.poll_answer.option_ids = [0]
     await receive_poll_answer(mock_update, mock_context)
 
     # Player 2 votes Normal
     mock_update.poll_answer.user.id = 302
     mock_update.poll_answer.user.first_name = "Player2"
+    mock_update.poll_answer.user.last_name = None
+    mock_update.poll_answer.user.username = None
     mock_update.poll_answer.option_ids = [0]
     await receive_poll_answer(mock_update, mock_context)
 
     # Player 3 votes Triple Star
     mock_update.poll_answer.user.id = 303
     mock_update.poll_answer.user.first_name = "Player3"
+    mock_update.poll_answer.user.last_name = None
+    mock_update.poll_answer.user.username = None
     mock_update.poll_answer.option_ids = [1]
 
     mock_poll_data = MagicMock()
