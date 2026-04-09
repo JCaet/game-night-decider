@@ -1504,3 +1504,370 @@ async def test_custom_poll_shows_description(mock_update, mock_context):
     assert "2 players" in text
     assert "1 games" in text
     assert "weighted voting" in text
+
+
+# ============================================================================
+# Add Game Cancel Test
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_custom_poll_add_cancel(mock_update, mock_context):
+    """Test that canceling the add picker deletes the message without adding a game."""
+    chat_id = 12345
+    poll_id = "poll_12345_cancel"
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                allow_adding_options=True,
+            )
+        )
+        u1 = User(telegram_id=111, telegram_name="User1")
+        u2 = User(telegram_id=222, telegram_name="User2")
+        session.add_all([u1, u2])
+        await session.flush()
+
+        g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+        session.add(g1)
+        await session.flush()
+
+        c1 = Collection(user_id=111, game_id=1)
+        c2 = Collection(user_id=222, game_id=1)
+        session.add_all([c1, c2])
+
+        sp1 = SessionPlayer(session_id=chat_id, user_id=111)
+        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
+        session.add_all([sp1, sp2])
+
+        poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999)
+        session.add(poll)
+        await session.commit()
+
+    mock_update.callback_query.data = f"poll_add_cancel:{poll_id}"
+    mock_update.callback_query.answer = AsyncMock()
+    mock_update.callback_query.message.delete = AsyncMock()
+
+    await poll_add_select_callback(mock_update, mock_context)
+
+    # Picker message should be deleted
+    mock_update.callback_query.message.delete.assert_called_once()
+
+    # No PollAddedGame should exist
+    async with db.AsyncSessionLocal() as session:
+        stmt = select(PollAddedGame).where(PollAddedGame.poll_id == poll_id)
+        added = (await session.execute(stmt)).scalars().all()
+        assert len(added) == 0
+
+
+# ============================================================================
+# Duplicate Add Prevention Test
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_custom_poll_add_game_duplicate_prevented(mock_update, mock_context):
+    """Test that adding the same game twice returns 'Already added!' message."""
+    chat_id = 12345
+    poll_id = "poll_12345_dup"
+    extra_game_id = 99
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                allow_adding_options=True,
+            )
+        )
+        u1 = User(telegram_id=111, telegram_name="User1")
+        u2 = User(telegram_id=222, telegram_name="User2")
+        session.add_all([u1, u2])
+        await session.flush()
+
+        g1 = Game(id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+        g_extra = Game(
+            id=extra_game_id, name="Extra", min_players=1,
+            max_players=2, playing_time=30, complexity=1.0,
+        )
+        session.add_all([g1, g_extra])
+        await session.flush()
+
+        c1 = Collection(user_id=111, game_id=1)
+        c2 = Collection(user_id=222, game_id=1)
+        session.add_all([c1, c2])
+
+        sp1 = SessionPlayer(session_id=chat_id, user_id=111)
+        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
+        session.add_all([sp1, sp2])
+
+        poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999)
+        session.add(poll)
+
+        # Pre-add the game
+        added = PollAddedGame(poll_id=poll_id, game_id=extra_game_id, added_by_user_id=111)
+        session.add(added)
+        await session.commit()
+
+    mock_update.callback_query.data = f"poll_add_select:{poll_id}:{extra_game_id}"
+    mock_update.callback_query.from_user.id = 111
+    mock_update.callback_query.answer = AsyncMock()
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.delete = AsyncMock()
+
+    await poll_add_select_callback(mock_update, mock_context)
+
+    # Should show "Already added!"
+    mock_update.callback_query.answer.assert_called_with("Already added!")
+
+    # Should NOT create a second record
+    async with db.AsyncSessionLocal() as session:
+        stmt = select(PollAddedGame).where(
+            PollAddedGame.poll_id == poll_id, PollAddedGame.game_id == extra_game_id
+        )
+        records = (await session.execute(stmt)).scalars().all()
+        assert len(records) == 1
+
+
+# ============================================================================
+# Hide Results with Category Votes Test
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_custom_poll_hide_results_hides_category_votes(mock_update, mock_context):
+    """Test that hide_results also hides category vote counts."""
+    chat_id = 12345
+    poll_id = "poll_12345_hide_cat"
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_results=True)
+        )
+
+        u1 = User(telegram_id=111, telegram_name="User1")
+        u2 = User(telegram_id=222, telegram_name="User2")
+        session.add_all([u1, u2])
+        await session.flush()
+
+        g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=3.5)
+        session.add(g1)
+        await session.flush()
+
+        c1 = Collection(user_id=111, game_id=1)
+        c2 = Collection(user_id=222, game_id=1)
+        session.add_all([c1, c2])
+
+        sp1 = SessionPlayer(session_id=chat_id, user_id=111)
+        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
+        session.add_all([sp1, sp2])
+
+        poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999)
+        session.add(poll)
+
+        # Add category votes
+        v1 = PollVote(
+            poll_id=poll_id, user_id=111, vote_type=VoteType.CATEGORY,
+            category_level=3, user_name="User1",
+        )
+        session.add(v1)
+        await session.commit()
+
+    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    call_kwargs = mock_context.bot.edit_message_text.call_args.kwargs
+    text = call_kwargs.get("text")
+
+    # Should show hidden results message, NOT category vote details
+    assert "Results will be revealed" in text
+    assert "Category 3" not in text
+    assert "User1" not in text
+
+    # Category header in buttons should NOT show vote count
+    keyboard = call_kwargs.get("reply_markup")
+    button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
+    cat_headers = [b for b in button_labels if "---" in b]
+    for header in cat_headers:
+        assert "(1)" not in header
+
+
+# ============================================================================
+# Native Poll New Parameters Test
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_native_poll_passes_new_api_parameters(mock_update, mock_context):
+    """Test that native polls pass shuffle, hide_results, allow_adding params to send_poll."""
+    chat_id = 12345
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.NATIVE,
+                shuffle_options=True,
+                hide_results=True,
+                allow_adding_options=True,
+            )
+        )
+
+        u1 = User(telegram_id=111, telegram_name="User1")
+        u2 = User(telegram_id=222, telegram_name="User2")
+        session.add_all([u1, u2])
+        await session.flush()
+
+        g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.5)
+        g2 = Game(id=2, name="Game2", min_players=2, max_players=4, playing_time=60, complexity=2.6)
+        session.add_all([g1, g2])
+        await session.flush()
+
+        c1 = Collection(user_id=111, game_id=1)
+        c2 = Collection(user_id=222, game_id=2)
+        session.add_all([c1, c2])
+
+        sp1 = SessionPlayer(session_id=chat_id, user_id=111)
+        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
+        session.add_all([sp1, sp2])
+        await session.commit()
+
+    mock_update.effective_chat.id = chat_id
+
+    await create_poll(mock_update, mock_context)
+
+    mock_context.bot.send_poll.assert_called()
+    call_kwargs = mock_context.bot.send_poll.call_args.kwargs
+
+    assert call_kwargs["allows_revoting"] is True
+    assert call_kwargs["shuffle_options"] is True
+    assert call_kwargs["hide_results_until_closes"] is True
+    assert call_kwargs["allow_adding_options"] is True
+    assert "description" in call_kwargs
+    assert "2 players" in call_kwargs["description"]
+
+
+# ============================================================================
+# Allow Adding Guard Test
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_poll_add_blocked_when_setting_disabled(mock_update, mock_context):
+    """Test that _handle_poll_add rejects when allow_adding_options is False."""
+    chat_id = 12345
+    poll_id = "poll_12345_guard"
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                allow_adding_options=False,
+            )
+        )
+        u1 = User(telegram_id=111, telegram_name="User1")
+        u2 = User(telegram_id=222, telegram_name="User2")
+        session.add_all([u1, u2])
+        await session.flush()
+
+        g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+        session.add(g1)
+        await session.flush()
+
+        c1 = Collection(user_id=111, game_id=1)
+        c2 = Collection(user_id=222, game_id=1)
+        session.add_all([c1, c2])
+
+        sp1 = SessionPlayer(session_id=chat_id, user_id=111)
+        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
+        session.add_all([sp1, sp2])
+
+        poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999)
+        session.add(poll)
+        await session.commit()
+
+    mock_update.callback_query.data = f"poll_add:{poll_id}"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.from_user.id = 111
+    mock_update.callback_query.answer = AsyncMock()
+
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    # Should show rejection alert
+    mock_update.callback_query.answer.assert_called_with(
+        "Adding games is not enabled for this poll.", show_alert=True
+    )
+
+    # Should NOT send a picker message
+    mock_context.bot.send_message.assert_not_called()
+
+
+# ============================================================================
+# Cascade Delete Test
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_poll_added_games_cascade_deleted(mock_update, mock_context):
+    """Test that PollAddedGame records are cascade-deleted when poll is closed."""
+    chat_id = 12345
+    poll_id = "poll_12345_cascade"
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                allow_adding_options=True,
+            )
+        )
+        u1 = User(telegram_id=111, telegram_name="User1")
+        u2 = User(telegram_id=222, telegram_name="User2")
+        session.add_all([u1, u2])
+        await session.flush()
+
+        g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+        g2 = Game(
+            id=99, name="Added", min_players=2, max_players=4,
+            playing_time=60, complexity=1.5,
+        )
+        session.add_all([g1, g2])
+        await session.flush()
+
+        c1 = Collection(user_id=111, game_id=1)
+        c2 = Collection(user_id=222, game_id=1)
+        session.add_all([c1, c2])
+
+        sp1 = SessionPlayer(session_id=chat_id, user_id=111)
+        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
+        session.add_all([sp1, sp2])
+
+        poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999)
+        session.add(poll)
+
+        added = PollAddedGame(poll_id=poll_id, game_id=99, added_by_user_id=111)
+        session.add(added)
+        await session.commit()
+
+    mock_update.callback_query.data = f"poll_close:{poll_id}"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.answer = AsyncMock()
+
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    # Verify both poll and added games are gone
+    async with db.AsyncSessionLocal() as session:
+        poll = await session.get(GameNightPoll, poll_id)
+        assert poll is None
+
+        stmt = select(PollAddedGame).where(PollAddedGame.poll_id == poll_id)
+        added = (await session.execute(stmt)).scalars().all()
+        assert len(added) == 0

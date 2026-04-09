@@ -158,6 +158,9 @@ class GameNightPoll(Base):
     votes: Mapped[list["PollVote"]] = relationship(
         back_populates="poll", cascade="all, delete-orphan"
     )
+    added_games: Mapped[list["PollAddedGame"]] = relationship(
+        back_populates="poll", cascade="all, delete-orphan"
+    )
 
 
 class PollAddedGame(Base):
@@ -174,7 +177,7 @@ class PollAddedGame(Base):
     added_by_user_id: Mapped[int] = mapped_column(BigInteger)
 
     # Relationships
-    poll: Mapped["GameNightPoll"] = relationship()
+    poll: Mapped["GameNightPoll"] = relationship(back_populates="added_games")
     game: Mapped["Game"] = relationship(lazy="joined")
 
 

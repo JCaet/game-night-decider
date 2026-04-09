@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import math
+import random
 from collections import namedtuple
 from collections.abc import Sequence
 
@@ -216,7 +217,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /gamenight - Start a new game night lobby\n"
         "• /poll - Create a poll from joined players' collections\n"
         "• /addguest `<name>` - Add a guest player\n"
-        "• /guestgame `<name> <game>` - Add game to guest's list\n\n"
+        "• /guestgame `<name> <game>` - Add game to guest's list\n"
+        "• /cancel - Cancel the current game night\n\n"
+        "**Poll Settings** (via ⚙️ Settings in lobby):\n"
+        "• **Mode**: Custom (buttons) or Native (Telegram polls)\n"
+        "• **Weights**: Starred games get +0.5 vote boost\n"
+        "• **Anonymous**: Hide voter names in results\n"
+        "• **Vote Limit**: Auto / 3 / 5 / 7 / 10 / Unlimited\n"
+        "• **Shuffle**: Randomize option order to reduce bias\n"
+        "• **Hide Results**: Hide votes until poll closes\n"
+        "• **Allow Suggestions**: Let players add games mid-poll\n\n"
         "**Other:**\n"
         "• /help - Show this message\n"
         "• /start - Show welcome message"
@@ -2757,8 +2767,9 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
         # Use PollService for vote casting
         vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
 
-        # Calculate valid games count for auto-limit
+        # Calculate valid games count for auto-limit (include user-added games)
         valid_games, _ = await get_session_valid_games(session, chat_id)
+        valid_games = await _merge_added_games(session, poll_id, valid_games)
         game_count = len(valid_games) if valid_games else 0
         valid_game_ids = {g.id for g in valid_games}
         valid_category_levels = (
@@ -2834,16 +2845,23 @@ async def get_session_valid_games(session, chat_id):
     return valid_games, priority_ids
 
 
-async def render_poll_message(bot, chat_id, message_id, session, poll_id, games, priority_ids):
-    """Update custom poll message with current vote state."""
-    # Include user-added games (from allow_adding_options)
+async def _merge_added_games(session, poll_id: str, games: list) -> list:
+    """Merge user-added games (PollAddedGame) into the games list."""
     added_stmt = select(PollAddedGame).where(PollAddedGame.poll_id == poll_id)
     added_records = (await session.execute(added_stmt)).scalars().all()
     existing_ids = {g.id for g in games}
+    merged = list(games)
     for rec in added_records:
         if rec.game.id not in existing_ids:
-            games = list(games) + [rec.game]
+            merged.append(rec.game)
             existing_ids.add(rec.game.id)
+    return merged
+
+
+async def render_poll_message(bot, chat_id, message_id, session, poll_id, games, priority_ids):
+    """Update custom poll message with current vote state."""
+    # Include user-added games (from allow_adding_options)
+    games = await _merge_added_games(session, poll_id, games)
 
     # Fetch all votes for this poll
     votes_stmt = select(PollVote).where(PollVote.poll_id == poll_id)
@@ -2981,8 +2999,6 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
 
         # Shuffle game order within group if enabled, otherwise sort by votes/starred
         if shuffle:
-            import random
-
             sorted_group = list(group)
             random.shuffle(sorted_group)
         else:
@@ -3127,8 +3143,9 @@ async def _handle_poll_category_vote(
         # Get session for vote limit
         session_obj = await session.get(Session, chat_id)
 
-        # Re-fetch games to ensure validity
+        # Re-fetch games to ensure validity (include user-added games)
         valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        valid_games = await _merge_added_games(session, poll_id, valid_games)
 
         # Use ALL valid games for grouping
         groups = group_games_by_complexity(valid_games)
@@ -3143,7 +3160,6 @@ async def _handle_poll_category_vote(
         vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
 
         # Calculate valid games count for auto-limit
-        # (valid_games is already fetched above)
         game_count = len(valid_games) if valid_games else 0
         valid_game_ids = {g.id for g in valid_games}
         valid_category_levels = set(groups.keys())
@@ -3190,15 +3206,7 @@ async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id:
             return
 
         valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-
-        # Include user-added games
-        added_stmt = select(PollAddedGame).where(PollAddedGame.poll_id == poll_id)
-        added_records = (await session.execute(added_stmt)).scalars().all()
-        existing_ids = {g.id for g in valid_games}
-        for rec in added_records:
-            if rec.game.id not in existing_ids:
-                valid_games = list(valid_games) + [rec.game]
-                existing_ids.add(rec.game.id)
+        valid_games = await _merge_added_games(session, poll_id, valid_games)
 
         # Use PollService for centralized winner calculation
         winners, scores, modifiers_log = await PollService.close_poll(
@@ -3256,6 +3264,13 @@ async def _handle_poll_add(query, context: ContextTypes.DEFAULT_TYPE, poll_id: s
         if not game_poll:
             with contextlib.suppress(telegram.error.BadRequest):
                 await query.answer("Poll not found")
+            return
+
+        # Guard: verify setting is enabled
+        session_obj = await session.get(Session, chat_id)
+        if not session_obj or not session_obj.allow_adding_options:
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("Adding games is not enabled for this poll.", show_alert=True)
             return
 
         # Get current valid games + already-added games
@@ -3320,7 +3335,7 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
     """Handle selecting a game to add to the poll."""
     query = update.callback_query
     parts = query.data.split(":")
-    if len(parts) < 3:
+    if len(parts) < 2:
         with contextlib.suppress(telegram.error.BadRequest):
             await query.answer("Invalid data")
         return
@@ -3333,6 +3348,11 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
         with contextlib.suppress(telegram.error.BadRequest):
             await query.answer()
             await query.message.delete()
+        return
+
+    if len(parts) < 3:
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer("Invalid data")
         return
 
     game_id = int(parts[2])
