@@ -66,7 +66,7 @@ def _find_best_split(games: list[Game], min_group_size: int = 2) -> int | None:
     return best_split[0]
 
 
-def split_games(games: list[Game], max_per_poll: int = 10) -> list[tuple[str, list[Game]]]:
+def split_games(games: list[Game], max_per_poll: int = 12) -> list[tuple[str, list[Game]]]:
     """
     Split games into logical groups using dynamic complexity gap analysis.
 

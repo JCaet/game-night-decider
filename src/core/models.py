@@ -72,7 +72,7 @@ class PollType:
     """Poll types for the session."""
 
     CUSTOM = 0  # Single interactive message with buttons
-    NATIVE = 1  # Standard Telegram polls (split if >10 games)
+    NATIVE = 1  # Standard Telegram polls (split if >12 games)
 
 
 class VoteLimit:
@@ -120,6 +120,9 @@ class Session(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     hide_voters: Mapped[bool] = mapped_column(Boolean, default=False)
     vote_limit: Mapped[int] = mapped_column(Integer, default=-1)  # VoteLimit.AUTO
+    shuffle_options: Mapped[bool] = mapped_column(Boolean, default=False)
+    hide_results: Mapped[bool] = mapped_column(Boolean, default=False)
+    allow_adding_options: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Relationships
     players: Mapped[list["SessionPlayer"]] = relationship(
@@ -155,6 +158,24 @@ class GameNightPoll(Base):
     votes: Mapped[list["PollVote"]] = relationship(
         back_populates="poll", cascade="all, delete-orphan"
     )
+
+
+class PollAddedGame(Base):
+    """Track games manually added to a poll by participants (allow_adding_options)."""
+
+    __tablename__ = "poll_added_games"
+    __table_args__ = (
+        UniqueConstraint("poll_id", "game_id", name="uq_poll_added_game"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    poll_id: Mapped[str] = mapped_column(ForeignKey("game_night_polls.poll_id"), index=True)
+    game_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("games.id"))
+    added_by_user_id: Mapped[int] = mapped_column(BigInteger)
+
+    # Relationships
+    poll: Mapped["GameNightPoll"] = relationship()
+    game: Mapped["Game"] = relationship(lazy="joined")
 
 
 class VoteType(str, PyEnum):

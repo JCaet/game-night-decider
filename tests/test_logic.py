@@ -22,7 +22,7 @@ def create_game(name: str, complexity: float) -> Game:
 
 
 def test_split_games_small_list():
-    """Small lists (<=10) should return a single 'Games' group."""
+    """Small lists (<=12) should return a single 'Games' group."""
     games = [
         create_game("Catan", 2.3),
         create_game("Carcassonne", 1.9),
@@ -31,6 +31,22 @@ def test_split_games_small_list():
     assert len(result) == 1
     assert result[0][0] == "Games"
     assert len(result[0][1]) == 2
+
+
+def test_split_games_default_limit_is_12():
+    """Default max_per_poll is 12 (API 9.1+)."""
+    # 11 games should fit in a single group with the new default
+    games = [create_game(f"Game {i}", 2.0 + i * 0.05) for i in range(11)]
+    result = split_games(games)
+    assert len(result) == 1
+    assert len(result[0][1]) == 11
+
+    # 13 games should split
+    games = [create_game(f"Game {i}", 2.0 + i * 0.05) for i in range(13)]
+    result = split_games(games)
+    total = sum(len(chunk) for _, chunk in result)
+    assert total == 13
+    assert len(result) >= 2
 
 
 def test_split_games_gap_based_split():
