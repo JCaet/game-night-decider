@@ -12,6 +12,7 @@ A Telegram bot that helps your group decide what board game to play on game nigh
 - **Poll Settings**: Choose between Custom (single-vote buttons) or Native (Telegram polls), toggle weighted voting, anonymous voting, and vote limits
 - **Weighted Voting**: Starred (🌟) games get a +0.5 vote boost per player who starred them
 - **Auto-Close Polls**: Polls close automatically once every player has voted
+- **Poll Pinning**: Poll messages are automatically pinned for visibility and unpinned when closed (requires bot to have "Pin Messages" admin permission)
 - **Guest Support**: Add guest players and assign games to them
 
 ## Commands

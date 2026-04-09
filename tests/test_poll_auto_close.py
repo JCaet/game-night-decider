@@ -87,6 +87,8 @@ async def test_poll_auto_close(mock_update, mock_context):
     mock_update.poll_answer.poll_id = poll_id
     mock_update.poll_answer.user.id = 111
     mock_update.poll_answer.user.first_name = "User1"
+    mock_update.poll_answer.user.last_name = None
+    mock_update.poll_answer.user.username = None
     mock_update.poll_answer.option_ids = [0]  # Voted for option 0
 
     # Prepare stop_poll mock (should NOT be called yet)
@@ -107,6 +109,8 @@ async def test_poll_auto_close(mock_update, mock_context):
     # 3. Player 2 Votes
     mock_update.poll_answer.user.id = 222
     mock_update.poll_answer.user.first_name = "User2"
+    mock_update.poll_answer.user.last_name = None
+    mock_update.poll_answer.user.username = None
     mock_update.poll_answer.option_ids = [0]
 
     # Mock stop_poll return value (needed for winner calculation)

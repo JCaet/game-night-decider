@@ -99,5 +99,9 @@ def mock_context():
     # Configure edit_message_text
     context.bot.edit_message_text = AsyncMock()
 
+    # Configure pin/unpin
+    context.bot.pin_chat_message = AsyncMock()
+    context.bot.unpin_chat_message = AsyncMock()
+
     context.args = []
     return context
