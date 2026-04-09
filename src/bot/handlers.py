@@ -2654,9 +2654,9 @@ async def create_custom_poll(
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                    "💡 *Tip:* Promote this bot to admin with"
-                    " 'Pin Messages' permission to auto-pin polls."
-                ),
+                "💡 *Tip:* Promote this bot to admin with"
+                " 'Pin Messages' permission to auto-pin polls."
+            ),
             parse_mode="Markdown",
         )
 
