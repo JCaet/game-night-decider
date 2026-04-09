@@ -14,6 +14,10 @@
 - New Session model fields: `shuffle_options`, `hide_results`, `allow_adding_options`.
 - 9 new tests covering all new settings, hide-results rendering, add-game flow, settings keyboard, and poll description.
 
+### Migration
+
+- **Existing databases** require migration: run `uv run python scripts/migrate_poll_settings.py` or restart the bot (auto-migration in `db.py` handles column additions; `create_all` handles the new `poll_added_games` table).
+
 ### Changed
 
 - Bumped `python-telegram-bot` minimum from `>=21.10` to `>=22.5`.
