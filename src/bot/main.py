@@ -29,6 +29,7 @@ from src.bot.handlers import (  # noqa: E402
     leave_lobby_callback,
     manage_collection,
     manage_collection_callback,
+    poll_add_select_callback,
     poll_settings_callback,
     receive_poll_answer,
     restart_night_callback,
@@ -38,8 +39,11 @@ from src.bot.handlers import (  # noqa: E402
     start_night,
     start_poll_callback,
     test_mode,
+    toggle_allow_adding_callback,
+    toggle_hide_results_callback,
     toggle_hide_voters_callback,
     toggle_poll_mode_callback,
+    toggle_shuffle_callback,
     toggle_weights_callback,
 )
 from src.core.db import init_db  # noqa: E402
@@ -92,6 +96,18 @@ def main():
         CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$")
     )
     app.add_handler(CallbackQueryHandler(cycle_vote_limit_callback, pattern=r"^cycle_vote_limit$"))
+    app.add_handler(CallbackQueryHandler(toggle_shuffle_callback, pattern=r"^toggle_shuffle$"))
+    app.add_handler(
+        CallbackQueryHandler(toggle_hide_results_callback, pattern=r"^toggle_hide_results$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(toggle_allow_adding_callback, pattern=r"^toggle_allow_adding$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_add:")
+    )
+    app.add_handler(CallbackQueryHandler(poll_add_select_callback, pattern=r"^poll_add_select:"))
+    app.add_handler(CallbackQueryHandler(poll_add_select_callback, pattern=r"^poll_add_cancel:"))
     app.add_handler(CallbackQueryHandler(manage_collection_callback, pattern="^manage:"))
     app.add_handler(PollAnswerHandler(receive_poll_answer))
 

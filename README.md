@@ -7,10 +7,17 @@ A Telegram bot that helps your group decide what board game to play on game nigh
 - **BGG Integration**: Syncs your collection from BoardGameGeek (with force-refresh option)
 - **Lobby System**: Create a lobby for players to join, with resume/restart if a night is already active
 - **Smart Filtering**: Only shows games that support the current player count
-- **Complexity Splitting**: Polls are split by game weight (Light/Medium/Heavy)
+- **Complexity Splitting**: Polls are split by game weight (Light/Medium/Heavy), up to 12 options per native poll
 - **Collection Management**: Three-state toggle per game (⬜ Included → 🌟 Starred → ❌ Excluded) plus custom max player overrides
-- **Poll Settings**: Choose between Custom (single-vote buttons) or Native (Telegram polls), toggle weighted voting, anonymous voting, and vote limits
+- **Two Poll Modes**: Custom (single interactive message with buttons) or Native (standard Telegram polls)
 - **Weighted Voting**: Starred (🌟) games get a +0.5 vote boost per player who starred them
+- **Category Voting**: Vote for a complexity level instead of a specific game — resolved to a random game at close
+- **Vote Limits**: Auto (scales with game count), fixed (3/5/7/10), or unlimited
+- **Anonymous Voting**: Hide voter names in custom poll results
+- **Shuffle Options**: Randomize option order to reduce positional bias (both poll modes)
+- **Hide Results**: Hide all vote counts and voter names until the poll is closed (both poll modes)
+- **Allow Suggestions**: Let players add games from their collection to the poll mid-vote (both poll modes)
+- **Poll Description**: Context metadata (player count, game count, active settings) shown in both poll types
 - **Auto-Close Polls**: Polls close automatically once every player has voted
 - **Poll Pinning**: Poll messages are automatically pinned for visibility and unpinned when closed (requires bot to have "Pin Messages" admin permission)
 - **Guest Support**: Add guest players and assign games to them

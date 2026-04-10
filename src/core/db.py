@@ -41,6 +41,9 @@ def _run_migrations(conn) -> None:  # type: ignore[no-untyped-def]
         "ALTER TABLE sessions ADD COLUMN message_id INTEGER",
         "ALTER TABLE sessions ADD COLUMN hide_voters BOOLEAN DEFAULT 0",
         "ALTER TABLE sessions ADD COLUMN vote_limit INTEGER DEFAULT -1",
+        "ALTER TABLE sessions ADD COLUMN shuffle_options BOOLEAN DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN hide_results BOOLEAN DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN allow_adding_options BOOLEAN DEFAULT 0",
         # poll_votes
         "ALTER TABLE poll_votes ADD COLUMN vote_type VARCHAR DEFAULT 'game'",
         "ALTER TABLE poll_votes ADD COLUMN game_id BIGINT",
