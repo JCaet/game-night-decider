@@ -3021,17 +3021,13 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
         current_row = []
         for g in sorted_group:
             count = vote_counts[g.id]
-            # Label: "⭐ Catan (2)" — hide count when hide_results is on
-            label = ""
-            if g.id in priority_ids:
-                label += "⭐ "
-            label += g.name
-
-            if count > 0 and not hide_results:
-                label += f" ({count})"
-
-            if len(label) > 30:
-                label = label[:27] + "..."
+            # Label: "⭐ Catan (2)" — reserve space for suffix so the count
+            # survives truncation on long names.
+            prefix = "⭐ " if g.id in priority_ids else ""
+            suffix = f" ({count})" if count > 0 and not hide_results else ""
+            max_name = 36 - len(prefix) - len(suffix)
+            name = g.name if len(g.name) <= max_name else g.name[: max_name - 1] + "…"
+            label = f"{prefix}{name}{suffix}"
             current_row.append(InlineKeyboardButton(label, callback_data=f"vote:{poll_id}:{g.id}"))
 
             if len(current_row) == 2:
