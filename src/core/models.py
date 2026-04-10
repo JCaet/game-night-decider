@@ -167,9 +167,7 @@ class PollAddedGame(Base):
     """Track games manually added to a poll by participants (allow_adding_options)."""
 
     __tablename__ = "poll_added_games"
-    __table_args__ = (
-        UniqueConstraint("poll_id", "game_id", name="uq_poll_added_game"),
-    )
+    __table_args__ = (UniqueConstraint("poll_id", "game_id", name="uq_poll_added_game"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     poll_id: Mapped[str] = mapped_column(ForeignKey("game_night_polls.poll_id"), index=True)
