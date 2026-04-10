@@ -103,9 +103,7 @@ def main():
     app.add_handler(
         CallbackQueryHandler(toggle_allow_adding_callback, pattern=r"^toggle_allow_adding$")
     )
-    app.add_handler(
-        CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_add:")
-    )
+    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_add:"))
     app.add_handler(CallbackQueryHandler(poll_add_select_callback, pattern=r"^poll_add_select:"))
     app.add_handler(CallbackQueryHandler(poll_add_select_callback, pattern=r"^poll_add_cancel:"))
     app.add_handler(CallbackQueryHandler(manage_collection_callback, pattern="^manage:"))

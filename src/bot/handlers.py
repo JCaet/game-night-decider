@@ -163,6 +163,20 @@ def _build_poll_description(player_count: int, game_count: int, session_obj) -> 
     return " · ".join(parts)
 
 
+def _poll_api_kwargs(session_obj, description: str) -> dict:
+    # Bot API 9.1/9.6 poll params that python-telegram-bot 22.x does not yet
+    # accept as native kwargs. Passed through via api_kwargs so they reach the
+    # Telegram HTTP layer unchanged. See issue tracker for the eventual swap
+    # back to native kwargs once PTB ships support.
+    return {
+        "allows_revoting": True,
+        "shuffle_options": session_obj.shuffle_options,
+        "hide_results_until_closes": session_obj.hide_results,
+        "allow_adding_options": session_obj.allow_adding_options,
+        "description": description,
+    }
+
+
 def build_player_names(players: Sequence[SessionPlayer]) -> list[str]:
     """Build disambiguated display names for a list of SessionPlayer objects."""
     users = [p.user for p in players]
@@ -1020,11 +1034,7 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             options=options,
             is_anonymous=False,
             allows_multiple_answers=True,
-            allows_revoting=True,
-            shuffle_options=session_obj.shuffle_options,
-            hide_results_until_closes=session_obj.hide_results,
-            allow_adding_options=session_obj.allow_adding_options,
-            description=poll_description,
+            api_kwargs=_poll_api_kwargs(session_obj, poll_description),
         )
 
         # Save poll to DB
@@ -1832,11 +1842,7 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             options=options,
             is_anonymous=False,
             allows_multiple_answers=True,
-            allows_revoting=True,
-            shuffle_options=session_obj.shuffle_options,
-            hide_results_until_closes=session_obj.hide_results,
-            allow_adding_options=session_obj.allow_adding_options,
-            description=poll_description,
+            api_kwargs=_poll_api_kwargs(session_obj, poll_description),
         )
 
         # Save poll to DB
@@ -2487,11 +2493,7 @@ def _build_settings_keyboard(
             )
         ],
         [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
-        [
-            InlineKeyboardButton(
-                f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle"
-            )
-        ],
+        [InlineKeyboardButton(f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle")],
         [
             InlineKeyboardButton(
                 f"Hide Results: {hide_results_icon}", callback_data="toggle_hide_results"
@@ -3011,9 +3013,7 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
         if level > 0:
             header_text = f"--- {level} ---" if not show_count else f"--- {level} ({cat_count}) ---"
         else:
-            header_text = (
-                "--- Unrated ---" if not show_count else f"--- Unrated ({cat_count}) ---"
-            )
+            header_text = "--- Unrated ---" if not show_count else f"--- Unrated ({cat_count}) ---"
         keyboard.append(
             [InlineKeyboardButton(header_text, callback_data=f"poll_random_vote:{poll_id}:{level}")]
         )
@@ -3316,9 +3316,7 @@ async def _handle_poll_add(query, context: ContextTypes.DEFAULT_TYPE, poll_id: s
             current_row = []
     if current_row:
         keyboard.append(current_row)
-    keyboard.append(
-        [InlineKeyboardButton("🔙 Cancel", callback_data=f"poll_add_cancel:{poll_id}")]
-    )
+    keyboard.append([InlineKeyboardButton("🔙 Cancel", callback_data=f"poll_add_cancel:{poll_id}")])
 
     with contextlib.suppress(telegram.error.BadRequest):
         await query.answer()
@@ -3347,7 +3345,7 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
         # Just delete the picker message
         with contextlib.suppress(telegram.error.BadRequest):
             await query.answer()
-            await query.message.delete()
+            await query.message.delete()  # type: ignore[attr-defined]
         return
 
     if len(parts) < 3:
@@ -3395,7 +3393,7 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
 
         # Delete the picker message
         with contextlib.suppress(telegram.error.BadRequest):
-            await query.message.delete()
+            await query.message.delete()  # type: ignore[attr-defined]
 
         # Refresh the poll
         valid_games, priority_ids = await get_session_valid_games(session, chat_id)
