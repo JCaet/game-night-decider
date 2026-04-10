@@ -2487,11 +2487,7 @@ def _build_settings_keyboard(
             )
         ],
         [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
-        [
-            InlineKeyboardButton(
-                f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle"
-            )
-        ],
+        [InlineKeyboardButton(f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle")],
         [
             InlineKeyboardButton(
                 f"Hide Results: {hide_results_icon}", callback_data="toggle_hide_results"
@@ -3011,9 +3007,7 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
         if level > 0:
             header_text = f"--- {level} ---" if not show_count else f"--- {level} ({cat_count}) ---"
         else:
-            header_text = (
-                "--- Unrated ---" if not show_count else f"--- Unrated ({cat_count}) ---"
-            )
+            header_text = "--- Unrated ---" if not show_count else f"--- Unrated ({cat_count}) ---"
         keyboard.append(
             [InlineKeyboardButton(header_text, callback_data=f"poll_random_vote:{poll_id}:{level}")]
         )
@@ -3021,17 +3015,13 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
         current_row = []
         for g in sorted_group:
             count = vote_counts[g.id]
-            # Label: "⭐ Catan (2)" — hide count when hide_results is on
-            label = ""
-            if g.id in priority_ids:
-                label += "⭐ "
-            label += g.name
-
-            if count > 0 and not hide_results:
-                label += f" ({count})"
-
-            if len(label) > 30:
-                label = label[:27] + "..."
+            # Label: "⭐ Catan (2)" — reserve space for suffix so the count
+            # survives truncation on long names.
+            prefix = "⭐ " if g.id in priority_ids else ""
+            suffix = f" ({count})" if count > 0 and not hide_results else ""
+            max_name = 36 - len(prefix) - len(suffix)
+            name = g.name if len(g.name) <= max_name else g.name[: max_name - 1] + "…"
+            label = f"{prefix}{name}{suffix}"
             current_row.append(InlineKeyboardButton(label, callback_data=f"vote:{poll_id}:{g.id}"))
 
             if len(current_row) == 2:
@@ -3316,9 +3306,7 @@ async def _handle_poll_add(query, context: ContextTypes.DEFAULT_TYPE, poll_id: s
             current_row = []
     if current_row:
         keyboard.append(current_row)
-    keyboard.append(
-        [InlineKeyboardButton("🔙 Cancel", callback_data=f"poll_add_cancel:{poll_id}")]
-    )
+    keyboard.append([InlineKeyboardButton("🔙 Cancel", callback_data=f"poll_add_cancel:{poll_id}")])
 
     with contextlib.suppress(telegram.error.BadRequest):
         await query.answer()
