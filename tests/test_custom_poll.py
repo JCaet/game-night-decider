@@ -1591,8 +1591,12 @@ async def test_custom_poll_add_game_duplicate_prevented(mock_update, mock_contex
 
         g1 = Game(id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0)
         g_extra = Game(
-            id=extra_game_id, name="Extra", min_players=1,
-            max_players=2, playing_time=30, complexity=1.0,
+            id=extra_game_id,
+            name="Extra",
+            min_players=1,
+            max_players=2,
+            playing_time=30,
+            complexity=1.0,
         )
         session.add_all([g1, g_extra])
         await session.flush()
@@ -1671,8 +1675,11 @@ async def test_custom_poll_hide_results_hides_category_votes(mock_update, mock_c
 
         # Add category votes
         v1 = PollVote(
-            poll_id=poll_id, user_id=111, vote_type=VoteType.CATEGORY,
-            category_level=3, user_name="User1",
+            poll_id=poll_id,
+            user_id=111,
+            vote_type=VoteType.CATEGORY,
+            category_level=3,
+            user_name="User1",
         )
         session.add(v1)
         await session.commit()
@@ -1836,8 +1843,12 @@ async def test_poll_added_games_cascade_deleted(mock_update, mock_context):
 
         g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.0)
         g2 = Game(
-            id=99, name="Added", min_players=2, max_players=4,
-            playing_time=60, complexity=1.5,
+            id=99,
+            name="Added",
+            min_players=2,
+            max_players=4,
+            playing_time=60,
+            complexity=1.5,
         )
         session.add_all([g1, g2])
         await session.flush()

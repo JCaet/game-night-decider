@@ -3335,7 +3335,7 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
         # Just delete the picker message
         with contextlib.suppress(telegram.error.BadRequest):
             await query.answer()
-            await query.message.delete()
+            await query.message.delete()  # type: ignore[attr-defined]
         return
 
     if len(parts) < 3:
@@ -3383,7 +3383,7 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
 
         # Delete the picker message
         with contextlib.suppress(telegram.error.BadRequest):
-            await query.message.delete()
+            await query.message.delete()  # type: ignore[attr-defined]
 
         # Refresh the poll
         valid_games, priority_ids = await get_session_valid_games(session, chat_id)
