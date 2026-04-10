@@ -163,6 +163,20 @@ def _build_poll_description(player_count: int, game_count: int, session_obj) -> 
     return " · ".join(parts)
 
 
+def _poll_api_kwargs(session_obj, description: str) -> dict:
+    # Bot API 9.1/9.6 poll params that python-telegram-bot 22.x does not yet
+    # accept as native kwargs. Passed through via api_kwargs so they reach the
+    # Telegram HTTP layer unchanged. See issue tracker for the eventual swap
+    # back to native kwargs once PTB ships support.
+    return {
+        "allows_revoting": True,
+        "shuffle_options": session_obj.shuffle_options,
+        "hide_results_until_closes": session_obj.hide_results,
+        "allow_adding_options": session_obj.allow_adding_options,
+        "description": description,
+    }
+
+
 def build_player_names(players: Sequence[SessionPlayer]) -> list[str]:
     """Build disambiguated display names for a list of SessionPlayer objects."""
     users = [p.user for p in players]
@@ -1020,11 +1034,7 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             options=options,
             is_anonymous=False,
             allows_multiple_answers=True,
-            allows_revoting=True,
-            shuffle_options=session_obj.shuffle_options,
-            hide_results_until_closes=session_obj.hide_results,
-            allow_adding_options=session_obj.allow_adding_options,
-            description=poll_description,
+            api_kwargs=_poll_api_kwargs(session_obj, poll_description),
         )
 
         # Save poll to DB
@@ -1832,11 +1842,7 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             options=options,
             is_anonymous=False,
             allows_multiple_answers=True,
-            allows_revoting=True,
-            shuffle_options=session_obj.shuffle_options,
-            hide_results_until_closes=session_obj.hide_results,
-            allow_adding_options=session_obj.allow_adding_options,
-            description=poll_description,
+            api_kwargs=_poll_api_kwargs(session_obj, poll_description),
         )
 
         # Save poll to DB

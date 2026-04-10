@@ -1751,12 +1751,15 @@ async def test_native_poll_passes_new_api_parameters(mock_update, mock_context):
     mock_context.bot.send_poll.assert_called()
     call_kwargs = mock_context.bot.send_poll.call_args.kwargs
 
-    assert call_kwargs["allows_revoting"] is True
-    assert call_kwargs["shuffle_options"] is True
-    assert call_kwargs["hide_results_until_closes"] is True
-    assert call_kwargs["allow_adding_options"] is True
-    assert "description" in call_kwargs
-    assert "2 players" in call_kwargs["description"]
+    # Bot API 9.1/9.6 poll params are passed via api_kwargs because
+    # python-telegram-bot 22.x does not yet accept them as native kwargs.
+    api_kwargs = call_kwargs["api_kwargs"]
+    assert api_kwargs["allows_revoting"] is True
+    assert api_kwargs["shuffle_options"] is True
+    assert api_kwargs["hide_results_until_closes"] is True
+    assert api_kwargs["allow_adding_options"] is True
+    assert "description" in api_kwargs
+    assert "2 players" in api_kwargs["description"]
 
 
 # ============================================================================
