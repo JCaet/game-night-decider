@@ -46,7 +46,6 @@ from src.bot.handlers import (  # noqa: E402
     toggle_shuffle_callback,
     toggle_weights_callback,
 )
-from src.core.db import init_db  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -108,13 +107,6 @@ def main():
     app.add_handler(CallbackQueryHandler(poll_add_select_callback, pattern=r"^poll_add_cancel:"))
     app.add_handler(CallbackQueryHandler(manage_collection_callback, pattern="^manage:"))
     app.add_handler(PollAnswerHandler(receive_poll_answer))
-
-    # Init DB on startup
-    # python-telegram-bot's Application has post_init
-    async def post_init(application):
-        await init_db()
-
-    app.post_init = post_init
 
     logger.info("Bot is polling...")
     app.run_polling()
