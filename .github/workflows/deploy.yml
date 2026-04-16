@@ -7,10 +7,18 @@ on:
         description: 'Sync GitHub secret values to Secret Manager before deploying'
         type: boolean
         default: false
-  workflow_run:
-    workflows: ["Release"]
-    types:
-      - completed
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to deploy'
+        type: string
+        required: false
+        default: ''
+      sync_secrets:
+        description: 'Sync GitHub secret values to Secret Manager before deploying'
+        type: boolean
+        required: false
+        default: false
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -21,7 +29,7 @@ jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' }}
     permissions:
       contents: 'read'
       id-token: 'write'
@@ -29,6 +37,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Google Auth
         id: auth
@@ -50,8 +60,10 @@ jobs:
 
       - name: Build and Push Container
         run: |
-          docker build -t us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$SERVICE_NAME:${{ github.sha }} .
-          docker push us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$SERVICE_NAME:${{ github.sha }}
+          IMAGE_TAG=${{ inputs.ref || github.sha }}
+          # Sanitize IMAGE_TAG (replace / with -) if it's a branch ref, but here it's usually a tag v* or a SHA
+          docker build -t us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$SERVICE_NAME:$IMAGE_TAG .
+          docker push us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$SERVICE_NAME:$IMAGE_TAG
 
       - name: Run Database Migrations
         env:
@@ -59,7 +71,7 @@ jobs:
         run: uv sync --frozen && uv run alembic upgrade head
 
       - name: Sync secrets to Secret Manager
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sync_secrets }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.sync_secrets) || (github.event_name == 'workflow_call' && inputs.sync_secrets) }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
@@ -88,7 +100,7 @@ jobs:
         with:
           service: ${{ env.SERVICE_NAME }}
           region: ${{ env.REGION }}
-          image: us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/cloud-run-source-deploy/${{ env.SERVICE_NAME }}:${{ github.sha }}
+          image: us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/cloud-run-source-deploy/${{ env.SERVICE_NAME }}:${{ inputs.ref || github.sha }}
           env_vars: |
             WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
           secrets: |
