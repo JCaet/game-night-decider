@@ -7,6 +7,10 @@ on:
         description: 'Sync GitHub secret values to Secret Manager before deploying'
         type: boolean
         default: false
+      sync_bot_config:
+        description: 'Sync Telegram bot configuration after deploying'
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -19,6 +23,11 @@ on:
         type: boolean
         required: false
         default: false
+      sync_bot_config:
+        description: 'Sync Telegram bot configuration after deploying'
+        type: boolean
+        required: false
+        default: true
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -125,6 +134,7 @@ jobs:
           done
 
       - name: Sync Bot Configuration
+        if: ${{ inputs.sync_bot_config }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: uv run scripts/sync_bot_config.py
