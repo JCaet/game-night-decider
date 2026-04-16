@@ -46,7 +46,6 @@ from src.bot.handlers import (  # noqa: E402
     toggle_shuffle_callback,
     toggle_weights_callback,
 )
-from src.core.db import init_db  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -109,15 +108,23 @@ def main():
     app.add_handler(CallbackQueryHandler(manage_collection_callback, pattern="^manage:"))
     app.add_handler(PollAnswerHandler(receive_poll_answer))
 
-    # Init DB on startup
-    # python-telegram-bot's Application has post_init
-    async def post_init(application):
-        await init_db()
-
-    app.post_init = post_init
-
-    logger.info("Bot is polling...")
-    app.run_polling()
+    if webhook_url := os.getenv("WEBHOOK_URL"):
+        port = int(os.getenv("PORT", "8080"))
+        webhook_secret = os.getenv("WEBHOOK_SECRET")
+        if not webhook_secret:
+            logger.error("WEBHOOK_SECRET is required when running in webhook mode")
+            sys.exit(1)
+        logger.info(f"Starting webhook on port {port}...")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path="telegram",
+            webhook_url=f"{webhook_url}/telegram",
+            secret_token=webhook_secret,
+        )
+    else:
+        logger.info("Bot is polling...")
+        app.run_polling()
 
 
 if __name__ == "__main__":
