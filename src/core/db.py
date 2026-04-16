@@ -1,6 +1,7 @@
 import logging
 import os
 from collections.abc import AsyncGenerator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -12,9 +13,23 @@ logger = logging.getLogger(__name__)
 def resolve_database_url(url: str | None = None) -> str:
     raw = url or os.getenv("DATABASE_URL", "sqlite+aiosqlite:///game_night.db")
     if raw.startswith("postgres://"):
-        return raw.replace("postgres://", "postgresql+asyncpg://", 1)
-    if raw.startswith("postgresql://") and "asyncpg" not in raw and "+" not in raw.split("://")[0]:
-        return raw.replace("postgresql://", "postgresql+asyncpg://", 1)
+        raw = raw.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif raw.startswith("postgresql://") and "asyncpg" not in raw and "+" not in raw.split("://")[0]:
+        raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
+    # Rewrite libpq-only query params that asyncpg doesn't understand, so
+    # Neon-style URLs copied from their dashboard work unchanged:
+    #   - sslmode=X -> ssl=X (same values accepted)
+    #   - channel_binding=X: dropped; no asyncpg equivalent, TLS still enforced
+    #     by ssl=require
+    if "+asyncpg" in raw:
+        parts = urlsplit(raw)
+        if parts.query:
+            params = [
+                ("ssl", v) if k == "sslmode" else (k, v)
+                for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                if k != "channel_binding"
+            ]
+            raw = urlunsplit(parts._replace(query=urlencode(params)))
     return raw
 
 
