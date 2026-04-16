@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency: release
     outputs:
-      released: ${{ steps.semantic.outputs.released }}
+      released: ${{ steps.detect.outputs.released }}
       version: ${{ steps.semantic.outputs.version }}
 
     steps:
@@ -45,6 +45,15 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: semantic-release version --changelog
+
+      - name: Detect release
+        id: detect
+        run: |
+          if git tag --points-at HEAD | grep -q '^v[0-9]'; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
 
   deploy:
     needs: release
