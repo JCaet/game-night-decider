@@ -112,13 +112,14 @@ def main():
         port = int(os.getenv("PORT", "8080"))
         webhook_secret = os.getenv("WEBHOOK_SECRET")
         if not webhook_secret:
-            logger.warning("WEBHOOK_SECRET not set - webhook requests will not be verified!")
+            logger.error("WEBHOOK_SECRET is required when running in webhook mode")
+            sys.exit(1)
         logger.info(f"Starting webhook on port {port}...")
         app.run_webhook(
             listen="0.0.0.0",
             port=port,
-            url_path=token,
-            webhook_url=f"{webhook_url}/{token}",
+            url_path="telegram",
+            webhook_url=f"{webhook_url}/telegram",
             secret_token=webhook_secret,
         )
     else:
