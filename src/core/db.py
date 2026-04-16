@@ -37,7 +37,14 @@ def resolve_database_url(url: str | None = None) -> str:
 
 DATABASE_URL = resolve_database_url()
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_pre_ping=True,  # Check connection health before using it
+    pool_recycle=300,  # Recycle connections every 5 minutes
+    pool_size=10,  # Allow up to 10 concurrent connections
+    max_overflow=20,  # Allow up to 20 additional connections if pool is full
+)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

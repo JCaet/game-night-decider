@@ -366,7 +366,7 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 import asyncio
 
-                for game_id in games_needing_complexity:
+                for i, game_id in enumerate(games_needing_complexity):
                     try:
                         details = await bgg.get_game_details(game_id)
                         if details and details.complexity and details.complexity > 0:
@@ -374,6 +374,11 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if game_obj:
                                 game_obj.complexity = details.complexity
                                 complexity_updated += 1
+                        
+                        # Commit every 10 games to avoid long transactions
+                        if (i + 1) % 10 == 0:
+                            await session.commit()
+                            
                         await asyncio.sleep(0.5)  # Rate limit
                     except Exception as e:
                         logger.warning(f"Failed to fetch complexity for game {game_id}: {e}")
