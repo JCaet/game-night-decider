@@ -29,6 +29,7 @@ bot = "src.bot.main:main"
 version_toml = ["pyproject.toml:project.version"]
 branch = "main"
 upload_to_release = true
+commit_message = "{version} [skip ci]"
 
 [tool.semantic_release.changelog]
 exclude_commit_patterns = []

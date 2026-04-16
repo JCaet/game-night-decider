@@ -44,3 +44,14 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: semantic-release version --changelog
+
+  deploy:
+    needs: release
+    if: |
+      always() &&
+      needs.release.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || needs.release.outputs.released == 'true')
+    uses: ./.github/workflows/deploy.yml
+    with:
+      ref: ${{ needs.release.outputs.released == 'true' && format('v{0}', needs.release.outputs.version) || '' }}
+    secrets: inherit
