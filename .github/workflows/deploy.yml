@@ -81,15 +81,8 @@ jobs:
           sync_secret() {
             local name="$1"
             local value="$2"
-            local prev
-            prev=$(gcloud secrets versions list "$name" --project="$PROJECT_ID" \
-              --filter="state=ENABLED" --format="value(name)" --sort-by="~createTime")
             printf '%s' "$value" | gcloud secrets versions add "$name" \
               --project="$PROJECT_ID" --data-file=-
-            for v in $prev; do
-              gcloud secrets versions destroy "$v" --secret="$name" \
-                --project="$PROJECT_ID" --quiet || true
-            done
           }
           sync_secret gnd-telegram-token "$TELEGRAM_BOT_TOKEN"
           sync_secret gnd-webhook-secret "$WEBHOOK_SECRET"
