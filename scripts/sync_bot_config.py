@@ -62,7 +62,8 @@ BOT_DESCRIPTION: str | None = (
     "• 🗳️ **Smart Voting:** I'll find games that fit your player count and generate a poll.\n"
     "• 👥 **Fair Play:** Filters games based on who is actually playing.\n\n"
     "👇 **Get Started:**\n"
-    "Add me to your group chat and use /gamenight to begin!"
+    "Add me to your group chat and use /gamenight to begin!\n\n"
+    "Powered by BoardGameGeek"
 )
 
 # Bot short description - shown on the bot's profile page (max 120 chars)

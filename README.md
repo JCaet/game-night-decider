@@ -94,6 +94,10 @@ uv run ruff check .
 uv run mypy .
 ```
 
+## Attribution
+
+Game data is sourced from [BoardGameGeek](https://boardgamegeek.com/) via their [XML API](https://boardgamegeek.com/wiki/page/BGG_XML_API2). Usage is subject to BGG's [API terms of use](https://boardgamegeek.com/xmlapi/termsofuse). "BoardGameGeek" is a trademark of BoardGameGeek, LLC.
+
 ## License
 
 MIT
