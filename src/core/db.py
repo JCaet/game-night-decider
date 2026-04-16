@@ -14,7 +14,9 @@ def resolve_database_url(url: str | None = None) -> str:
     raw = url or os.getenv("DATABASE_URL", "sqlite+aiosqlite:///game_night.db")
     if raw.startswith("postgres://"):
         raw = raw.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif raw.startswith("postgresql://") and "asyncpg" not in raw and "+" not in raw.split("://")[0]:
+    elif (
+        raw.startswith("postgresql://") and "asyncpg" not in raw and "+" not in raw.split("://")[0]
+    ):
         raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
     # Rewrite libpq-only query params that asyncpg doesn't understand, so
     # Neon-style URLs copied from their dashboard work unchanged:
