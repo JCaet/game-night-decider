@@ -1,6 +1,6 @@
 [project]
 name = "game-night-decider"
-version = "0.1.0"
+version = "1.0.1"
 description = "Telegram bot to decide what to play on game night"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,11 +13,13 @@ dependencies = [
     "lxml>=6.0.2",
     "python-dotenv>=1.2.1",
     "python-telegram-bot[job-queue]>=22.5",
+    "tornado>=6.5.4",
     "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30.0",
     "aiosqlite>=0.20.0",
     "pydantic>=2.10.3",
     "pydantic-settings>=2.7.0",
+    "alembic>=1.18.4",
 ]
 
 [project.scripts]
@@ -27,6 +29,7 @@ bot = "src.bot.main:main"
 version_toml = ["pyproject.toml:project.version"]
 branch = "main"
 upload_to_release = true
+commit_message = "{version} [skip ci]"
 
 [tool.semantic_release.changelog]
 exclude_commit_patterns = []
@@ -71,7 +74,7 @@ mypy_path = "src"
 dev = [
     "mypy>=1.13.0",
     "pre-commit>=4.0.1",
-    "pytest>=8.3.4",
+    "pytest>=9.0.3",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
     "ruff>=0.8.2",
