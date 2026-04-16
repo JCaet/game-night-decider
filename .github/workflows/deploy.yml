@@ -61,7 +61,6 @@ jobs:
       - name: Build and Push Container
         run: |
           IMAGE_TAG=${{ inputs.ref || github.sha }}
-          # Sanitize IMAGE_TAG (replace / with -) if it's a branch ref, but here it's usually a tag v* or a SHA
           docker build -t us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$SERVICE_NAME:$IMAGE_TAG .
           docker push us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$SERVICE_NAME:$IMAGE_TAG
 
@@ -76,6 +75,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BGG_API_TOKEN: ${{ secrets.BGG_API_TOKEN }}
         run: |
           set -euo pipefail
           sync_secret() {
@@ -94,6 +94,7 @@ jobs:
           sync_secret gnd-telegram-token "$TELEGRAM_BOT_TOKEN"
           sync_secret gnd-webhook-secret "$WEBHOOK_SECRET"
           sync_secret gnd-database-url "$DATABASE_URL"
+          sync_secret gnd-bgg-api-token "$BGG_API_TOKEN"
 
       - name: Deploy to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v3
@@ -107,6 +108,7 @@ jobs:
             TELEGRAM_BOT_TOKEN=gnd-telegram-token:latest
             WEBHOOK_SECRET=gnd-webhook-secret:latest
             DATABASE_URL=gnd-database-url:latest
+            BGG_API_TOKEN=gnd-bgg-api-token:latest
           flags: |
             --cpu=1
             --memory=512Mi
