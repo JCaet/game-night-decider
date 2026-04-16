@@ -13,16 +13,13 @@ BGG_API_TOKEN = os.getenv("BGG_API_TOKEN")
 
 
 class BGGClient:
+    # BGG XML API2 — terms of use: https://boardgamegeek.com/xmlapi/termsofuse
     BASE_URL = "https://boardgamegeek.com/xmlapi2"
+    USER_AGENT = "GameNightDeciderBot (+https://github.com/JCaet/game-night-decider)"
 
     def _get_headers(self) -> dict:
         """Get headers for BGG API requests."""
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
+        headers = {"User-Agent": self.USER_AGENT}
         if BGG_API_TOKEN:
             headers["Authorization"] = f"Bearer {BGG_API_TOKEN}"
         return headers

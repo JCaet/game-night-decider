@@ -209,7 +209,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /addgame `<name>` - Search BGG and add game\n"
         "• /manage - Toggle game availability (⬜→🌟→❌)\n"
         "• /help - Show all available commands\n\n"
-        "_Add me to a group chat for the best experience!_"
+        "_Add me to a group chat for the best experience!_\n\n"
+        "Powered by BoardGameGeek"
     )
 
     if os.path.exists(banner_path):
@@ -243,7 +244,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• **Allow Suggestions**: Let players add games mid-poll\n\n"
         "**Other:**\n"
         "• /help - Show this message\n"
-        "• /start - Show welcome message"
+        "• /start - Show welcome message\n\n"
+        "Powered by BoardGameGeek"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -1217,6 +1219,7 @@ async def add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Extract data for reply before session closes
             g_name = game.name
+            g_id = game.id
             g_min = game.min_players
             g_max = game.max_players
             g_comp = game.complexity
@@ -1227,8 +1230,11 @@ async def add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 **Details from BGG:**\n"
             f"• Players: {g_min}-{g_max}\n"
             f"• Complexity: {g_comp:.2f}/5\n"
-            f"• Play time: {g_time} min",
+            f"• Play time: {g_time} min\n\n"
+            f"[View on BoardGameGeek](https://boardgamegeek.com/boardgame/{g_id})\n"
+            "Powered by BoardGameGeek",
             parse_mode="Markdown",
+            disable_web_page_preview=True,
         )
 
     except Exception as e:
@@ -2229,11 +2235,13 @@ async def _render_detail_view(query: CallbackQuery, user_id: int, game_id: int) 
     )
     await query.edit_message_text(
         f"⚙️ **{game.name}**\n"
-        f"Players: {game.min_players}–{game.max_players} (BGG default)\n"
+        f"Players: {game.min_players}–{game.max_players} "
+        f"([BGG default](https://boardgamegeek.com/boardgame/{game.id}))\n"
         f"{override_text}\n\n"
         "Set a custom max player count below:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
+        disable_web_page_preview=True,
     )
 
 
