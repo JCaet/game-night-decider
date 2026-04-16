@@ -1,6 +1,6 @@
 [project]
 name = "game-night-decider"
-version = "1.0.2"
+version = "1.0.3"
 description = "Telegram bot to decide what to play on game night"
 readme = "README.md"
 requires-python = ">=3.12"
