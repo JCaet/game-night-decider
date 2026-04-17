@@ -7,8 +7,10 @@ from collections.abc import Sequence
 
 import telegram
 from sqlalchemy import delete, func, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from src.core import db
@@ -263,6 +265,15 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     force_update = len(context.args) > 1 and context.args[1].lower() == "force"
     telegram_id = update.effective_user.id
 
+    # Acknowledge immediately — DB write + BGG fetch take several seconds on
+    # Cloud Run + external Postgres, and the user needs to see we're working.
+    with contextlib.suppress(Exception):
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    mode_text = " (force update)" if force_update else ""
+    status_msg = await update.message.reply_text(
+        f"⏳ Syncing BGG collection for {bgg_username}{mode_text}, please wait..."
+    )
+
     async with db.AsyncSessionLocal() as session:
         # Check if user exists
         stmt = select(User).where(User.telegram_id == telegram_id)
@@ -279,12 +290,6 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user.telegram_last_name = tg_user.last_name
         user.telegram_username = tg_user.username
         await session.commit()
-
-    # Show initial feedback and keep reference to message to update it
-    mode_text = " (force update)" if force_update else ""
-    status_msg = await update.message.reply_text(
-        f"⏳ Linked BGG account: {bgg_username}. Syncing collection{mode_text}..."
-    )
 
     try:
         bgg = BGGClient()
@@ -361,13 +366,14 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Update status message instead of sending new one
                 with contextlib.suppress(Exception):
                     await status_msg.edit_text(
-                        f"⏳ Linked BGG account: {bgg_username}\n"
-                        f"• Fetching computed complexity for {len(games_needing_complexity)} "
-                        "games..."
+                        f"⏳ Syncing BGG collection for {bgg_username}\n"
+                        f"• Fetching complexity: 0/{len(games_needing_complexity)}..."
                     )
 
                 import asyncio
 
+                total_complexity = len(games_needing_complexity)
+                progress_every = 20
                 for i, game_id in enumerate(games_needing_complexity):
                     try:
                         details = await bgg.get_game_details(game_id)
@@ -380,6 +386,14 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         # Commit every 10 games to avoid long transactions
                         if (i + 1) % 10 == 0:
                             await session.commit()
+
+                        # Throttled progress update so the user knows it's alive
+                        if (i + 1) % progress_every == 0 and (i + 1) < total_complexity:
+                            with contextlib.suppress(Exception):
+                                await status_msg.edit_text(
+                                    f"⏳ Syncing BGG collection for {bgg_username}\n"
+                                    f"• Fetching complexity: {i + 1}/{total_complexity}..."
+                                )
 
                         await asyncio.sleep(0.5)  # Rate limit
                     except Exception as e:
@@ -400,7 +414,7 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Update status for expansion sync
             with contextlib.suppress(Exception):
                 await status_msg.edit_text(
-                    f"⏳ Linked BGG account: {bgg_username}\n• Syncing expansions..."
+                    f"⏳ Syncing BGG collection for {bgg_username}\n• Syncing expansions..."
                 )
 
             expansions_data = await bgg.fetch_expansions(bgg_username)
@@ -517,7 +531,7 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 exp_line += f" ({player_count_updates} player count updates)"
             summary_lines.append(exp_line)
 
-        final_message = "\n".join(summary_lines)
+        final_message = "\n".join(summary_lines) + "\n\nPowered by BoardGameGeek"
 
         # Try to edit the status message, fallback to reply
         try:
@@ -561,6 +575,9 @@ async def _close_existing_polls(session, context, chat_id, reason="Poll Closed")
 async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start a lobby."""
     chat_id = update.effective_chat.id
+
+    with contextlib.suppress(Exception):
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
     async with db.AsyncSessionLocal() as session:
         stmt = select(Session).where(Session.chat_id == chat_id)
@@ -935,6 +952,9 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate polls based on lobby."""
     chat_id = update.effective_chat.id
 
+    with contextlib.suppress(Exception):
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
     async with db.AsyncSessionLocal() as session:
         # Get Players
         stmt = select(SessionPlayer).where(SessionPlayer.session_id == chat_id)
@@ -1079,6 +1099,9 @@ async def add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     telegram_id = update.effective_user.id
+
+    with contextlib.suppress(Exception):
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
     # If only name provided (1-2 args), search BGG
     # Name can be multi-word like "Ticket to Ride", so we join if len > 1 but no numeric args
@@ -2137,14 +2160,17 @@ async def calculate_winner_scores(poll_data, chat_id: int, session, is_weighted:
 GAMES_PER_PAGE = 8
 
 
-async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's collection with toggle buttons for availability (sent via DM)."""
-    user_id = update.effective_user.id
-    user_name = update.effective_user.first_name
-    chat_type = update.effective_chat.type
+MANAGE_HEADER = (
+    "📚 **Your Collection** ({count} games)\n"
+    "Tap a game to cycle its state:\n"
+    "⬜ Included → 🌟 Starred → ❌ Excluded\n"
+    "Tap ⚙️ to set custom max players."
+)
 
+
+async def _load_manage_cache(user_id: int) -> list[tuple[Collection, Game]]:
+    """Fetch the (Collection, Game) list for a user, ordered by game name."""
     async with db.AsyncSessionLocal() as session:
-        # Fetch user's collection with game details
         stmt = (
             select(Collection, Game)
             .join(Game)
@@ -2152,8 +2178,42 @@ async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
             .order_by(Game.name)
         )
         results = (await session.execute(stmt)).all()
+    return [(col, game) for col, game in results]
 
-    if not results:
+
+async def _get_manage_cache(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> list[tuple[Collection, Game]]:
+    """Return the cached collection, reloading from DB if missing (e.g., cold start)."""
+    cache = context.user_data.get("manage_cache")
+    if cache is None:
+        cache = await _load_manage_cache(user_id)
+        context.user_data["manage_cache"] = cache
+    return cache
+
+
+def _find_cache_entry(
+    cache: list[tuple[Collection, Game]], game_id: int
+) -> tuple[Collection, Game] | None:
+    for col, game in cache:
+        if game.id == game_id:
+            return col, game
+    return None
+
+
+async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's collection with toggle buttons for availability (sent via DM)."""
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
+    chat_type = update.effective_chat.type
+
+    with contextlib.suppress(Exception):
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+
+    cache = await _load_manage_cache(user_id)
+
+    if not cache:
+        context.user_data.pop("manage_cache", None)
         await update.message.reply_text(
             "Your collection is empty!\n\n"
             "Use /setbgg <username> to sync from BGG, or /addgame <name> to add games."
@@ -2169,15 +2229,13 @@ async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_id=old_manage_msg_id,
             )
 
-    # Build keyboard with first page
-    keyboard, total_pages = _build_manage_keyboard(list(results), page=0)
+    # Cache the (col, game) pairs so button callbacks can rebuild the keyboard
+    # without re-fetching the whole collection on every click.
+    # expire_on_commit=False means detached ORM objects are safe to read/mutate.
+    context.user_data["manage_cache"] = cache
 
-    collection_message = (
-        f"📚 **Your Collection** ({len(results)} games)\n"
-        "Tap a game to cycle its state:\n"
-        "⬜ Included → 🌟 Starred → ❌ Excluded\n"
-        "Tap ⚙️ to set custom max players."
-    )
+    keyboard, _total_pages = _build_manage_keyboard(cache, page=0)
+    collection_message = MANAGE_HEADER.format(count=len(cache))
 
     # If in a group chat, send via DM and post playful message in group
     if chat_type in ("group", "supergroup"):
@@ -2214,19 +2272,19 @@ async def manage_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["manage_message_id"] = msg.message_id
 
 
-async def _render_detail_view(query: CallbackQuery, user_id: int, game_id: int) -> None:
+async def _render_detail_view(
+    query: CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    game_id: int,
+) -> None:
     """Render the per-game detail view with player count stepper."""
-    async with db.AsyncSessionLocal() as session:
-        stmt = (
-            select(Collection, Game)
-            .join(Game)
-            .where(Collection.user_id == user_id, Collection.game_id == game_id)
-        )
-        result = (await session.execute(stmt)).one_or_none()
-    if not result:
+    cache = await _get_manage_cache(context, user_id)
+    entry = _find_cache_entry(cache, game_id)
+    if not entry:
         await query.edit_message_text("Game not found in your collection.")
         return
-    col, game = result
+    col, game = entry
     keyboard = _build_detail_keyboard(col, game)
     override_text = (
         f"Override: **{col.effective_max_players}** players (manual)"
@@ -2246,12 +2304,16 @@ async def _render_detail_view(query: CallbackQuery, user_id: int, game_id: int) 
 
 
 async def manage_collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle manage collection button clicks."""
+    """Handle manage collection button clicks.
+
+    Uses an in-memory cache (context.user_data["manage_cache"]) so each click
+    needs only one single-row UPDATE — no re-fetching the whole collection.
+    """
     query = update.callback_query
     with contextlib.suppress(telegram.error.BadRequest):
         await query.answer()
 
-    data = query.data  # "manage:<action>:<game_id>[:<extra>]"
+    data = query.data  # "manage:<action>[:<arg>[:<arg>]]"
     parts = data.split(":")
     action = parts[1]
     user_id = query.from_user.id
@@ -2266,98 +2328,96 @@ async def manage_collection_callback(update: Update, context: ContextTypes.DEFAU
             )
         return
 
+    # --- No-op (e.g., page indicator tap) ---
+    if action == "noop":
+        return
+
     # --- Close the collection manager ---
     if action == "close":
         context.user_data.pop("manage_message_id", None)
+        context.user_data.pop("manage_cache", None)
         with contextlib.suppress(Exception):
             await query.delete_message()
         return
+
+    cache = await _get_manage_cache(context, user_id)
 
     # --- Set max players override ---
     if action == "setmax":
         game_id = int(parts[2])
         new_max = int(parts[3])
+        entry = _find_cache_entry(cache, game_id)
+        if entry:
+            col, _ = entry
+            col.effective_max_players = new_max
+            col.is_manual_player_override = True
         async with db.AsyncSessionLocal() as session:
-            col_stmt = select(Collection).where(
-                Collection.user_id == user_id, Collection.game_id == game_id
+            await session.execute(
+                sa_update(Collection)
+                .where(Collection.user_id == user_id, Collection.game_id == game_id)
+                .values(effective_max_players=new_max, is_manual_player_override=True)
             )
-            col = (await session.execute(col_stmt)).scalar_one_or_none()
-            if col:
-                col.effective_max_players = new_max
-                col.is_manual_player_override = True
-                await session.commit()
-        await _render_detail_view(query, user_id, game_id)
+            await session.commit()
+        await _render_detail_view(query, context, user_id, game_id)
         return
 
     # --- Clear max players override ---
     if action == "clearmax":
         game_id = int(parts[2])
+        entry = _find_cache_entry(cache, game_id)
+        if entry:
+            col, _ = entry
+            col.effective_max_players = None
+            col.is_manual_player_override = False
         async with db.AsyncSessionLocal() as session:
-            col_stmt = select(Collection).where(
-                Collection.user_id == user_id, Collection.game_id == game_id
+            await session.execute(
+                sa_update(Collection)
+                .where(Collection.user_id == user_id, Collection.game_id == game_id)
+                .values(effective_max_players=None, is_manual_player_override=False)
             )
-            col = (await session.execute(col_stmt)).scalar_one_or_none()
-            if col:
-                col.effective_max_players = None
-                col.is_manual_player_override = False
-                await session.commit()
-        await _render_detail_view(query, user_id, game_id)
+            await session.commit()
+        await _render_detail_view(query, context, user_id, game_id)
         return
 
     # --- Detail view: show per-game settings ---
     if action == "detail":
         game_id = int(parts[2])
-        await _render_detail_view(query, user_id, game_id)
+        await _render_detail_view(query, context, user_id, game_id)
         return
 
-    # --- Toggle / Page (existing collection list view) ---
-    async with db.AsyncSessionLocal() as session:
-        if action == "toggle":
-            game_id = int(parts[2])
-
-            # Cycle through states: INCLUDED -> STARRED -> EXCLUDED -> INCLUDED
-            col_stmt = select(Collection).where(
-                Collection.user_id == user_id, Collection.game_id == game_id
-            )
-            col = (await session.execute(col_stmt)).scalar_one_or_none()
-
-            if col:
-                # 3-state cycle: 0 (included) -> 1 (starred) -> 2 (excluded) -> 0
-                col.state = (col.state + 1) % 3
+    # --- Toggle state in cache + single-row UPDATE ---
+    page = 0
+    if action == "toggle":
+        game_id = int(parts[2])
+        entry = _find_cache_entry(cache, game_id)
+        if entry:
+            col, _ = entry
+            # 3-state cycle: 0 (included) -> 1 (starred) -> 2 (excluded) -> 0
+            col.state = (col.state + 1) % 3
+            new_state = col.state
+            async with db.AsyncSessionLocal() as session:
+                await session.execute(
+                    sa_update(Collection)
+                    .where(Collection.user_id == user_id, Collection.game_id == game_id)
+                    .values(state=new_state)
+                )
                 await session.commit()
+            # Stay on the page containing the toggled game
+            for idx, (_c, g) in enumerate(cache):
+                if g.id == game_id:
+                    page = idx // GAMES_PER_PAGE
+                    break
+    elif action == "page":
+        page = int(parts[2])
 
-        # Fetch updated collection to rebuild keyboard
-        stmt = (
-            select(Collection, Game)
-            .join(Game)
-            .where(Collection.user_id == user_id)
-            .order_by(Game.name)
-        )
-        results = (await session.execute(stmt)).all()
-
-    if not results:
+    if not cache:
         await query.edit_message_text("Your collection is now empty!")
         return
 
-    # Determine current page
-    page = 0
-    if action == "page":
-        page = int(parts[2])
-    elif action == "toggle":
-        # Stay on same page - figure out which page the toggled game is on
-        game_id = int(parts[2])
-        for idx, (_col, game) in enumerate(results):
-            if game.id == game_id:
-                page = idx // GAMES_PER_PAGE
-                break
-
-    keyboard, total_pages = _build_manage_keyboard(list(results), page)
+    keyboard, _total_pages = _build_manage_keyboard(cache, page)
 
     await query.edit_message_text(
-        f"📚 **Your Collection** ({len(results)} games)\n"
-        "Tap a game to cycle its state:\n"
-        "⬜ Included → 🌟 Starred → ❌ Excluded\n"
-        "Tap ⚙️ to set custom max players.",
+        MANAGE_HEADER.format(count=len(cache)),
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
