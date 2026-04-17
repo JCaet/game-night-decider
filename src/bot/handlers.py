@@ -4,6 +4,7 @@ import math
 import random
 from collections import namedtuple
 from collections.abc import Sequence
+from typing import cast
 
 import telegram
 from sqlalchemy import delete, func, select
@@ -2189,7 +2190,7 @@ async def _get_manage_cache(
     if cache is None:
         cache = await _load_manage_cache(user_id)
         context.user_data["manage_cache"] = cache
-    return cache
+    return cast(list[tuple[Collection, Game]], cache)
 
 
 def _find_cache_entry(
