@@ -13,7 +13,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    concurrency: release
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     outputs:
       released: ${{ steps.detect.outputs.released }}
       version: ${{ steps.semantic.outputs.version }}
