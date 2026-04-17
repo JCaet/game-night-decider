@@ -59,14 +59,14 @@ jobs:
           token_format: 'access_token'
 
       - name: Docker Login to Artifact Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
         with:
           registry: us-central1-docker.pkg.dev
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
 
       - name: Build and Push Container
         run: |
@@ -91,8 +91,15 @@ jobs:
           sync_secret() {
             local name="$1"
             local value="$2"
+            local prev
+            prev=$(gcloud secrets versions list "$name" --project="$PROJECT_ID" \
+              --filter="state=ENABLED" --format="value(name)" --sort-by="~createTime")
             printf '%s' "$value" | gcloud secrets versions add "$name" \
               --project="$PROJECT_ID" --data-file=-
+            for v in $prev; do
+              gcloud secrets versions destroy "$v" --secret="$name" \
+                --project="$PROJECT_ID" --quiet || true
+            done
           }
           sync_secret gnd-telegram-token "$TELEGRAM_BOT_TOKEN"
           sync_secret gnd-webhook-secret "$WEBHOOK_SECRET"
@@ -106,7 +113,7 @@ jobs:
           region: ${{ env.REGION }}
           image: us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/cloud-run-source-deploy/${{ env.SERVICE_NAME }}:${{ inputs.ref || github.sha }}
           env_vars: |
-            WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
+            WEBHOOK_URL=${{ vars.WEBHOOK_URL }}
           secrets: |
             TELEGRAM_BOT_TOKEN=gnd-telegram-token:latest
             WEBHOOK_SECRET=gnd-webhook-secret:latest
@@ -121,6 +128,15 @@ jobs:
             --timeout=30s
             --cpu-boost
             --allow-unauthenticated
+
+      - name: Smoke test
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' "${{ vars.WEBHOOK_URL }}/telegram")
+          echo "Webhook endpoint returned HTTP $status"
+          if [ "$status" -ge 500 ]; then
+            echo "::error::Smoke test failed — webhook endpoint returned $status"
+            exit 1
+          fi
 
       - name: Clean up old container images
         run: |
