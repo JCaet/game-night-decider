@@ -69,7 +69,7 @@ BOT_DESCRIPTION: str | None = (
 # Bot short description - shown on the bot's profile page (max 120 chars)
 # Leave None to keep current
 BOT_SHORT_DESCRIPTION: str | None = (
-    "Your board game night companion! 🎲 Syncs BGG collections and helps groups vote on what to play."
+    "Your board game night companion! 🎲 Syncs BGG collections and helps groups vote on what to play.\n\nPowered by BoardGameGeek"
 )
 
 # ============================================================================
