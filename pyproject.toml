@@ -10,7 +10,7 @@ authors = [
 ]
 dependencies = [
     "httpx>=0.28.1",
-    "lxml>=6.0.2",
+    "lxml>=6.1.0",
     "python-dotenv>=1.2.2",
     "python-telegram-bot[job-queue]>=22.5",
     "tornado>=6.5.4",
