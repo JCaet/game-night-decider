@@ -3204,34 +3204,6 @@ async def _handle_poll_refresh(query, context: ContextTypes.DEFAULT_TYPE, poll_i
             )
 
 
-async def _handle_poll_toggle_voters(
-    query, context: ContextTypes.DEFAULT_TYPE, poll_id: str
-) -> None:
-    """Toggle voter name visibility in poll results."""
-    chat_id = query.message.chat.id
-    async with db.AsyncSessionLocal() as session:
-        session_obj = await session.get(Session, chat_id)
-        if session_obj:
-            session_obj.hide_voters = not session_obj.hide_voters
-            await session.commit()
-
-            # Refresh UI
-            game_poll = await session.get(GameNightPoll, poll_id)
-            if game_poll:
-                valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-                await render_poll_message(
-                    context.bot,
-                    chat_id,
-                    game_poll.message_id,
-                    session,
-                    poll_id,
-                    valid_games,
-                    priority_ids,
-                )
-    with contextlib.suppress(telegram.error.BadRequest):
-        await query.answer("Visibility toggled")
-
-
 async def _handle_poll_category_vote(
     query, context: ContextTypes.DEFAULT_TYPE, poll_id: str, level: int
 ) -> None:
@@ -3518,11 +3490,10 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Dispatcher for custom poll actions: Refresh, Close, Toggle visibility, Category vote, Add.
+    Dispatcher for custom poll actions: Refresh, Close, Category vote, Add.
 
     Callback data formats:
     - poll_refresh:<poll_id>
-    - poll_toggle_voters:<poll_id>
     - poll_random_vote:<poll_id>:<level>
     - poll_close:<poll_id>
     - poll_add:<poll_id>
@@ -3535,9 +3506,6 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
 
     if action == "poll_refresh":
         await _handle_poll_refresh(query, context, poll_id)
-
-    elif action == "poll_toggle_voters":
-        await _handle_poll_toggle_voters(query, context, poll_id)
 
     elif action == "poll_random_vote":
         if len(parts) < 3:
