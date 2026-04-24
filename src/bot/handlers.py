@@ -2844,8 +2844,15 @@ async def create_custom_poll(
         chat_id=chat_id, text="📊 **Initializing Poll...**", parse_mode="Markdown"
     )
 
-    # Create GameNightPoll entry
-    db_poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=message.message_id)
+    # Create GameNightPoll entry with a stable shuffle seed — render_poll_message
+    # uses this so re-rendering the poll keeps button order consistent instead of
+    # reshuffling on every refresh.
+    db_poll = GameNightPoll(
+        poll_id=poll_id,
+        chat_id=chat_id,
+        message_id=message.message_id,
+        shuffle_seed=random.randint(0, 2**31 - 1),
+    )
     session.add(db_poll)
     await session.commit()
 
@@ -3049,6 +3056,11 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
     shuffle = session_obj.shuffle_options if session_obj else False
     allow_adding = session_obj.allow_adding_options if session_obj else False
 
+    # Per-poll shuffle seed so re-renders keep a consistent button order.
+    # Fall back to 0 for legacy polls created before the column existed.
+    game_poll = await session.get(GameNightPoll, poll_id)
+    shuffle_seed = (game_poll.shuffle_seed if game_poll else None) or 0
+
     # Get vote limit info for display
     vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
     if vote_limit == VoteLimit.AUTO:
@@ -3127,10 +3139,13 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
     for level in sorted(groups.keys(), reverse=True):
         group = groups[level]
 
-        # Shuffle game order within group if enabled, otherwise sort by votes/starred
+        # Shuffle game order within group if enabled, otherwise sort by votes/starred.
+        # Use a per-group seed so adding/removing a game in one complexity group
+        # doesn't reshuffle others. Input is sorted by id first so the shuffle is
+        # reproducible regardless of DB row order.
         if shuffle:
-            sorted_group = list(group)
-            random.shuffle(sorted_group)
+            sorted_group = sorted(group, key=lambda g: g.id)
+            random.Random(shuffle_seed ^ level).shuffle(sorted_group)
         else:
             sorted_group = sorted(group, key=sort_key)
 
