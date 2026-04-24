@@ -1735,6 +1735,11 @@ async def toggle_weights_callback(update: Update, context: ContextTypes.DEFAULT_
                     await query.answer("This session is expired.", show_alert=True)
                 return
 
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
+                return
+
             session_obj.settings_weighted = not session_obj.settings_weighted
             await session.commit()
 
@@ -2593,6 +2598,14 @@ POLL_SETTINGS_TEXT = (
     "• **Allow Suggestions**: Let players add games to the poll."
 )
 
+POLL_RUNNING_ALERT = "Poll is running — close it first to change settings."
+
+
+async def _has_active_poll(session, chat_id: int) -> bool:
+    """Return True if a GameNightPoll row exists for this chat."""
+    stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
+    return (await session.execute(stmt)).scalars().first() is not None
+
 
 async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show poll settings."""
@@ -2612,6 +2625,11 @@ async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         if not session_obj:
+            return
+
+        if await _has_active_poll(session, chat_id):
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer(POLL_RUNNING_ALERT, show_alert=True)
             return
 
         keyboard = _build_settings_keyboard(session_obj)
@@ -2639,6 +2657,11 @@ async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAUL
             if session_obj.message_id and session_obj.message_id != message_id:
                 with contextlib.suppress(telegram.error.BadRequest):
                     await query.answer("This session is expired.", show_alert=True)
+                return
+
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
                 return
 
             # Toggle poll type
@@ -2675,6 +2698,11 @@ async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFA
                     await query.answer("This session is expired.", show_alert=True)
                 return
 
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
+                return
+
             session_obj.hide_voters = not session_obj.hide_voters
             await session.commit()
 
@@ -2703,6 +2731,11 @@ async def cycle_vote_limit_callback(update: Update, context: ContextTypes.DEFAUL
             if session_obj.message_id and session_obj.message_id != message_id:
                 with contextlib.suppress(telegram.error.BadRequest):
                     await query.answer("This session is expired.", show_alert=True)
+                return
+
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
                 return
 
             # Cycle to next option
@@ -2741,6 +2774,11 @@ async def _toggle_session_bool(update, field_name: str):
             if session_obj.message_id and session_obj.message_id != message_id:
                 with contextlib.suppress(telegram.error.BadRequest):
                     await query.answer("This session is expired.", show_alert=True)
+                return
+
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
                 return
 
             setattr(session_obj, field_name, not getattr(session_obj, field_name))

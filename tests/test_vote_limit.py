@@ -8,11 +8,13 @@ import pytest
 from sqlalchemy import select
 
 from src.bot.handlers import (
+    POLL_RUNNING_ALERT,
     calculate_auto_vote_limit,
     custom_poll_vote_callback,
     cycle_vote_limit_callback,
     get_vote_limit_display,
     poll_settings_callback,
+    toggle_hide_voters_callback,
 )
 from src.core import db
 from src.core.models import (
@@ -421,3 +423,77 @@ async def test_poll_settings_shows_vote_limit_button(mock_update, mock_context):
 
     # Should have a vote limit button
     assert any("Vote Limit" in t for t in btn_texts)
+
+
+# ============================================================================
+# Settings Lock During Active Poll
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_poll_settings_blocked_while_poll_active(mock_update, mock_context):
+    """Opening settings while a poll is running alerts and doesn't edit the lobby."""
+    chat_id = 12345
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, vote_limit=VoteLimit.AUTO))
+        session.add(GameNightPoll(poll_id="poll_active", chat_id=chat_id, message_id=999))
+        await session.commit()
+
+    mock_update.callback_query.message.chat.id = chat_id
+
+    await poll_settings_callback(mock_update, mock_context)
+
+    mock_update.callback_query.answer.assert_any_call(POLL_RUNNING_ALERT, show_alert=True)
+    mock_update.callback_query.edit_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cycle_vote_limit_blocked_while_poll_active(mock_update, mock_context):
+    """Cycling vote limit while a poll is running alerts and doesn't mutate the session."""
+    chat_id = 12345
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                vote_limit=VoteLimit.AUTO,
+            )
+        )
+        session.add(GameNightPoll(poll_id="poll_active", chat_id=chat_id, message_id=999))
+        await session.commit()
+
+    mock_update.callback_query.message.chat.id = chat_id
+
+    await cycle_vote_limit_callback(mock_update, mock_context)
+
+    mock_update.callback_query.answer.assert_any_call(POLL_RUNNING_ALERT, show_alert=True)
+    mock_update.callback_query.edit_message_text.assert_not_called()
+
+    async with db.AsyncSessionLocal() as session:
+        sess = await session.get(Session, chat_id)
+        assert sess.vote_limit == VoteLimit.AUTO  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_toggle_hide_voters_blocked_while_poll_active(mock_update, mock_context):
+    """Toggling hide_voters while a poll is running alerts and doesn't mutate the session."""
+    chat_id = 12345
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, hide_voters=False))
+        session.add(GameNightPoll(poll_id="poll_active", chat_id=chat_id, message_id=999))
+        await session.commit()
+
+    mock_update.callback_query.message.chat.id = chat_id
+
+    await toggle_hide_voters_callback(mock_update, mock_context)
+
+    mock_update.callback_query.answer.assert_any_call(POLL_RUNNING_ALERT, show_alert=True)
+    mock_update.callback_query.edit_message_text.assert_not_called()
+
+    async with db.AsyncSessionLocal() as session:
+        sess = await session.get(Session, chat_id)
+        assert sess.hide_voters is False  # unchanged
