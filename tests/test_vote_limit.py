@@ -425,6 +425,34 @@ async def test_poll_settings_shows_vote_limit_button(mock_update, mock_context):
     assert any("Vote Limit" in t for t in btn_texts)
 
 
+@pytest.mark.asyncio
+async def test_poll_settings_hides_vote_limit_button_for_native(mock_update, mock_context):
+    """Vote Limit button is hidden in Native mode (setting has no effect there)."""
+    chat_id = 12345
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.NATIVE,
+                vote_limit=VoteLimit.AUTO,
+            )
+        )
+        await session.commit()
+
+    mock_update.callback_query.message.chat.id = chat_id
+
+    await poll_settings_callback(mock_update, mock_context)
+
+    call_kwargs = mock_update.callback_query.edit_message_text.call_args.kwargs
+    reply_markup = call_kwargs.get("reply_markup")
+    buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
+    btn_texts = [btn.text for btn in buttons]
+
+    assert not any("Vote Limit" in t for t in btn_texts)
+
+
 # ============================================================================
 # Settings Lock During Active Poll
 # ============================================================================

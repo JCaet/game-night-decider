@@ -2563,7 +2563,7 @@ def _build_settings_keyboard(
     allow_adding_icon = "✅" if session_obj.allow_adding_options else "❌"
     limit_text = vote_limit_text or get_vote_limit_display(session_obj.vote_limit)
 
-    return [
+    keyboard: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
         [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
         [
@@ -2571,20 +2571,36 @@ def _build_settings_keyboard(
                 f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
             )
         ],
-        [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
-        [InlineKeyboardButton(f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle")],
-        [
-            InlineKeyboardButton(
-                f"Hide Results: {hide_results_icon}", callback_data="toggle_hide_results"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                f"Allow Suggestions: {allow_adding_icon}", callback_data="toggle_allow_adding"
-            )
-        ],
-        [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
     ]
+    # Vote Limit only applies to Custom polls — Native poll answers bypass
+    # PollService.cast_vote entirely, so hide the button when the setting
+    # would be a no-op.
+    if is_custom:
+        keyboard.append(
+            [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")]
+        )
+    keyboard.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Hide Results: {hide_results_icon}", callback_data="toggle_hide_results"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Allow Suggestions: {allow_adding_icon}",
+                    callback_data="toggle_allow_adding",
+                )
+            ],
+            [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
+        ]
+    )
+    return keyboard
 
 
 POLL_SETTINGS_TEXT = (
@@ -2592,7 +2608,7 @@ POLL_SETTINGS_TEXT = (
     "• **Custom (Single)**: One message with buttons. Good for large lists.\n"
     "• **Native (Multiple)**: Standard Telegram polls. Split if >12 games.\n"
     "• **Weights**: Starred games get +0.5 votes.\n"
-    "• **Vote Limit**: Max votes per player (Auto scales with game count).\n"
+    "• **Vote Limit**: Max votes per player (Custom mode only; Auto scales with game count).\n"
     "• **Shuffle**: Randomize option order to reduce positional bias.\n"
     "• **Hide Results**: Hide votes until the poll is closed.\n"
     "• **Allow Suggestions**: Let players add games to the poll."
