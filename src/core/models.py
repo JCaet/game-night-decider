@@ -154,6 +154,10 @@ class GameNightPoll(Base):
     chat_id: Mapped[int] = mapped_column(ForeignKey("sessions.chat_id"))
     message_id: Mapped[int] = mapped_column(Integer)
 
+    # Seed for deterministic shuffle across re-renders of a custom poll.
+    # NULL on legacy rows / native polls (Telegram handles shuffle server-side).
+    shuffle_seed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Relationships
     votes: Mapped[list["PollVote"]] = relationship(
         back_populates="poll", cascade="all, delete-orphan"

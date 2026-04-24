@@ -17,6 +17,7 @@ from src.bot.handlers import (
     join_lobby_callback,
     poll_add_select_callback,
     poll_settings_callback,
+    render_poll_message,
     start_poll_callback,
     toggle_allow_adding_callback,
     toggle_hide_results_callback,
@@ -1173,6 +1174,78 @@ async def test_auto_refresh_poll_on_join(mock_update, mock_context):
 # ============================================================================
 # New Settings Toggle Tests (API 9.6 Migration)
 # ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_shuffle_is_stable_across_renders(mock_context):
+    """With shuffle_options on, repeated renders of the same poll keep the same button order."""
+    chat_id = 31415
+    poll_id = f"poll_shuffle_{chat_id}"
+    base_id = 90000
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Session(
+                chat_id=chat_id,
+                is_active=True,
+                poll_type=PollType.CUSTOM,
+                shuffle_options=True,
+            )
+        )
+        session.add(
+            GameNightPoll(
+                poll_id=poll_id, chat_id=chat_id, message_id=555, shuffle_seed=424242
+            )
+        )
+        session.add(User(telegram_id=111, telegram_name="P1"))
+        session.add(User(telegram_id=112, telegram_name="P2"))
+        session.add(SessionPlayer(session_id=chat_id, user_id=111))
+        session.add(SessionPlayer(session_id=chat_id, user_id=112))
+        games = [
+            Game(
+                id=base_id + i,
+                name=f"Game{i}",
+                min_players=1,
+                max_players=5,
+                complexity=2.0,
+                playing_time=60,
+            )
+            for i in range(6)
+        ]
+        session.add_all(games)
+        for g in games:
+            session.add(Collection(user_id=111, game_id=g.id))
+        await session.commit()
+
+    def vote_callbacks_of(call):
+        kb = call.kwargs["reply_markup"]
+        return [
+            btn.callback_data
+            for row in kb.inline_keyboard
+            for btn in row
+            if btn.callback_data and btn.callback_data.startswith("vote:")
+        ]
+
+    async with db.AsyncSessionLocal() as session:
+        games_list = list(
+            (await session.execute(select(Game).where(Game.id.in_([g.id for g in games]))))
+            .scalars()
+            .all()
+        )
+        await render_poll_message(
+            mock_context.bot, chat_id, 555, session, poll_id, games_list, set()
+        )
+        first_order = vote_callbacks_of(mock_context.bot.edit_message_text.call_args_list[-1])
+
+        await render_poll_message(
+            mock_context.bot, chat_id, 555, session, poll_id, games_list, set()
+        )
+        second_order = vote_callbacks_of(mock_context.bot.edit_message_text.call_args_list[-1])
+
+    assert first_order == second_order
+    # Sanity: shuffle actually ran (order differs from the sorted-by-id input)
+    sorted_order = [f"vote:{poll_id}:{base_id + i}" for i in range(6)]
+    assert first_order != sorted_order
 
 
 @pytest.mark.asyncio

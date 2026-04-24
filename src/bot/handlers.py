@@ -1735,6 +1735,11 @@ async def toggle_weights_callback(update: Update, context: ContextTypes.DEFAULT_
                     await query.answer("This session is expired.", show_alert=True)
                 return
 
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
+                return
+
             session_obj.settings_weighted = not session_obj.settings_weighted
             await session.commit()
 
@@ -2558,7 +2563,7 @@ def _build_settings_keyboard(
     allow_adding_icon = "✅" if session_obj.allow_adding_options else "❌"
     limit_text = vote_limit_text or get_vote_limit_display(session_obj.vote_limit)
 
-    return [
+    keyboard: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
         [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
         [
@@ -2566,20 +2571,36 @@ def _build_settings_keyboard(
                 f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
             )
         ],
-        [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
-        [InlineKeyboardButton(f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle")],
-        [
-            InlineKeyboardButton(
-                f"Hide Results: {hide_results_icon}", callback_data="toggle_hide_results"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                f"Allow Suggestions: {allow_adding_icon}", callback_data="toggle_allow_adding"
-            )
-        ],
-        [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
     ]
+    # Vote Limit only applies to Custom polls — Native poll answers bypass
+    # PollService.cast_vote entirely, so hide the button when the setting
+    # would be a no-op.
+    if is_custom:
+        keyboard.append(
+            [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")]
+        )
+    keyboard.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Hide Results: {hide_results_icon}", callback_data="toggle_hide_results"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Allow Suggestions: {allow_adding_icon}",
+                    callback_data="toggle_allow_adding",
+                )
+            ],
+            [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
+        ]
+    )
+    return keyboard
 
 
 POLL_SETTINGS_TEXT = (
@@ -2587,11 +2608,19 @@ POLL_SETTINGS_TEXT = (
     "• **Custom (Single)**: One message with buttons. Good for large lists.\n"
     "• **Native (Multiple)**: Standard Telegram polls. Split if >12 games.\n"
     "• **Weights**: Starred games get +0.5 votes.\n"
-    "• **Vote Limit**: Max votes per player (Auto scales with game count).\n"
+    "• **Vote Limit**: Max votes per player (Custom mode only; Auto scales with game count).\n"
     "• **Shuffle**: Randomize option order to reduce positional bias.\n"
     "• **Hide Results**: Hide votes until the poll is closed.\n"
     "• **Allow Suggestions**: Let players add games to the poll."
 )
+
+POLL_RUNNING_ALERT = "Poll is running — close it first to change settings."
+
+
+async def _has_active_poll(session, chat_id: int) -> bool:
+    """Return True if a GameNightPoll row exists for this chat."""
+    stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
+    return (await session.execute(stmt)).scalars().first() is not None
 
 
 async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2612,6 +2641,11 @@ async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         if not session_obj:
+            return
+
+        if await _has_active_poll(session, chat_id):
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer(POLL_RUNNING_ALERT, show_alert=True)
             return
 
         keyboard = _build_settings_keyboard(session_obj)
@@ -2639,6 +2673,11 @@ async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAUL
             if session_obj.message_id and session_obj.message_id != message_id:
                 with contextlib.suppress(telegram.error.BadRequest):
                     await query.answer("This session is expired.", show_alert=True)
+                return
+
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
                 return
 
             # Toggle poll type
@@ -2675,6 +2714,11 @@ async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFA
                     await query.answer("This session is expired.", show_alert=True)
                 return
 
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
+                return
+
             session_obj.hide_voters = not session_obj.hide_voters
             await session.commit()
 
@@ -2703,6 +2747,11 @@ async def cycle_vote_limit_callback(update: Update, context: ContextTypes.DEFAUL
             if session_obj.message_id and session_obj.message_id != message_id:
                 with contextlib.suppress(telegram.error.BadRequest):
                     await query.answer("This session is expired.", show_alert=True)
+                return
+
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
                 return
 
             # Cycle to next option
@@ -2741,6 +2790,11 @@ async def _toggle_session_bool(update, field_name: str):
             if session_obj.message_id and session_obj.message_id != message_id:
                 with contextlib.suppress(telegram.error.BadRequest):
                     await query.answer("This session is expired.", show_alert=True)
+                return
+
+            if await _has_active_poll(session, chat_id):
+                with contextlib.suppress(telegram.error.BadRequest):
+                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
                 return
 
             setattr(session_obj, field_name, not getattr(session_obj, field_name))
@@ -2790,8 +2844,15 @@ async def create_custom_poll(
         chat_id=chat_id, text="📊 **Initializing Poll...**", parse_mode="Markdown"
     )
 
-    # Create GameNightPoll entry
-    db_poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=message.message_id)
+    # Create GameNightPoll entry with a stable shuffle seed — render_poll_message
+    # uses this so re-rendering the poll keeps button order consistent instead of
+    # reshuffling on every refresh.
+    db_poll = GameNightPoll(
+        poll_id=poll_id,
+        chat_id=chat_id,
+        message_id=message.message_id,
+        shuffle_seed=random.randint(0, 2**31 - 1),
+    )
     session.add(db_poll)
     await session.commit()
 
@@ -2995,6 +3056,11 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
     shuffle = session_obj.shuffle_options if session_obj else False
     allow_adding = session_obj.allow_adding_options if session_obj else False
 
+    # Per-poll shuffle seed so re-renders keep a consistent button order.
+    # Fall back to 0 for legacy polls created before the column existed.
+    game_poll = await session.get(GameNightPoll, poll_id)
+    shuffle_seed = (game_poll.shuffle_seed if game_poll else None) or 0
+
     # Get vote limit info for display
     vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
     if vote_limit == VoteLimit.AUTO:
@@ -3073,10 +3139,13 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
     for level in sorted(groups.keys(), reverse=True):
         group = groups[level]
 
-        # Shuffle game order within group if enabled, otherwise sort by votes/starred
+        # Shuffle game order within group if enabled, otherwise sort by votes/starred.
+        # Use a per-group seed so adding/removing a game in one complexity group
+        # doesn't reshuffle others. Input is sorted by id first so the shuffle is
+        # reproducible regardless of DB row order.
         if shuffle:
-            sorted_group = list(group)
-            random.shuffle(sorted_group)
+            sorted_group = sorted(group, key=lambda g: g.id)
+            random.Random(shuffle_seed ^ level).shuffle(sorted_group)
         else:
             sorted_group = sorted(group, key=sort_key)
 
@@ -3164,34 +3233,6 @@ async def _handle_poll_refresh(query, context: ContextTypes.DEFAULT_TYPE, poll_i
                 valid_games,
                 priority_ids,
             )
-
-
-async def _handle_poll_toggle_voters(
-    query, context: ContextTypes.DEFAULT_TYPE, poll_id: str
-) -> None:
-    """Toggle voter name visibility in poll results."""
-    chat_id = query.message.chat.id
-    async with db.AsyncSessionLocal() as session:
-        session_obj = await session.get(Session, chat_id)
-        if session_obj:
-            session_obj.hide_voters = not session_obj.hide_voters
-            await session.commit()
-
-            # Refresh UI
-            game_poll = await session.get(GameNightPoll, poll_id)
-            if game_poll:
-                valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-                await render_poll_message(
-                    context.bot,
-                    chat_id,
-                    game_poll.message_id,
-                    session,
-                    poll_id,
-                    valid_games,
-                    priority_ids,
-                )
-    with contextlib.suppress(telegram.error.BadRequest):
-        await query.answer("Visibility toggled")
 
 
 async def _handle_poll_category_vote(
@@ -3480,11 +3521,10 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Dispatcher for custom poll actions: Refresh, Close, Toggle visibility, Category vote, Add.
+    Dispatcher for custom poll actions: Refresh, Close, Category vote, Add.
 
     Callback data formats:
     - poll_refresh:<poll_id>
-    - poll_toggle_voters:<poll_id>
     - poll_random_vote:<poll_id>:<level>
     - poll_close:<poll_id>
     - poll_add:<poll_id>
@@ -3497,9 +3537,6 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
 
     if action == "poll_refresh":
         await _handle_poll_refresh(query, context, poll_id)
-
-    elif action == "poll_toggle_voters":
-        await _handle_poll_toggle_voters(query, context, poll_id)
 
     elif action == "poll_random_vote":
         if len(parts) < 3:

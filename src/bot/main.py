@@ -89,9 +89,6 @@ def main():
         CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_random_vote:")
     )
     app.add_handler(
-        CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_toggle_voters:")
-    )
-    app.add_handler(
         CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$")
     )
     app.add_handler(CallbackQueryHandler(cycle_vote_limit_callback, pattern=r"^cycle_vote_limit$"))
