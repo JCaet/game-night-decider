@@ -2,6 +2,7 @@ import contextlib
 import logging
 import math
 import random
+import textwrap
 from collections import namedtuple
 from collections.abc import Sequence
 from typing import cast
@@ -152,6 +153,39 @@ def disambiguate_voter_names(votes: list) -> dict[int, str]:
                 )
             )
     return _disambiguate(entries)
+
+
+# Inline-keyboard button label layout for the custom poll's vote keyboard
+# and the "Add a game" picker. Telegram clients render '\n' inside button text
+# as a soft line break, so a long game name can span multiple visual rows
+# inside a single button rather than being truncated to '…'.
+_BUTTON_LINE_WIDTH = 18
+_BUTTON_MAX_LINES = 3
+# Names longer than this trigger a one-button-per-row layout for that group,
+# giving the wrapper twice the horizontal room and reducing how often it has
+# to wrap or fall back to the ellipsis placeholder.
+_BUTTON_LONG_THRESHOLD = 18
+
+
+def _wrap_button_label(prefix: str, name: str, suffix: str) -> str:
+    """Build an inline-button label that wraps the name across multiple lines.
+
+    The prefix is glued to the first line and the suffix to the last so that
+    the star marker and the vote count stay visible regardless of where the
+    name wraps. If the wrapped name still doesn't fit within ``_BUTTON_MAX_LINES``
+    lines, the final line ends with an ellipsis placeholder.
+    """
+    lines = textwrap.wrap(
+        name,
+        width=_BUTTON_LINE_WIDTH,
+        max_lines=_BUTTON_MAX_LINES,
+        placeholder="…",
+        break_long_words=True,
+        break_on_hyphens=False,
+    ) or [""]
+    lines[0] = f"{prefix}{lines[0]}"
+    lines[-1] = f"{lines[-1]}{suffix}"
+    return "\n".join(lines)
 
 
 def _build_poll_description(player_count: int, game_count: int, session_obj) -> str:
@@ -3161,19 +3195,20 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
             [InlineKeyboardButton(header_text, callback_data=f"poll_random_vote:{poll_id}:{level}")]
         )
 
+        # When any game in the group has a long name, render the group at
+        # one button per row so wrapping has more horizontal room. Other
+        # groups stay at two-per-row to keep the keyboard compact.
+        columns = 1 if any(len(g.name) > _BUTTON_LONG_THRESHOLD for g in sorted_group) else 2
+
         current_row = []
         for g in sorted_group:
             count = vote_counts[g.id]
-            # Label: "⭐ Catan (2)" — reserve space for suffix so the count
-            # survives truncation on long names.
             prefix = "⭐ " if g.id in priority_ids else ""
             suffix = f" ({count})" if count > 0 and not hide_results else ""
-            max_name = 36 - len(prefix) - len(suffix)
-            name = g.name if len(g.name) <= max_name else g.name[: max_name - 1] + "…"
-            label = f"{prefix}{name}{suffix}"
+            label = _wrap_button_label(prefix, g.name, suffix)
             current_row.append(InlineKeyboardButton(label, callback_data=f"vote:{poll_id}:{g.id}"))
 
-            if len(current_row) == 2:
+            if len(current_row) == columns:
                 keyboard.append(current_row)
                 current_row = []
         if current_row:
@@ -3412,17 +3447,17 @@ async def _handle_poll_add(query, context: ContextTypes.DEFAULT_TYPE, poll_id: s
             await query.answer("No additional games to add!", show_alert=True)
         return
 
-    # Build picker keyboard
+    # Build picker keyboard. Mirror the vote keyboard's layout: wrap long
+    # names across multiple lines and drop to one-per-row when needed.
     keyboard = []
+    columns = 1 if any(len(g.name) > _BUTTON_LONG_THRESHOLD for g in candidates) else 2
     current_row = []
     for g in candidates:
-        label = g.name
-        if len(label) > 28:
-            label = label[:25] + "..."
+        label = _wrap_button_label("", g.name, "")
         current_row.append(
             InlineKeyboardButton(label, callback_data=f"poll_add_select:{poll_id}:{g.id}")
         )
-        if len(current_row) == 2:
+        if len(current_row) == columns:
             keyboard.append(current_row)
             current_row = []
     if current_row:
