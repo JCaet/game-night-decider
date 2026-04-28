@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import select
 
 from src.bot.handlers import (
+    _wrap_button_label,
     create_poll,
     custom_poll_action_callback,
     custom_poll_vote_callback,
@@ -1193,9 +1194,7 @@ async def test_shuffle_is_stable_across_renders(mock_context):
             )
         )
         session.add(
-            GameNightPoll(
-                poll_id=poll_id, chat_id=chat_id, message_id=555, shuffle_seed=424242
-            )
+            GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=555, shuffle_seed=424242)
         )
         session.add(User(telegram_id=111, telegram_name="P1"))
         session.add(User(telegram_id=112, telegram_name="P2"))
@@ -1958,3 +1957,262 @@ async def test_poll_added_games_cascade_deleted(mock_update, mock_context):
         stmt = select(PollAddedGame).where(PollAddedGame.poll_id == poll_id)
         added = (await session.execute(stmt)).scalars().all()
         assert len(added) == 0
+
+
+# ============================================================================
+# Button Label Wrapping Tests
+# ============================================================================
+
+
+def test_wrap_button_label_short_name_single_line():
+    """Short names produce a single-line label with prefix and suffix glued on."""
+    label = _wrap_button_label("⭐ ", "Catan", " (3)")
+    assert label == "⭐ Catan (3)"
+    assert "\n" not in label
+
+
+def test_wrap_button_label_long_name_wraps_across_lines():
+    """A long name wraps across multiple lines instead of being truncated."""
+    label = _wrap_button_label("", "Twilight Imperium Fourth Edition", "")
+    assert "\n" in label
+    # Every word from the original name should still appear somewhere
+    for word in ("Twilight", "Imperium", "Fourth", "Edition"):
+        assert word in label
+    # No ellipsis: the whole name fit within the wrap budget
+    assert "…" not in label
+
+
+def test_wrap_button_label_preserves_vote_count_on_wrapped_name():
+    """The vote-count suffix lands on the final wrapped line, never lost."""
+    label = _wrap_button_label("⭐ ", "Twilight Imperium Fourth Edition", " (7)")
+    lines = label.split("\n")
+    assert len(lines) >= 2
+    assert lines[0].startswith("⭐ ")
+    assert lines[-1].endswith(" (7)")
+
+
+def test_wrap_button_label_extremely_long_name_truncates_with_ellipsis():
+    """A name that overflows the max-lines budget ends with an ellipsis."""
+    very_long = "Word " * 40  # 200 chars of repeated words
+    label = _wrap_button_label("", very_long.strip(), " (1)")
+    assert "…" in label
+    assert label.endswith(" (1)")
+    assert label.count("\n") == 2  # exactly _BUTTON_MAX_LINES - 1 newlines
+
+
+def test_wrap_button_label_long_word_without_spaces_breaks_mid_word():
+    """A single word longer than the line width is split mid-word, not lost."""
+    label = _wrap_button_label("", "Supercalifragilisticexpialidocious", "")
+    # Should produce more than one line (the word is 34 chars, line width 18)
+    assert "\n" in label
+    # The full word's characters should all be present
+    assert "Supercali" in label
+    assert "expialidocious" in label.replace("\n", "")
+
+
+@pytest.mark.asyncio
+async def test_render_poll_long_game_name_wrapped_not_truncated(mock_update, mock_context):
+    """A game with a long name renders as a wrapped multi-line button, no '…'."""
+    chat_id = 12345
+    poll_id = "poll_12345_wrap"
+    long_name = "Twilight Imperium Fourth Edition"
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+
+        session.add_all(
+            [
+                User(telegram_id=111, telegram_name="User1"),
+                User(telegram_id=222, telegram_name="User2"),
+            ]
+        )
+        await session.flush()
+
+        g1 = Game(
+            id=1, name=long_name, min_players=2, max_players=4, playing_time=240, complexity=4.5
+        )
+        session.add(g1)
+        await session.flush()
+
+        session.add_all(
+            [
+                Collection(user_id=111, game_id=1),
+                Collection(user_id=222, game_id=1),
+                SessionPlayer(session_id=chat_id, user_id=111),
+                SessionPlayer(session_id=chat_id, user_id=222),
+                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999),
+            ]
+        )
+        await session.commit()
+
+    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
+    button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
+    long_button = next(b for b in button_labels if "Twilight" in b)
+
+    assert "\n" in long_button, "long name should wrap across multiple lines"
+    assert "…" not in long_button, "name fits within wrap budget; no ellipsis expected"
+    assert "Edition" in long_button, "tail of the name should not be lost"
+
+
+@pytest.mark.asyncio
+async def test_render_poll_long_name_group_renders_one_per_row(mock_update, mock_context):
+    """A complexity group containing any long name lays out one button per row."""
+    chat_id = 12345
+    poll_id = "poll_12345_onecol"
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+
+        session.add_all(
+            [
+                User(telegram_id=111, telegram_name="User1"),
+                User(telegram_id=222, telegram_name="User2"),
+            ]
+        )
+        await session.flush()
+
+        # Two games in the same complexity bucket, one with a long name.
+        g_short = Game(
+            id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0
+        )
+        g_long = Game(
+            id=2,
+            name="Twilight Imperium Fourth Edition",
+            min_players=2,
+            max_players=4,
+            playing_time=60,
+            complexity=2.0,
+        )
+        session.add_all([g_short, g_long])
+        await session.flush()
+
+        session.add_all(
+            [
+                Collection(user_id=111, game_id=1),
+                Collection(user_id=111, game_id=2),
+                Collection(user_id=222, game_id=1),
+                Collection(user_id=222, game_id=2),
+                SessionPlayer(session_id=chat_id, user_id=111),
+                SessionPlayer(session_id=chat_id, user_id=222),
+                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999),
+            ]
+        )
+        await session.commit()
+
+    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
+    # Find the two game-vote rows (callback_data starts with "vote:")
+    vote_rows = [
+        row
+        for row in keyboard.inline_keyboard
+        if row and row[0].callback_data and row[0].callback_data.startswith("vote:")
+    ]
+    assert len(vote_rows) == 2, "expected one row per game when group has a long name"
+    assert all(len(row) == 1 for row in vote_rows), "long-name group should be one-per-row"
+
+
+@pytest.mark.asyncio
+async def test_render_poll_short_names_stay_two_per_row(mock_update, mock_context):
+    """A complexity group with only short names keeps the two-per-row layout."""
+    chat_id = 12345
+    poll_id = "poll_12345_twocol"
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+
+        session.add_all(
+            [
+                User(telegram_id=111, telegram_name="User1"),
+                User(telegram_id=222, telegram_name="User2"),
+            ]
+        )
+        await session.flush()
+
+        # Two short-named games, same complexity bucket.
+        g1 = Game(id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+        g2 = Game(id=2, name="Azul", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+        session.add_all([g1, g2])
+        await session.flush()
+
+        session.add_all(
+            [
+                Collection(user_id=111, game_id=1),
+                Collection(user_id=111, game_id=2),
+                Collection(user_id=222, game_id=1),
+                Collection(user_id=222, game_id=2),
+                SessionPlayer(session_id=chat_id, user_id=111),
+                SessionPlayer(session_id=chat_id, user_id=222),
+                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999),
+            ]
+        )
+        await session.commit()
+
+    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
+    vote_rows = [
+        row
+        for row in keyboard.inline_keyboard
+        if row and row[0].callback_data and row[0].callback_data.startswith("vote:")
+    ]
+    assert len(vote_rows) == 1, "expected a single row holding both short-name buttons"
+    assert len(vote_rows[0]) == 2, "short-name group should stay two-per-row"
+
+
+@pytest.mark.asyncio
+async def test_render_poll_long_name_with_vote_keeps_count_visible(mock_update, mock_context):
+    """A wrapped long-name button still ends with the vote-count suffix."""
+    chat_id = 12345
+    poll_id = "poll_12345_wrapcount"
+    long_name = "Twilight Imperium Fourth Edition"
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+
+        session.add_all(
+            [
+                User(telegram_id=111, telegram_name="User1"),
+                User(telegram_id=222, telegram_name="User2"),
+            ]
+        )
+        await session.flush()
+
+        g1 = Game(
+            id=1, name=long_name, min_players=2, max_players=4, playing_time=240, complexity=4.5
+        )
+        session.add(g1)
+        await session.flush()
+
+        session.add_all(
+            [
+                Collection(user_id=111, game_id=1),
+                Collection(user_id=222, game_id=1),
+                SessionPlayer(session_id=chat_id, user_id=111),
+                SessionPlayer(session_id=chat_id, user_id=222),
+                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999),
+                PollVote(
+                    poll_id=poll_id,
+                    user_id=111,
+                    vote_type=VoteType.GAME,
+                    game_id=1,
+                    user_name="User1",
+                ),
+            ]
+        )
+        await session.commit()
+
+    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
+    button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
+    long_button = next(b for b in button_labels if "Twilight" in b)
+
+    # The count suffix lives on the last visual line of the wrapped label.
+    assert long_button.split("\n")[-1].endswith(" (1)")
