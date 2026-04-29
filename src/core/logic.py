@@ -1,4 +1,24 @@
+from typing import Any
+
+from sqlalchemy import func
+
 from src.core.models import Game
+
+
+def player_count_blocked(column: Any, n: int) -> Any:
+    """
+    SQLAlchemy expression: True iff `n` is present in the CSV-encoded
+    Game.community_unplayable_counts column. Uses LIKE patterns anchored on
+    commas so "1" doesn't match inside "15".
+    """
+    needle = str(n)
+    col = func.coalesce(column, "")
+    return (
+        (col == needle)
+        | col.like(f"{needle},%")
+        | col.like(f"%,{needle}")
+        | col.like(f"%,{needle},%")
+    )
 
 
 def _get_complexity_label(min_c: float, max_c: float) -> str:

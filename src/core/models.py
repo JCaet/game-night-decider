@@ -37,8 +37,21 @@ class Game(Base):
     complexity: Mapped[float] = mapped_column(Float)  # BGG Weight (1-5)
     thumbnail: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # CSV of integer player counts within [min_players, max_players] that the BGG
+    # community-suggested player-count poll marks as not playable. Example: "5"
+    # for Dune: Imperium – Uprising. Empty string = poll parsed, no counts blocked.
+    # NULL = never parsed (treated the same as empty by the filter).
+    community_unplayable_counts: Mapped[str | None] = mapped_column(String, nullable=True)
+
     # Relationships
     # user_collections: Mapped[List["Collection"]] = relationship(back_populates="game")
+
+
+def parse_unplayable_counts(raw: str | None) -> set[int]:
+    """Parse the CSV stored in Game.community_unplayable_counts to a set of ints."""
+    if not raw:
+        return set()
+    return {int(x) for x in raw.split(",") if x.strip().isdigit()}
 
 
 class User(Base):

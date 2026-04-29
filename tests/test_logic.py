@@ -1,13 +1,18 @@
 from dataclasses import dataclass
 
+import pytest
+from sqlalchemy import select
+
+from src.core import db
 from src.core.logic import (
     STAR_BOOST,
     _find_best_split,
     _get_complexity_label,
     calculate_poll_winner,
+    player_count_blocked,
     split_games,
 )
-from src.core.models import Game
+from src.core.models import Game, parse_unplayable_counts
 
 
 def create_game(name: str, complexity: float) -> Game:
@@ -334,3 +339,118 @@ def test_calculate_poll_winner_with_star_boost():
     assert scores["NormalGame"] == 1.0
     assert len(modifiers) == 1
     assert "StarredGame" in modifiers[0]
+
+
+# ---------------------------------------------------------------------------- #
+# Community player-count blocklist
+# ---------------------------------------------------------------------------- #
+
+
+def test_parse_unplayable_counts():
+    assert parse_unplayable_counts(None) == set()
+    assert parse_unplayable_counts("") == set()
+    assert parse_unplayable_counts("5") == {5}
+    assert parse_unplayable_counts("2,5,7") == {2, 5, 7}
+    # Whitespace and bogus tokens are skipped
+    assert parse_unplayable_counts("5, ,abc,7") == {5, 7}
+
+
+def _make_game(
+    *,
+    game_id: int,
+    name: str,
+    min_p: int,
+    max_p: int,
+    blocklist: str | None,
+) -> Game:
+    return Game(
+        id=game_id,
+        name=name,
+        min_players=min_p,
+        max_players=max_p,
+        playing_time=60,
+        complexity=2.0,
+        community_unplayable_counts=blocklist,
+    )
+
+
+@pytest.mark.asyncio
+async def test_player_count_blocked_filter_excludes_blocked_count():
+    """A game with '5' in community_unplayable_counts should be hidden at player_count=5."""
+    async with db.AsyncSessionLocal() as session:
+        session.add_all(
+            [
+                _make_game(
+                    game_id=397598,
+                    name="Dune Uprising",
+                    min_p=1,
+                    max_p=6,
+                    blocklist="5",
+                ),
+                _make_game(
+                    game_id=13,
+                    name="Catan",
+                    min_p=3,
+                    max_p=4,
+                    blocklist="",
+                ),
+                _make_game(
+                    game_id=999,
+                    name="Unparsed",
+                    min_p=2,
+                    max_p=8,
+                    blocklist=None,
+                ),
+            ]
+        )
+        await session.commit()
+
+        # At 5p: Dune is blocked, Catan's max=4 excludes it, Unparsed (NULL) passes through.
+        stmt = select(Game).where(
+            Game.min_players <= 5,
+            Game.max_players >= 5,
+            ~player_count_blocked(Game.community_unplayable_counts, 5),
+        )
+        names_5p = {g.name for g in (await session.execute(stmt)).scalars().all()}
+        assert names_5p == {"Unparsed"}
+
+        # At 4p: Dune passes (4 not blocked), Catan passes, Unparsed passes.
+        stmt = select(Game).where(
+            Game.min_players <= 4,
+            Game.max_players >= 4,
+            ~player_count_blocked(Game.community_unplayable_counts, 4),
+        )
+        names_4p = {g.name for g in (await session.execute(stmt)).scalars().all()}
+        assert names_4p == {"Dune Uprising", "Catan", "Unparsed"}
+
+
+@pytest.mark.asyncio
+async def test_player_count_blocked_csv_substring_safety():
+    """'1' must not match inside '15'; commas anchor the search."""
+    async with db.AsyncSessionLocal() as session:
+        # Hypothetical 18-player Werewolves variant — not real, just a substring stress-test
+        session.add(
+            _make_game(
+                game_id=42,
+                name="Multi-block",
+                min_p=1,
+                max_p=20,
+                blocklist="3,15,17",
+            )
+        )
+        await session.commit()
+
+        for n, expected_blocked in [
+            (1, False),
+            (3, True),
+            (5, False),
+            (7, False),  # not the "17" suffix
+            (15, True),
+            (17, True),
+            (20, False),
+        ]:
+            stmt = select(Game.id).where(player_count_blocked(Game.community_unplayable_counts, n))
+            hits = (await session.execute(stmt)).scalars().all()
+            assert (len(hits) == 1) == expected_blocked, (
+                f"player_count={n} expected_blocked={expected_blocked}, hits={hits}"
+            )

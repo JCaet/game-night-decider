@@ -148,3 +148,159 @@ def test_parse_thing_xml_empty():
     game = client._parse_thing_xml(empty_xml, bgg_id=999)
 
     assert game is None
+
+
+# Suggested-numplayers poll parsing
+DUNE_UPRISING_THING_XML = b"""
+<items>
+    <item type="boardgame" id="397598">
+        <name type="primary" value="Dune: Imperium - Uprising"/>
+        <minplayers value="1"/>
+        <maxplayers value="6"/>
+        <playingtime value="120"/>
+        <minplaytime value="60"/>
+        <maxplaytime value="120"/>
+        <poll name="suggested_numplayers" totalvotes="500">
+            <results numplayers="1">
+                <result value="Best" numvotes="22"/>
+                <result value="Recommended" numvotes="149"/>
+                <result value="Not Recommended" numvotes="113"/>
+            </results>
+            <results numplayers="2">
+                <result value="Best" numvotes="18"/>
+                <result value="Recommended" numvotes="171"/>
+                <result value="Not Recommended" numvotes="118"/>
+            </results>
+            <results numplayers="3">
+                <result value="Best" numvotes="153"/>
+                <result value="Recommended" numvotes="204"/>
+                <result value="Not Recommended" numvotes="20"/>
+            </results>
+            <results numplayers="4">
+                <result value="Best" numvotes="320"/>
+                <result value="Recommended" numvotes="84"/>
+                <result value="Not Recommended" numvotes="6"/>
+            </results>
+            <results numplayers="5">
+                <result value="Best" numvotes="2"/>
+                <result value="Recommended" numvotes="12"/>
+                <result value="Not Recommended" numvotes="246"/>
+            </results>
+            <results numplayers="6">
+                <result value="Best" numvotes="58"/>
+                <result value="Recommended" numvotes="140"/>
+                <result value="Not Recommended" numvotes="53"/>
+            </results>
+            <results numplayers="6+">
+                <result value="Best" numvotes="1"/>
+                <result value="Recommended" numvotes="1"/>
+                <result value="Not Recommended" numvotes="182"/>
+            </results>
+        </poll>
+        <statistics page="1">
+            <ratings>
+                <averageweight value="3.6"/>
+            </ratings>
+        </statistics>
+    </item>
+</items>
+"""
+
+# Like Red Dragon Inn 4 — community signal exists but every count has fewer than 30 votes.
+LOW_SAMPLE_THING_XML = b"""
+<items>
+    <item type="boardgame" id="142402">
+        <name type="primary" value="The Red Dragon Inn 4"/>
+        <minplayers value="2"/>
+        <maxplayers value="4"/>
+        <playingtime value="60"/>
+        <poll name="suggested_numplayers" totalvotes="4">
+            <results numplayers="2">
+                <result value="Best" numvotes="0"/>
+                <result value="Recommended" numvotes="2"/>
+                <result value="Not Recommended" numvotes="1"/>
+            </results>
+            <results numplayers="3">
+                <result value="Best" numvotes="1"/>
+                <result value="Recommended" numvotes="3"/>
+                <result value="Not Recommended" numvotes="0"/>
+            </results>
+            <results numplayers="4">
+                <result value="Best" numvotes="3"/>
+                <result value="Recommended" numvotes="1"/>
+                <result value="Not Recommended" numvotes="0"/>
+            </results>
+        </poll>
+        <statistics page="1">
+            <ratings><averageweight value="1.5"/></ratings>
+        </statistics>
+    </item>
+</items>
+"""
+
+# Catan-shaped: official 3-4, community recommends both. Nothing should be blocked.
+CATAN_THING_XML = b"""
+<items>
+    <item type="boardgame" id="13">
+        <name type="primary" value="Catan"/>
+        <minplayers value="3"/>
+        <maxplayers value="4"/>
+        <playingtime value="90"/>
+        <poll name="suggested_numplayers" totalvotes="2000">
+            <results numplayers="3">
+                <result value="Best" numvotes="721"/>
+                <result value="Recommended" numvotes="1154"/>
+                <result value="Not Recommended" numvotes="112"/>
+            </results>
+            <results numplayers="4">
+                <result value="Best" numvotes="1541"/>
+                <result value="Recommended" numvotes="465"/>
+                <result value="Not Recommended" numvotes="47"/>
+            </results>
+        </poll>
+        <statistics page="1">
+            <ratings><averageweight value="2.32"/></ratings>
+        </statistics>
+    </item>
+</items>
+"""
+
+
+def test_parse_thing_xml_blocks_dune_uprising_5p():
+    """Suggested-numplayers poll → blocks 5 within official 1-6 for Dune Uprising."""
+    client = BGGClient()
+    game = client._parse_thing_xml(DUNE_UPRISING_THING_XML, bgg_id=397598)
+
+    assert game is not None
+    assert game.min_players == 1
+    assert game.max_players == 6
+    assert game.community_unplayable_counts == "5"
+
+
+def test_parse_thing_xml_low_sample_does_not_block():
+    """When per-count totals are below the threshold, no count is blocked."""
+    client = BGGClient()
+    game = client._parse_thing_xml(LOW_SAMPLE_THING_XML, bgg_id=142402)
+
+    assert game is not None
+    # Empty string = poll seen, nothing met the blocklist threshold.
+    assert game.community_unplayable_counts == ""
+
+
+def test_parse_thing_xml_no_poll_returns_none_blocklist():
+    """When the suggested-numplayers poll is absent, blocklist is None (unknown)."""
+    client = BGGClient()
+    # MOCK_THING_XML defined earlier in the file has no <poll> element.
+    game = client._parse_thing_xml(MOCK_THING_XML, bgg_id=13)
+
+    assert game is not None
+    assert game.community_unplayable_counts is None
+
+
+def test_parse_thing_xml_catan_recommended_counts_not_blocked():
+    """All counts in Catan's official range are community-recommended → no block."""
+    client = BGGClient()
+    game = client._parse_thing_xml(CATAN_THING_XML, bgg_id=13)
+
+    assert game is not None
+    assert game.community_unplayable_counts == ""
