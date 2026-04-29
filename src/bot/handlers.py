@@ -20,6 +20,7 @@ from src.core.bgg import BGGClient
 from src.core.logic import (
     STAR_BOOST,
     group_games_by_complexity,
+    player_count_blocked,
     split_games,
 )
 from src.core.models import (
@@ -1032,6 +1033,8 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 Game.min_players <= player_count,
                 # Use effective_max_players if set (from owned expansions), else base game max
                 func.coalesce(Collection.effective_max_players, Game.max_players) >= player_count,
+                # Drop counts the BGG community marks as not playable (e.g. Dune Uprising 5p)
+                ~player_count_blocked(Game.community_unplayable_counts, player_count),
             )
             .distinct()
         )
@@ -1855,6 +1858,7 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 Game.min_players <= player_count,
                 # Use effective_max_players if set (from owned expansions), else base game max
                 func.coalesce(Collection.effective_max_players, Game.max_players) >= player_count,
+                ~player_count_blocked(Game.community_unplayable_counts, player_count),
             )
             .distinct()
         )
@@ -3000,6 +3004,7 @@ async def get_session_valid_games(session, chat_id):
             Collection.state != GameState.EXCLUDED,
             Game.min_players <= player_count,
             func.coalesce(Collection.effective_max_players, Game.max_players) >= player_count,
+            ~player_count_blocked(Game.community_unplayable_counts, player_count),
         )
         .distinct()
     )

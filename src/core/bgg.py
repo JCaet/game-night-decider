@@ -11,6 +11,64 @@ logger = logging.getLogger(__name__)
 
 BGG_API_TOKEN = os.getenv("BGG_API_TOKEN")
 
+# Thresholds for treating a count as community-blocked. Tuned against real BGG data:
+# blocks Dune Uprising 5p, Wingspan 5p, 7 Wonders 2p; rejects low-sample noise (e.g.
+# Red Dragon Inn editions where each count has only ~3 votes).
+COMMUNITY_BLOCKLIST_MIN_VOTES = 30
+COMMUNITY_BLOCKLIST_NOT_REC_SHARE = 0.60
+
+
+def _extract_unplayable_counts(
+    item: ET.Element, official_min: int, official_max: int
+) -> str | None:
+    """
+    Parse the suggested_numplayers poll on a /thing item and return a CSV of
+    integer player counts within [official_min, official_max] that the community
+    marks as not playable.
+
+    A count is "not playable" only when ALL hold:
+      - total votes >= COMMUNITY_BLOCKLIST_MIN_VOTES
+      - not_recommended > best + recommended
+      - not_recommended share >= COMMUNITY_BLOCKLIST_NOT_REC_SHARE
+
+    Returns:
+        CSV like "5" or "" (poll seen, nothing blocked) or None (no poll).
+        Non-integer buckets like "5+" are ignored — the blocklist constrains
+        only within the official range.
+    """
+    poll = None
+    for p in item.findall("poll"):
+        if p.get("name") == "suggested_numplayers":
+            poll = p
+            break
+    if poll is None:
+        return None
+
+    blocked: list[int] = []
+    for results in poll.findall("results"):
+        np_str = results.get("numplayers", "")
+        if not np_str.isdigit():
+            continue
+        np = int(np_str)
+        if np < official_min or np > official_max:
+            continue
+
+        counts = {r.get("value"): int(r.get("numvotes", 0)) for r in results.findall("result")}
+        best = counts.get("Best", 0)
+        rec = counts.get("Recommended", 0)
+        not_rec = counts.get("Not Recommended", 0)
+        total = best + rec + not_rec
+        if total < COMMUNITY_BLOCKLIST_MIN_VOTES:
+            continue
+        if not_rec <= best + rec:
+            continue
+        if (not_rec / total) < COMMUNITY_BLOCKLIST_NOT_REC_SHARE:
+            continue
+
+        blocked.append(np)
+
+    return ",".join(str(n) for n in sorted(blocked))
+
 
 class BGGClient:
     # BGG XML API2 — terms of use: https://boardgamegeek.com/xmlapi/termsofuse
@@ -285,6 +343,8 @@ class BGGClient:
                         with contextlib.suppress(ValueError):
                             complexity = float(avg_weight.get("value", 0))
 
+            community_unplayable = _extract_unplayable_counts(item, min_players, max_players)
+
             return Game(
                 id=bgg_id,
                 name=name,
@@ -295,6 +355,7 @@ class BGGClient:
                 max_playing_time=max_playing_time,
                 complexity=complexity,
                 thumbnail=thumbnail,
+                community_unplayable_counts=community_unplayable,
             )
         except (ValueError, AttributeError) as e:
             logger.warning(f"Failed to parse thing item {bgg_id}: {e}")
