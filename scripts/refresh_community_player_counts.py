@@ -4,20 +4,35 @@ Hits BGG /thing once per game and writes the parsed CSV (or empty string if the
 poll exists but no count met the blocklist threshold) back to the row. Safe to
 re-run; only games where the field is NULL are touched.
 """
+
 import asyncio
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
 from src.core import db
 from src.core.bgg import BGGClient
 from src.core.models import Game
 
+REQUIRED_COLUMN = "community_unplayable_counts"
+
+
+async def _ensure_schema_up_to_date() -> None:
+    async with db.engine.connect() as conn:
+        columns = await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_columns("games"))
+    if not any(c["name"] == REQUIRED_COLUMN for c in columns):
+        sys.exit(
+            f"Schema is out of date: games.{REQUIRED_COLUMN} is missing. "
+            f"Run `uv run python -m alembic upgrade head` first."
+        )
+
 
 async def refresh_community_player_counts() -> None:
+    await _ensure_schema_up_to_date()
+
     bgg = BGGClient()
 
     async with db.AsyncSessionLocal() as session:
