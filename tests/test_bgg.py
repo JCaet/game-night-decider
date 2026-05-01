@@ -304,3 +304,66 @@ def test_parse_thing_xml_catan_recommended_counts_not_blocked():
 
     assert game is not None
     assert game.community_unplayable_counts == ""
+
+
+# Deep Regrets-shaped: community votes the publisher's max as not playable
+# (1-5, 5p at 73.8% NotRec). Per issue #55, the official max is treated as a
+# supported mode regardless of community sentiment.
+DEEP_REGRETS_THING_XML = b"""
+<items>
+    <item type="boardgame" id="397931">
+        <name type="primary" value="Deep Regrets"/>
+        <minplayers value="1"/>
+        <maxplayers value="5"/>
+        <playingtime value="90"/>
+        <poll name="suggested_numplayers" totalvotes="107">
+            <results numplayers="1">
+                <result value="Best" numvotes="5"/>
+                <result value="Recommended" numvotes="29"/>
+                <result value="Not Recommended" numvotes="21"/>
+            </results>
+            <results numplayers="2">
+                <result value="Best" numvotes="28"/>
+                <result value="Recommended" numvotes="38"/>
+                <result value="Not Recommended" numvotes="12"/>
+            </results>
+            <results numplayers="3">
+                <result value="Best" numvotes="51"/>
+                <result value="Recommended" numvotes="21"/>
+                <result value="Not Recommended" numvotes="5"/>
+            </results>
+            <results numplayers="4">
+                <result value="Best" numvotes="16"/>
+                <result value="Recommended" numvotes="31"/>
+                <result value="Not Recommended" numvotes="27"/>
+            </results>
+            <results numplayers="5">
+                <result value="Best" numvotes="3"/>
+                <result value="Recommended" numvotes="14"/>
+                <result value="Not Recommended" numvotes="48"/>
+            </results>
+            <results numplayers="5+">
+                <result value="Best" numvotes="0"/>
+                <result value="Recommended" numvotes="0"/>
+                <result value="Not Recommended" numvotes="46"/>
+            </results>
+        </poll>
+        <statistics page="1">
+            <ratings><averageweight value="2.5"/></ratings>
+        </statistics>
+    </item>
+</items>
+"""
+
+
+def test_parse_thing_xml_does_not_block_official_max():
+    """Even when the community-poll consensus marks the official max as not playable,
+    the max is preserved as a supported mode (issue #55: Deep Regrets 5p)."""
+    client = BGGClient()
+    game = client._parse_thing_xml(DEEP_REGRETS_THING_XML, bgg_id=397931)
+
+    assert game is not None
+    assert game.min_players == 1
+    assert game.max_players == 5
+    # 5p meets the threshold (73.8% NotRec, 65 votes) but is also the official max.
+    assert game.community_unplayable_counts == ""

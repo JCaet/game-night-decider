@@ -23,13 +23,17 @@ def _extract_unplayable_counts(
 ) -> str | None:
     """
     Parse the suggested_numplayers poll on a /thing item and return a CSV of
-    integer player counts within [official_min, official_max] that the community
+    integer player counts within [official_min, official_max) that the community
     marks as not playable.
 
     A count is "not playable" only when ALL hold:
       - total votes >= COMMUNITY_BLOCKLIST_MIN_VOTES
       - not_recommended > best + recommended
       - not_recommended share >= COMMUNITY_BLOCKLIST_NOT_REC_SHARE
+
+    The publisher's max player count is never blocked: community polls there are
+    quality opinions about a supported mode (e.g. Deep Regrets 5p at 73.8 % NotRec),
+    not "this mode doesn't exist" signals like Dune Uprising 5p.
 
     Returns:
         CSV like "5" or "" (poll seen, nothing blocked) or None (no poll).
@@ -50,7 +54,7 @@ def _extract_unplayable_counts(
         if not np_str.isdigit():
             continue
         np = int(np_str)
-        if np < official_min or np > official_max:
+        if np < official_min or np >= official_max:
             continue
 
         counts = {r.get("value"): int(r.get("numvotes", 0)) for r in results.findall("result")}
