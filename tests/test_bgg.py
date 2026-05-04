@@ -357,13 +357,84 @@ DEEP_REGRETS_THING_XML = b"""
 
 
 def test_parse_thing_xml_does_not_block_official_max():
-    """Even when the community-poll consensus marks the official max as not playable,
-    the max is preserved as a supported mode (issue #55: Deep Regrets 5p)."""
+    """The max sets the bar: a count is only blocked if it's strictly worse than
+    the publisher's official max. Deep Regrets max=5 has the highest NotRec share
+    in its range, so nothing is blocked (issue #55)."""
     client = BGGClient()
     game = client._parse_thing_xml(DEEP_REGRETS_THING_XML, bgg_id=397931)
 
     assert game is not None
     assert game.min_players == 1
     assert game.max_players == 5
-    # 5p meets the threshold (73.8% NotRec, 65 votes) but is also the official max.
+    # 5p meets the absolute threshold (73.8% NotRec, 65 votes) AND is the max,
+    # so its share is the bar nothing else exceeds → empty blocklist.
+    assert game.community_unplayable_counts == ""
+
+
+# Massive Darkness 2: Hellscape — official 1-6, community votes 5p at 69.6% NotRec
+# and 6p (max) at 83.3%. Under a naive "skip max" rule we'd expose the worse 6p
+# while hiding the better 5p. The "strictly worse than max" rule keeps both.
+HELLSCAPE_THING_XML = b"""
+<items>
+    <item type="boardgame" id="315610">
+        <name type="primary" value="Massive Darkness 2: Hellscape"/>
+        <minplayers value="1"/>
+        <maxplayers value="6"/>
+        <playingtime value="120"/>
+        <poll name="suggested_numplayers" totalvotes="90">
+            <results numplayers="1">
+                <result value="Best" numvotes="23"/>
+                <result value="Recommended" numvotes="51"/>
+                <result value="Not Recommended" numvotes="16"/>
+            </results>
+            <results numplayers="2">
+                <result value="Best" numvotes="37"/>
+                <result value="Recommended" numvotes="49"/>
+                <result value="Not Recommended" numvotes="4"/>
+            </results>
+            <results numplayers="3">
+                <result value="Best" numvotes="59"/>
+                <result value="Recommended" numvotes="25"/>
+                <result value="Not Recommended" numvotes="5"/>
+            </results>
+            <results numplayers="4">
+                <result value="Best" numvotes="21"/>
+                <result value="Recommended" numvotes="42"/>
+                <result value="Not Recommended" numvotes="18"/>
+            </results>
+            <results numplayers="5">
+                <result value="Best" numvotes="0"/>
+                <result value="Recommended" numvotes="24"/>
+                <result value="Not Recommended" numvotes="55"/>
+            </results>
+            <results numplayers="6">
+                <result value="Best" numvotes="0"/>
+                <result value="Recommended" numvotes="13"/>
+                <result value="Not Recommended" numvotes="65"/>
+            </results>
+            <results numplayers="6+">
+                <result value="Best" numvotes="0"/>
+                <result value="Recommended" numvotes="0"/>
+                <result value="Not Recommended" numvotes="57"/>
+            </results>
+        </poll>
+        <statistics page="1">
+            <ratings><averageweight value="2.5"/></ratings>
+        </statistics>
+    </item>
+</items>
+"""
+
+
+def test_parse_thing_xml_does_not_block_count_better_than_max():
+    """A count whose NotRec share is *better* than the official max must never be
+    blocked, even if it crosses the absolute threshold. Hellscape 5p (69.6% NotRec)
+    is better than 6p max (83.3% NotRec) — both stay; the table decides."""
+    client = BGGClient()
+    game = client._parse_thing_xml(HELLSCAPE_THING_XML, bgg_id=315610)
+
+    assert game is not None
+    assert game.min_players == 1
+    assert game.max_players == 6
+    # 5p crosses 60% NotRec but sits below 6p's 83.3%, so it's not blocked.
     assert game.community_unplayable_counts == ""
