@@ -610,8 +610,9 @@ async def test_custom_poll_close_resolves_category_votes(mock_update, mock_conte
     assert "winner" in text.lower()
     # Winner should be one of the category games
     assert "ComplexGame1" in text or "ComplexGame2" in text
-    # The winner should have 2 votes (both category votes resolved to same game)
-    assert "2.0 pts" in text
+    # Both category votes must resolve to the SAME game — otherwise we'd get
+    # a 1-1 split and the close message would announce a tie.
+    assert "tie" not in text.lower()
 
 
 @pytest.mark.asyncio
@@ -714,6 +715,208 @@ async def test_custom_poll_close_with_weighted_voting(mock_update, mock_context)
     # StarredGame should win due to boost
     assert "StarredGame" in text
     assert "winner" in text.lower()
+
+
+# ============================================================================
+# Leaderboard rendering — issue #54
+#
+# `_handle_poll_close` builds a "Top 5" board from poll scores. Games in the
+# poll that received no votes still appear in `scores` with value 0.0, so a
+# naive top-N slice padded the leaderboard with 0-pt losers (issue #54).
+# These tests pin down the leaderboard contract: only voted games count, the
+# board is hidden when fewer than 2 games scored, and the cap of 5 still holds.
+# ============================================================================
+
+
+async def _seed_close_poll_scenario(
+    chat_id: int,
+    poll_id: str,
+    games: list[tuple[int, str]],
+    votes: list[tuple[int, int]],
+):
+    """
+    Seed an active session with `games` and `votes`, ready for poll close.
+
+    games: list of (game_id, name) — every game gets added to every player's
+           collection, so they're all valid in the poll.
+    votes: list of (user_id, game_id) — one vote row per entry.
+    """
+    voter_ids = sorted({uid for uid, _ in votes}) or [111, 222]
+    # Ensure at least 2 players so close logic doesn't trip on player counts.
+    player_ids = list(dict.fromkeys(voter_ids + [111, 222]))[:max(2, len(voter_ids))]
+
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+
+        for uid in player_ids:
+            session.add(User(telegram_id=uid, telegram_name=f"User{uid}"))
+        await session.flush()
+
+        # Generous player range so games stay "valid" even when tests seed
+        # many voters (get_session_valid_games filters by player_count).
+        for gid, name in games:
+            session.add(
+                Game(
+                    id=gid,
+                    name=name,
+                    min_players=1,
+                    max_players=20,
+                    playing_time=60,
+                    complexity=2.0,
+                )
+            )
+        await session.flush()
+
+        # Every player has every game in their collection — keeps games "valid".
+        for uid in player_ids:
+            for gid, _ in games:
+                session.add(Collection(user_id=uid, game_id=gid))
+
+        for uid in player_ids:
+            session.add(SessionPlayer(session_id=chat_id, user_id=uid))
+
+        session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
+
+        for uid, gid in votes:
+            session.add(
+                PollVote(
+                    poll_id=poll_id,
+                    user_id=uid,
+                    vote_type=VoteType.GAME,
+                    game_id=gid,
+                    user_name=f"User{uid}",
+                )
+            )
+
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_excludes_zero_vote_games(mock_update, mock_context):
+    """
+    Issue #54: with 2 voted games out of 5 in the poll, the leaderboard must
+    only list those 2 — not pad the remaining slots with 0-pt entries.
+    """
+    chat_id = 12345
+    poll_id = "poll_lb_zero"
+
+    await _seed_close_poll_scenario(
+        chat_id,
+        poll_id,
+        games=[
+            (1, "Voted A"),
+            (2, "Voted B"),
+            (3, "Unvoted X"),
+            (4, "Unvoted Y"),
+            (5, "Unvoted Z"),
+        ],
+        votes=[(111, 1), (111, 1), (222, 2)],  # 2 votes for A, 1 for B
+    )
+
+    mock_update.callback_query.data = f"poll_close:{poll_id}"
+    mock_update.callback_query.message.chat.id = chat_id
+
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    text = mock_context.bot.edit_message_text.call_args.kwargs.get("text")
+    assert "Top 5:" in text
+    assert "Voted A" in text
+    assert "Voted B" in text
+    # Unvoted games must not appear, and no 0-pt rows.
+    assert "Unvoted X" not in text
+    assert "Unvoted Y" not in text
+    assert "Unvoted Z" not in text
+    assert "0.0 pts" not in text
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_hidden_when_only_one_game_voted(mock_update, mock_context):
+    """
+    With a single voted game (everything else 0 pts), there's nothing to
+    rank — the leaderboard section must not render. The winner line still does.
+    """
+    chat_id = 12345
+    poll_id = "poll_lb_one"
+
+    await _seed_close_poll_scenario(
+        chat_id,
+        poll_id,
+        games=[(1, "Solo Winner"), (2, "Ignored"), (3, "Also Ignored")],
+        votes=[(111, 1), (222, 1)],
+    )
+
+    mock_update.callback_query.data = f"poll_close:{poll_id}"
+    mock_update.callback_query.message.chat.id = chat_id
+
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    text = mock_context.bot.edit_message_text.call_args.kwargs.get("text")
+    assert "Solo Winner" in text
+    assert "winner" in text.lower()
+    # No leaderboard header, no padding.
+    assert "Top 5:" not in text
+    assert "Ignored" not in text
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_caps_at_five_when_more_voted(mock_update, mock_context):
+    """
+    With 6 voted games, the leaderboard should still show exactly the top 5
+    by score — confirming the cap survives the zero-filter change.
+    """
+    chat_id = 12345
+    poll_id = "poll_lb_cap"
+
+    games = [(i, f"Game{i}") for i in range(1, 7)]
+    # Game1 gets 6 votes, Game2 gets 5, ..., Game6 gets 1 vote.
+    votes: list[tuple[int, int]] = []
+    for gid in range(1, 7):
+        vote_count = 7 - gid
+        for v in range(vote_count):
+            votes.append((100 + v, gid))
+
+    await _seed_close_poll_scenario(chat_id, poll_id, games=games, votes=votes)
+
+    mock_update.callback_query.data = f"poll_close:{poll_id}"
+    mock_update.callback_query.message.chat.id = chat_id
+
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    text = mock_context.bot.edit_message_text.call_args.kwargs.get("text")
+    assert "Top 5:" in text
+    for gid in range(1, 6):
+        assert f"Game{gid}" in text
+    # Game6 (lowest, 1 vote) is squeezed out by the cap, not by zero-filter.
+    assert "Game6" not in text
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_renders_tie_at_top_without_zero_padding(mock_update, mock_context):
+    """
+    A 2-way tie with one extra unvoted game should announce a tie *and* show
+    a 2-row leaderboard — but still no 0-pt third row.
+    """
+    chat_id = 12345
+    poll_id = "poll_lb_tie"
+
+    await _seed_close_poll_scenario(
+        chat_id,
+        poll_id,
+        games=[(1, "TiedA"), (2, "TiedB"), (3, "Unvoted")],
+        votes=[(111, 1), (222, 2)],
+    )
+
+    mock_update.callback_query.data = f"poll_close:{poll_id}"
+    mock_update.callback_query.message.chat.id = chat_id
+
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    text = mock_context.bot.edit_message_text.call_args.kwargs.get("text")
+    assert "tie" in text.lower()
+    assert "TiedA" in text and "TiedB" in text
+    assert "Top 5:" in text
+    assert "Unvoted" not in text
+    assert "0.0 pts" not in text
 
 
 # ============================================================================
