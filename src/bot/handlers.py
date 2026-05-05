@@ -3372,9 +3372,15 @@ async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id:
             else:
                 text += "It's a tie between:\n" + "\n".join([f"• {w}" for w in winners])
 
-            # Build Top 5 leaderboard from scores
-            sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-            top_5 = sorted_scores[:5]
+            # Build Top 5 leaderboard from scores. Only include games that
+            # actually scored — otherwise an under-voted poll pads the board
+            # with 0-pt entries (issue #54).
+            voted_scores = sorted(
+                ((n, s) for n, s in scores.items() if s > 0),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            top_5 = voted_scores[:5]
 
             if len(top_5) > 1:
                 text += "\n\n**Top 5:**"
