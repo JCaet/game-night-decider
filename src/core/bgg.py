@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 BGG_API_TOKEN = os.getenv("BGG_API_TOKEN")
 
 # Thresholds for treating a count as community-blocked. Tuned against real BGG data:
-# blocks Dune Uprising 5p, Wingspan 5p, 7 Wonders 2p; rejects low-sample noise (e.g.
-# Red Dragon Inn editions where each count has only ~3 votes).
+# blocks Dune Uprising 5p and 7 Wonders 2p; rejects low-sample noise (e.g. Red
+# Dragon Inn editions where each count has only ~3 votes).
 COMMUNITY_BLOCKLIST_MIN_VOTES = 30
 COMMUNITY_BLOCKLIST_NOT_REC_SHARE = 0.60
 
@@ -24,12 +24,20 @@ def _extract_unplayable_counts(
     """
     Parse the suggested_numplayers poll on a /thing item and return a CSV of
     integer player counts within [official_min, official_max] that the community
-    marks as not playable.
+    marks as not playable AND worse than the publisher's official max.
 
-    A count is "not playable" only when ALL hold:
+    A count `n` is blocked only when ALL hold:
       - total votes >= COMMUNITY_BLOCKLIST_MIN_VOTES
       - not_recommended > best + recommended
       - not_recommended share >= COMMUNITY_BLOCKLIST_NOT_REC_SHARE
+      - not_recommended share strictly greater than the share at official_max
+
+    The max-share comparison preserves monotonicity: we never hide a mode whose
+    community sentiment is at least as good as the publisher's max we already
+    keep. Catches "this mode doesn't exist" gaps inside the range (Dune Uprising
+    5p, 7 Wonders 2p) without dropping max-shaped quality opinions (Deep Regrets
+    5p) or strictly-better-than-max modes (Massive Darkness 2: Hellscape 5p,
+    where the community rates 5p better than the publisher's max of 6p).
 
     Returns:
         CSV like "5" or "" (poll seen, nothing blocked) or None (no poll).
@@ -43,6 +51,22 @@ def _extract_unplayable_counts(
             break
     if poll is None:
         return None
+
+    # Find NotRec share at official_max. If the max bucket is missing or has no
+    # votes, default to 1.0 so nothing in-range can exceed it (safe default —
+    # we'd rather show the game than over-block on incomplete poll data).
+    max_share = 1.0
+    for results in poll.findall("results"):
+        np_str = results.get("numplayers", "")
+        if not np_str.isdigit() or int(np_str) != official_max:
+            continue
+        counts = {r.get("value"): int(r.get("numvotes", 0)) for r in results.findall("result")}
+        total = (
+            counts.get("Best", 0) + counts.get("Recommended", 0) + counts.get("Not Recommended", 0)
+        )
+        if total > 0:
+            max_share = counts.get("Not Recommended", 0) / total
+        break
 
     blocked: list[int] = []
     for results in poll.findall("results"):
@@ -62,7 +86,11 @@ def _extract_unplayable_counts(
             continue
         if not_rec <= best + rec:
             continue
-        if (not_rec / total) < COMMUNITY_BLOCKLIST_NOT_REC_SHARE:
+        share = not_rec / total
+        if share < COMMUNITY_BLOCKLIST_NOT_REC_SHARE:
+            continue
+        # Never drop a mode at least as good as the publisher's max.
+        if share <= max_share:
             continue
 
         blocked.append(np)
