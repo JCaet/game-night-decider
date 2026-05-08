@@ -165,6 +165,8 @@ async def test_render_anonymous_poll(mock_update, mock_context):
             Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_voters=True)
         )
         session.add(User(telegram_id=222, telegram_name="SecretVoter"))
+        await session.flush()
+        session.add(SessionPlayer(session_id=chat_id, user_id=222))
 
         g1 = Game(
             id=2, name="SecretGame", min_players=1, max_players=5, complexity=3.0, playing_time=45

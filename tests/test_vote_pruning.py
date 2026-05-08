@@ -602,3 +602,173 @@ async def test_no_notification_when_no_votes_suspended(mock_update, mock_context
     send_calls = mock_context.bot.send_message.call_args_list
     suspension_notification = [c for c in send_calls if "suspended" in str(c).lower()]
     assert len(suspension_notification) == 0, "Should NOT send suspension notification"
+
+
+# ============================================================================
+# Test: Leaving player's votes are excluded from the rendered poll (issue #49)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_leaver_votes_excluded_from_render(mock_update, mock_context):
+    """When a player leaves, their already-cast votes must not appear in the
+    rendered poll text or count toward totals — even when the games they
+    voted for are still valid for the remaining lobby."""
+    chat_id = 12345
+    poll_id = "poll_prune_test"
+
+    await _setup_poll_scenario(
+        chat_id=chat_id,
+        poll_id=poll_id,
+        games=[
+            {"id": 1, "name": "GameA", "min_players": 2, "max_players": 6},
+            {"id": 2, "name": "GameB", "min_players": 2, "max_players": 6},
+        ],
+        players=[111, 222, 333],
+        votes=[
+            {"user_id": 111, "game_id": 1},
+            {"user_id": 222, "game_id": 2},
+            {"user_id": 333, "game_id": 1},  # User 333 will leave
+        ],
+        vote_limit=VoteLimit.UNLIMITED,
+    )
+
+    mock_update.callback_query.from_user.id = 333
+    mock_update.callback_query.from_user.first_name = "User333"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 888
+
+    mock_context.bot.edit_message_text.reset_mock()
+    await leave_lobby_callback(mock_update, mock_context)
+
+    # User 333's vote must remain in the DB (suspended, will resume on rejoin)
+    async with db.AsyncSessionLocal() as session:
+        all_votes = (
+            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
+            .scalars()
+            .all()
+        )
+        assert any(v.user_id == 333 for v in all_votes), (
+            "Leaver's vote must be kept in DB so it resumes on rejoin"
+        )
+
+    # Render must reflect only 2 active votes (111 and 222), not 3
+    calls = mock_context.bot.edit_message_text.call_args_list
+    assert calls, "render_poll_message should have been called on leave"
+    last_render_text = calls[-1].kwargs.get("text") or calls[-1].args[0]
+
+    assert "2 votes" in last_render_text or "2 vote" in last_render_text, (
+        f"Only the 2 remaining members' votes should be counted. Got: {last_render_text!r}"
+    )
+    # GameA was voted by both 111 (active) and 333 (left) — display must show 1, not 2
+    assert "**1** - GameA" in last_render_text, (
+        f"GameA should show 1 active vote (333's vote suspended). Got: {last_render_text!r}"
+    )
+
+
+# ============================================================================
+# Test: Leaver's votes are not counted in close_poll winner calculation
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_close_poll_ignores_leaver_votes(mock_update, mock_context):
+    """When closing a poll, votes from users who left the lobby must not
+    influence the winner."""
+    chat_id = 12345
+    poll_id = "poll_close_leaver"
+
+    await _setup_poll_scenario(
+        chat_id=chat_id,
+        poll_id=poll_id,
+        games=[
+            {"id": 1, "name": "GameA", "min_players": 2, "max_players": 6},
+            {"id": 2, "name": "GameB", "min_players": 2, "max_players": 6},
+        ],
+        players=[111, 222, 333],
+        votes=[
+            # Without filtering, GameA wins 2-1; once 333 leaves, GameB wins 1-1
+            # ... actually 1-1 is a tie. Let's tilt GameB.
+            {"user_id": 111, "game_id": 1},
+            {"user_id": 333, "game_id": 1},  # 333 leaves -> this vote should NOT count
+            {"user_id": 222, "game_id": 2},
+            {"user_id": 222, "game_id": 1},  # makes GameA tie if 333 stayed
+        ],
+        vote_limit=VoteLimit.UNLIMITED,
+    )
+
+    # 333 leaves before the poll closes
+    mock_update.callback_query.from_user.id = 333
+    mock_update.callback_query.from_user.first_name = "User333"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 888
+    await leave_lobby_callback(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        from src.bot.handlers import get_session_valid_games
+
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        winners, scores, _ = await PollService.close_poll(
+            session, poll_id, chat_id, valid_games, priority_ids
+        )
+
+    # Active votes after 333 leaves: 111->A, 222->A, 222->B  → A wins 2-1.
+    # But 333's suspended vote on A should NOT push A to 3.
+    # The crucial check: scores must reflect only active-member votes.
+    assert scores.get("GameA", 0) == 2, (
+        f"GameA should have 2 active votes (333's vote excluded). Got scores: {scores}"
+    )
+    assert scores.get("GameB", 0) == 1, f"GameB should have 1 vote. Got scores: {scores}"
+    assert winners == ["GameA"], (
+        f"GameA wins 2-1 with leaver's vote excluded. Got winners: {winners}"
+    )
+
+
+# ============================================================================
+# Test: Leave-then-rejoin restores the leaver's votes
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_votes_restored_after_player_leaves_then_rejoins(mock_update, mock_context):
+    """A leaver's votes are suspended (kept in DB), so if they rejoin the
+    same lobby their votes resume counting automatically."""
+    chat_id = 12345
+    poll_id = "poll_prune_test"
+
+    await _setup_poll_scenario(
+        chat_id=chat_id,
+        poll_id=poll_id,
+        games=[
+            {"id": 1, "name": "GameA", "min_players": 2, "max_players": 6},
+        ],
+        players=[111, 222, 333],
+        votes=[
+            {"user_id": 333, "game_id": 1},
+        ],
+        vote_limit=VoteLimit.UNLIMITED,
+    )
+
+    # 333 leaves -> vote suspended
+    mock_update.callback_query.from_user.id = 333
+    mock_update.callback_query.from_user.first_name = "User333"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 888
+    await leave_lobby_callback(mock_update, mock_context)
+
+    mock_context.bot.edit_message_text.reset_mock()
+
+    # 333 rejoins
+    await join_lobby_callback(mock_update, mock_context)
+
+    # Vote is back in the active tally
+    calls = mock_context.bot.edit_message_text.call_args_list
+    assert calls, "render_poll_message should have been called on rejoin"
+    last_render_text = calls[-1].kwargs.get("text") or calls[-1].args[0]
+
+    assert "1 vote" in last_render_text, (
+        f"333's vote should resume counting after rejoin. Got: {last_render_text!r}"
+    )
+    assert "**1** - GameA" in last_render_text, (
+        f"GameA should show 1 active vote after rejoin. Got: {last_render_text!r}"
+    )
