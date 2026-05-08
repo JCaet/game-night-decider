@@ -743,7 +743,7 @@ async def _seed_close_poll_scenario(
     """
     voter_ids = sorted({uid for uid, _ in votes}) or [111, 222]
     # Ensure at least 2 players so close logic doesn't trip on player counts.
-    player_ids = list(dict.fromkeys(voter_ids + [111, 222]))[:max(2, len(voter_ids))]
+    player_ids = list(dict.fromkeys(voter_ids + [111, 222]))[: max(2, len(voter_ids))]
 
     async with db.AsyncSessionLocal() as session:
         session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
