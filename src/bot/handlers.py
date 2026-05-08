@@ -2986,6 +2986,17 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
             )
 
 
+async def get_active_member_ids(session, chat_id) -> set[int]:
+    """Return user_ids of players currently in the lobby.
+
+    Used to suspend votes cast by users who have since left the session: the
+    rows stay in the DB so they auto-resume if the user rejoins, but they are
+    excluded from tallies and winner calculation while the voter is absent.
+    """
+    stmt = select(SessionPlayer.user_id).where(SessionPlayer.session_id == chat_id)
+    return set((await session.execute(stmt)).scalars().all())
+
+
 async def get_session_valid_games(session, chat_id):
     """Helper to re-fetch valid games for a session."""
     players_stmt = select(SessionPlayer).where(SessionPlayer.session_id == chat_id)
@@ -3039,9 +3050,13 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
     # Include user-added games (from allow_adding_options)
     games = await _merge_added_games(session, poll_id, games)
 
-    # Fetch all votes for this poll
+    # Fetch all votes for this poll, then drop votes from users who have left
+    # the lobby. Rows stay in the DB (so a rejoin auto-resumes them) but are
+    # excluded from every tally below.
     votes_stmt = select(PollVote).where(PollVote.poll_id == poll_id)
-    all_votes = (await session.execute(votes_stmt)).scalars().all()
+    raw_votes = (await session.execute(votes_stmt)).scalars().all()
+    active_member_ids = await get_active_member_ids(session, chat_id)
+    all_votes = [v for v in raw_votes if v.user_id in active_member_ids]
 
     # Aggregate votes - separate game votes from category votes
     vote_counts = {g.id: 0 for g in games}

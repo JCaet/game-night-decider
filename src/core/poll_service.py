@@ -21,6 +21,7 @@ from src.core.models import (
     GameState,
     PollVote,
     Session,
+    SessionPlayer,
     VoteLimit,
     VoteType,
 )
@@ -291,8 +292,13 @@ class PollService:
         Returns:
             Tuple of (winner_names, scores_dict, modifiers_log)
         """
-        # Fetch all votes
+        # Fetch all votes, then drop votes from users who left the lobby —
+        # they should not influence the winner. Rows are kept in the DB so a
+        # rejoin would auto-resume them, but no rejoin can happen after close.
         all_votes = await PollService.get_votes_for_poll(session, poll_id)
+        member_stmt = select(SessionPlayer.user_id).where(SessionPlayer.session_id == chat_id)
+        active_member_ids = set((await session.execute(member_stmt)).scalars().all())
+        all_votes = [v for v in all_votes if v.user_id in active_member_ids]
 
         # Resolve category votes to actual games
         resolved_votes = PollService.resolve_category_votes(all_votes, valid_games)
