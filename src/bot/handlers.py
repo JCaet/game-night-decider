@@ -443,6 +443,10 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         removed_count = len(removed_game_ids)
 
         # Phase 2: Fetch and sync expansions
+        # fetch_expansions returns None on BGG error and [] on legit-empty success.
+        # We only prune/recompute when we know the response is authoritative —
+        # otherwise a transient BGG outage would silently wipe a user's
+        # expansion-driven player counts. See issue #45.
         expansions_processed = 0
         player_count_updates = 0
 
@@ -455,10 +459,12 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             expansions_data = await bgg.fetch_expansions(bgg_username)
 
-            if expansions_data:
+            if expansions_data is not None:
                 import asyncio
 
                 async with db.AsyncSessionLocal() as session:
+                    owned_expansion_ids: set[int] = set()
+
                     for exp_data in expansions_data:
                         try:
                             # Get expansion details (base game link, player count)
@@ -470,68 +476,95 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                             base_game_id = exp_info["base_game_id"]
 
-                            # Check if base game is in user's collection
+                            # Skip expansions whose base game is unknown to us
                             base_game = await session.get(Game, base_game_id)
                             if not base_game:
                                 continue
 
-                            # Create or update expansion record
+                            owned_expansion_ids.add(exp_data["id"])
+                            new_max = exp_info.get("new_max_players")
+
+                            # Create or update expansion record. Don't overwrite a
+                            # known-good new_max_players with None — BGG occasionally
+                            # returns 0/missing maxplayers on a re-fetch.
                             existing_exp = await session.get(Expansion, exp_data["id"])
                             if not existing_exp:
-                                expansion = Expansion(
-                                    id=exp_data["id"],
-                                    name=exp_info["name"],
-                                    base_game_id=base_game_id,
-                                    new_max_players=exp_info.get("new_max_players"),
-                                    complexity_delta=None,  # Future use
+                                session.add(
+                                    Expansion(
+                                        id=exp_data["id"],
+                                        name=exp_info["name"],
+                                        base_game_id=base_game_id,
+                                        new_max_players=new_max,
+                                        complexity_delta=None,  # Future use
+                                    )
                                 )
-                                session.add(expansion)
                             else:
-                                # Update existing expansion
                                 existing_exp.name = exp_info["name"]
                                 existing_exp.base_game_id = base_game_id
-                                existing_exp.new_max_players = exp_info.get("new_max_players")
+                                if new_max:
+                                    existing_exp.new_max_players = new_max
 
-                            # Link expansion to user
+                            # Link expansion to user (idempotent)
                             user_exp_stmt = select(UserExpansion).where(
                                 UserExpansion.user_id == telegram_id,
                                 UserExpansion.expansion_id == exp_data["id"],
                             )
                             if not (await session.execute(user_exp_stmt)).scalar_one_or_none():
-                                user_exp = UserExpansion(
-                                    user_id=telegram_id,
-                                    expansion_id=exp_data["id"],
-                                )
-                                session.add(user_exp)
-
-                            # Update effective_max_players on Collection if expansion adds players
-                            exp_max = exp_info.get("new_max_players")
-                            if exp_max and exp_max > base_game.max_players:
-                                col_stmt = select(Collection).where(
-                                    Collection.user_id == telegram_id,
-                                    Collection.game_id == base_game_id,
-                                )
-                                collection_entry = (
-                                    await session.execute(col_stmt)
-                                ).scalar_one_or_none()
-                                if (
-                                    collection_entry
-                                    and not collection_entry.is_manual_player_override
-                                ):
-                                    # Update if new max is higher than current effective
-                                    current_eff = (
-                                        collection_entry.effective_max_players
-                                        or base_game.max_players
+                                session.add(
+                                    UserExpansion(
+                                        user_id=telegram_id,
+                                        expansion_id=exp_data["id"],
                                     )
-                                    if exp_max > current_eff:
-                                        collection_entry.effective_max_players = exp_max
-                                        player_count_updates += 1
+                                )
 
                             expansions_processed += 1
 
                         except Exception as e:
                             logger.warning(f"Failed to process expansion {exp_data.get('id')}: {e}")
                             continue
+
+                    # Prune UserExpansion rows for expansions the user no longer owns.
+                    prune_stmt = delete(UserExpansion).where(UserExpansion.user_id == telegram_id)
+                    if owned_expansion_ids:
+                        prune_stmt = prune_stmt.where(
+                            UserExpansion.expansion_id.notin_(owned_expansion_ids)
+                        )
+                    await session.execute(prune_stmt)
+                    await session.flush()
+
+                    # Recompute effective_max_players for every collection entry
+                    # without a manual override, based on currently-owned expansions.
+                    recompute_stmt = (
+                        select(Collection, Game)
+                        .join(Game, Game.id == Collection.game_id)
+                        .where(
+                            Collection.user_id == telegram_id,
+                            Collection.is_manual_player_override.is_(False),
+                        )
+                    )
+                    rows = (await session.execute(recompute_stmt)).all()
+                    for col, game in rows:
+                        max_for_base_stmt = (
+                            select(func.max(Expansion.new_max_players))
+                            .join(UserExpansion, UserExpansion.expansion_id == Expansion.id)
+                            .where(
+                                UserExpansion.user_id == telegram_id,
+                                Expansion.base_game_id == col.game_id,
+                            )
+                        )
+                        expansion_max = (
+                            await session.execute(max_for_base_stmt)
+                        ).scalar_one_or_none()
+
+                        if expansion_max and expansion_max > game.max_players:
+                            new_eff = expansion_max
+                        else:
+                            new_eff = None
+
+                        if col.effective_max_players != new_eff:
+                            col.effective_max_players = new_eff
+                            if new_eff is not None:
+                                player_count_updates += 1
 
                     await session.commit()
 
