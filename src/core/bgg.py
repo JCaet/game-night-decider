@@ -389,7 +389,7 @@ class BGGClient:
             logger.warning(f"Failed to parse thing item {bgg_id}: {e}")
             return None
 
-    async def fetch_expansions(self, username: str) -> list[dict]:
+    async def fetch_expansions(self, username: str) -> list[dict] | None:
         """
         Fetch a user's owned expansions from BGG.
 
@@ -397,7 +397,9 @@ class BGGClient:
             username: BGG Username
 
         Returns:
-            List of dicts: [{id, name}, ...]
+            List of dicts on success: [{id, name}, ...] (may be empty).
+            None on error (network failure, 202 retries exhausted) — callers
+            should treat None as "BGG unavailable, leave existing state alone".
         """
         params: dict[str, str | int] = {
             "username": username,
@@ -427,7 +429,7 @@ class BGGClient:
                             await asyncio.sleep(wait_time)
                             continue
                         else:
-                            return []
+                            return None
 
                     if response.status_code == 404:
                         return []
@@ -437,8 +439,8 @@ class BGGClient:
 
                 except httpx.HTTPError as e:
                     logger.error(f"Error fetching expansions for {username}: {e}")
-                    return []
-            return []
+                    return None
+            return None
 
     def _parse_expansion_collection_xml(self, xml_content: bytes) -> list[dict]:
         """Parse expansion collection XML response."""
