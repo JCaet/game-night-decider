@@ -389,51 +389,65 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await session.commit()
 
-            # Find ALL games in collection that still need complexity
-            games_needing_complexity = []
+            # Pick which games need a /thing fetch. Force sync hits every game so
+            # algorithm-driven fields (complexity, community_unplayable_counts) get
+            # refreshed even when complexity is already present — that's what makes
+            # `/setbgg <user> force` the user-facing recovery path after we ship a
+            # parser change.
+            games_needing_details = []
             for g in games:
                 db_game = await session.get(Game, g.id)
-                if db_game and (not db_game.complexity or db_game.complexity <= 0):
-                    games_needing_complexity.append(g.id)
+                if not db_game:
+                    continue
+                if force_update or not db_game.complexity or db_game.complexity <= 0:
+                    games_needing_details.append(g.id)
 
-            # Fetch detailed complexity for games that need it
             complexity_updated = 0
-            if games_needing_complexity:
+            if games_needing_details:
                 # Update status message instead of sending new one
                 with contextlib.suppress(Exception):
                     await status_msg.edit_text(
                         f"⏳ Syncing BGG collection for {bgg_username}\n"
-                        f"• Fetching complexity: 0/{len(games_needing_complexity)}..."
+                        f"• Fetching game details: 0/{len(games_needing_details)}..."
                     )
 
                 import asyncio
 
-                total_complexity = len(games_needing_complexity)
+                total_details = len(games_needing_details)
                 progress_every = 20
-                for i, game_id in enumerate(games_needing_complexity):
+                for i, game_id in enumerate(games_needing_details):
                     try:
                         details = await bgg.get_game_details(game_id)
-                        if details and details.complexity and details.complexity > 0:
+                        if details:
                             game_obj = await session.get(Game, game_id)
                             if game_obj:
-                                game_obj.complexity = details.complexity
-                                complexity_updated += 1
+                                if details.complexity and details.complexity > 0:
+                                    game_obj.complexity = details.complexity
+                                    complexity_updated += 1
+                                # Persist parsed value so algorithm changes propagate.
+                                # None means "no poll on /thing"; store "" so we don't
+                                # keep retrying. Matches refresh_community_player_counts.
+                                game_obj.community_unplayable_counts = (
+                                    details.community_unplayable_counts
+                                    if details.community_unplayable_counts is not None
+                                    else ""
+                                )
 
                         # Commit every 10 games to avoid long transactions
                         if (i + 1) % 10 == 0:
                             await session.commit()
 
                         # Throttled progress update so the user knows it's alive
-                        if (i + 1) % progress_every == 0 and (i + 1) < total_complexity:
+                        if (i + 1) % progress_every == 0 and (i + 1) < total_details:
                             with contextlib.suppress(Exception):
                                 await status_msg.edit_text(
                                     f"⏳ Syncing BGG collection for {bgg_username}\n"
-                                    f"• Fetching complexity: {i + 1}/{total_complexity}..."
+                                    f"• Fetching game details: {i + 1}/{total_details}..."
                                 )
 
                         await asyncio.sleep(0.5)  # Rate limit
                     except Exception as e:
-                        logger.warning(f"Failed to fetch complexity for game {game_id}: {e}")
+                        logger.warning(f"Failed to fetch details for game {game_id}: {e}")
                         continue
                 await session.commit()
 
