@@ -16,6 +16,8 @@ updates:
           - "patch"
       python-security:
         applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
