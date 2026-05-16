@@ -1,8 +1,13 @@
-"""Refresh community_unplayable_counts for all games with the field unpopulated.
+"""Refresh community_unplayable_counts for every BGG-sourced game.
 
 Hits BGG /thing once per game and writes the parsed CSV (or empty string if the
 poll exists but no count met the blocklist threshold) back to the row. Safe to
-re-run; only games where the field is NULL are touched.
+re-run; idempotent for any game where the parser's verdict hasn't changed.
+
+Reprocesses every BGG-sourced row (positive ID) regardless of current value so
+that algorithm changes to _extract_unplayable_counts propagate to rows that
+were populated under the old logic. Manually-added games (negative IDs) are
+skipped — they have no BGG /thing entry.
 """
 
 import asyncio
@@ -36,12 +41,10 @@ async def refresh_community_player_counts() -> None:
     bgg = BGGClient()
 
     async with db.AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(Game).where(Game.community_unplayable_counts.is_(None), Game.id > 0)
-        )
+        result = await session.execute(select(Game).where(Game.id > 0))
         games = result.scalars().all()
 
-        print(f"Found {len(games)} games with no community_unplayable_counts")
+        print(f"Found {len(games)} BGG-sourced games to reprocess")
 
         updated = 0
         blocked_total = 0

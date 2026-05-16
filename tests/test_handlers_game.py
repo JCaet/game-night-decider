@@ -604,3 +604,123 @@ async def test_addgame_bgg_search_auto_stars(mock_update, mock_context):
         stmt = select(Collection).where(Collection.game_id == 100)
         col = (await session.execute(stmt)).scalar_one()
         assert col.state == GameState.STARRED
+
+
+@pytest.mark.asyncio
+async def test_setbgg_force_refreshes_community_unplayable_counts(mock_update, mock_context):
+    """/setbgg ... force re-fetches /thing for every game and overwrites stale
+    community_unplayable_counts — the user-facing recovery path after a parser
+    change. Existing complexity must not gate the refresh."""
+    mock_context.args = ["testuser", "force"]
+
+    async with db.AsyncSessionLocal() as session:
+        user = User(telegram_id=111, telegram_name="TestUser", bgg_username="testuser")
+        session.add(user)
+        # LotR: Journeys with a stale "5" left over from the old algorithm.
+        # Complexity is already populated, so the old gate would have skipped it.
+        session.add(
+            Game(
+                id=269385,
+                name="The Lord of the Rings: Journeys in Middle-Earth",
+                min_players=1,
+                max_players=5,
+                playing_time=60,
+                complexity=2.5,
+                community_unplayable_counts="5",
+            )
+        )
+        session.add(Collection(user_id=111, game_id=269385, state=GameState.INCLUDED))
+        await session.commit()
+
+    refreshed_game = Game(
+        id=269385,
+        name="The Lord of the Rings: Journeys in Middle-Earth",
+        min_players=1,
+        max_players=5,
+        playing_time=60,
+        complexity=2.5,
+        community_unplayable_counts="",
+    )
+
+    with patch("src.bot.handlers.BGGClient") as MockBGG:
+        mock_client = MockBGG.return_value
+        mock_client.fetch_collection = AsyncMock(
+            return_value=[
+                Game(
+                    id=269385,
+                    name="The Lord of the Rings: Journeys in Middle-Earth",
+                    min_players=1,
+                    max_players=5,
+                    playing_time=60,
+                    complexity=2.5,
+                )
+            ]
+        )
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
+        mock_client.get_game_details = AsyncMock(return_value=refreshed_game)
+
+        await set_bgg(mock_update, mock_context)
+
+        mock_client.get_game_details.assert_awaited_with(269385)
+
+    async with db.AsyncSessionLocal() as session:
+        stored = await session.get(Game, 269385)
+        assert stored.community_unplayable_counts == ""
+
+
+@pytest.mark.asyncio
+async def test_setbgg_force_persists_no_poll_as_empty_string(mock_update, mock_context):
+    """When /thing has no suggested_numplayers poll, get_game_details returns
+    community_unplayable_counts=None. Force sync must persist that as "" so we
+    don't keep retrying on every subsequent sync."""
+    mock_context.args = ["testuser", "force"]
+
+    async with db.AsyncSessionLocal() as session:
+        user = User(telegram_id=111, telegram_name="TestUser", bgg_username="testuser")
+        session.add(user)
+        session.add(
+            Game(
+                id=42,
+                name="ObscureGame",
+                min_players=2,
+                max_players=4,
+                playing_time=60,
+                complexity=2.0,
+                community_unplayable_counts=None,
+            )
+        )
+        session.add(Collection(user_id=111, game_id=42, state=GameState.INCLUDED))
+        await session.commit()
+
+    refreshed_game = Game(
+        id=42,
+        name="ObscureGame",
+        min_players=2,
+        max_players=4,
+        playing_time=60,
+        complexity=2.0,
+        community_unplayable_counts=None,
+    )
+
+    with patch("src.bot.handlers.BGGClient") as MockBGG:
+        mock_client = MockBGG.return_value
+        mock_client.fetch_collection = AsyncMock(
+            return_value=[
+                Game(
+                    id=42,
+                    name="ObscureGame",
+                    min_players=2,
+                    max_players=4,
+                    playing_time=60,
+                    complexity=2.0,
+                )
+            ]
+        )
+        mock_client.fetch_expansions = AsyncMock(return_value=[])
+        mock_client.get_game_details = AsyncMock(return_value=refreshed_game)
+
+        await set_bgg(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        stored = await session.get(Game, 42)
+        assert stored.community_unplayable_counts == ""
