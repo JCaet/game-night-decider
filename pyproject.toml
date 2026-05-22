@@ -79,5 +79,5 @@ dev = [
     "pytest-cov>=6.0.0",
     "ruff>=0.8.2",
     "types-requests>=2.32.0",
-    "types-aiofiles>=24.1.0",
+    "types-aiofiles>=25.1.0.20260518",
 ]
