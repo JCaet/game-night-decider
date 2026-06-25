@@ -59,7 +59,10 @@ def main():
         logger.error("TELEGRAM_BOT_TOKEN not set!")
         sys.exit(1)
 
-    app = ApplicationBuilder().token(token).build()
+    # concurrent_updates lets votes from different users process in parallel
+    # instead of serializing one-update-at-a-time. Safe here because cast_vote
+    # uses a row-level lock (Postgres) + IntegrityError handling for races.
+    app = ApplicationBuilder().token(token).concurrent_updates(True).build()
 
     # Handlers
     app.add_handler(CommandHandler("start", start))

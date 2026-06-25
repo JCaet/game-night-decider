@@ -103,5 +103,10 @@ def mock_context():
     context.bot.pin_chat_message = AsyncMock()
     context.bot.unpin_chat_message = AsyncMock()
 
+    # Default to no job queue so vote handlers take the inline-render fallback
+    # path (which calls edit_message_text directly, as these tests assert).
+    # Debounce-specific tests inject their own fake job queue.
+    context.job_queue = None
+
     context.args = []
     return context

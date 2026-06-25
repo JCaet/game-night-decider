@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import select
 
 from src.bot.handlers import (
+    _render_poll_job,
     _wrap_button_label,
     create_poll,
     custom_poll_action_callback,
@@ -2419,3 +2420,155 @@ async def test_render_poll_long_name_with_vote_keeps_count_visible(mock_update, 
 
     # The count suffix lives on the last visual line of the wrapped label.
     assert long_button.split("\n")[-1].endswith(" (1)")
+
+
+# ============================================================================
+# Debounced Render (Vote Coalescing) Tests
+# ============================================================================
+
+
+class _FakeJob:
+    def __init__(self, name, data):
+        self.name = name
+        self.data = data
+        self.removed = False
+
+    def schedule_removal(self):
+        self.removed = True
+
+
+class _FakeJobQueue:
+    """Minimal stand-in for telegram.ext.JobQueue used to assert that vote
+    handlers debounce renders instead of editing the message inline."""
+
+    def __init__(self):
+        self.jobs: list[_FakeJob] = []
+
+    def get_jobs_by_name(self, name):
+        return tuple(j for j in self.jobs if j.name == name and not j.removed)
+
+    def run_once(self, callback, when, name, data):  # noqa: ARG002 - signature parity
+        self.jobs.append(_FakeJob(name, data))
+
+    def pending(self, name):
+        return [j for j in self.jobs if j.name == name and not j.removed]
+
+
+async def _seed_basic_poll(chat_id, poll_id, game_id, user_id, message_id=999):
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add_all(
+            [
+                User(telegram_id=user_id, telegram_name="Voter"),
+                User(telegram_id=user_id + 1, telegram_name="Other"),
+            ]
+        )
+        await session.flush()
+        session.add(
+            Game(
+                id=game_id,
+                name="TestGame",
+                min_players=2,
+                max_players=4,
+                playing_time=60,
+                complexity=2.0,
+            )
+        )
+        await session.flush()
+        session.add_all(
+            [
+                Collection(user_id=user_id, game_id=game_id),
+                Collection(user_id=user_id + 1, game_id=game_id),
+                SessionPlayer(session_id=chat_id, user_id=user_id),
+                SessionPlayer(session_id=chat_id, user_id=user_id + 1),
+                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=message_id),
+            ]
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_vote_schedules_debounced_render_instead_of_inline_edit(mock_update, mock_context):
+    """With a job queue present, a vote schedules a render job and does NOT
+    edit the message inline (the edit happens later, in the coalesced job)."""
+    chat_id, poll_id, game_id, user_id = 12345, "poll_12345_1", 1, 111
+    await _seed_basic_poll(chat_id, poll_id, game_id, user_id)
+
+    mock_context.job_queue = _FakeJobQueue()
+    mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
+    mock_update.callback_query.from_user.id = user_id
+    mock_update.callback_query.from_user.first_name = "Voter"
+
+    await custom_poll_vote_callback(mock_update, mock_context)
+
+    # Vote persisted + acknowledged immediately (non-blocking UX preserved).
+    mock_update.callback_query.answer.assert_called_with("Vote recorded")
+    # Render is deferred to the job queue, not edited inline.
+    mock_context.bot.edit_message_text.assert_not_called()
+    pending = mock_context.job_queue.pending(f"render:{poll_id}")
+    assert len(pending) == 1
+    assert pending[0].data == {
+        "chat_id": chat_id,
+        "message_id": 999,
+        "poll_id": poll_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_rapid_votes_coalesce_to_single_pending_render(mock_update, mock_context):
+    """A burst of votes leaves exactly one pending render job: each new vote
+    cancels the previous job before scheduling its own."""
+    chat_id, poll_id, user_id = 12345, "poll_12345_2", 111
+    await _seed_basic_poll(chat_id, poll_id, 1, user_id)
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Game(id=2, name="Second", min_players=2, max_players=4, playing_time=60, complexity=2.0)
+        )
+        await session.flush()
+        session.add_all(
+            [
+                Collection(user_id=user_id, game_id=2),
+                Collection(user_id=user_id + 1, game_id=2),
+            ]
+        )
+        await session.commit()
+
+    mock_context.job_queue = _FakeJobQueue()
+    mock_update.callback_query.from_user.id = user_id
+    mock_update.callback_query.from_user.first_name = "Voter"
+
+    for game_id in (1, 2):
+        mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
+        await custom_poll_vote_callback(mock_update, mock_context)
+
+    # Two votes scheduled two jobs but the first was cancelled → one live job.
+    assert len(mock_context.job_queue.pending(f"render:{poll_id}")) == 1
+    assert sum(j.removed for j in mock_context.job_queue.jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_render_job_edits_message(mock_context):
+    """The debounced job renders the live poll state to the message."""
+    chat_id, poll_id, game_id, user_id = 12345, "poll_12345_3", 1, 111
+    await _seed_basic_poll(chat_id, poll_id, game_id, user_id)
+
+    mock_context.job = MagicMock()
+    mock_context.job.data = {"chat_id": chat_id, "message_id": 999, "poll_id": poll_id}
+
+    await _render_poll_job(mock_context)
+
+    mock_context.bot.edit_message_text.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_render_job_skips_closed_poll(mock_context):
+    """If the poll was closed (record gone) during the debounce window, the job
+    is a no-op so it can't clobber the results message."""
+    chat_id, poll_id = 12345, "poll_does_not_exist"
+
+    mock_context.job = MagicMock()
+    mock_context.job.data = {"chat_id": chat_id, "message_id": 999, "poll_id": poll_id}
+
+    await _render_poll_job(mock_context)
+
+    mock_context.bot.edit_message_text.assert_not_called()
