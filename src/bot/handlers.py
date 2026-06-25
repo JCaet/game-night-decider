@@ -3347,15 +3347,25 @@ async def _render_poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 def _schedule_poll_render(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, poll_id: str
 ) -> bool:
-    """Debounce a poll re-render: cancel any pending render for this poll and
-    schedule a fresh one. Returns False if no job queue is available (caller
-    should then render inline as a fallback)."""
+    """Throttle a poll re-render: ensure exactly one render is pending for this
+    poll, firing _POLL_RENDER_DEBOUNCE_SECONDS after the *first* vote of a burst.
+    Returns False if no job queue is available (caller should then render inline
+    as a fallback).
+
+    This is a leading-window throttle, NOT a trailing-edge debounce: if a render
+    is already pending we leave it in place rather than cancelling and pushing it
+    out. A pure debounce starves under sustained voting — every vote within the
+    window reschedules the job, so it never fires and the tally freezes. The job
+    reads fresh state when it runs, so one render per window reflects every vote
+    cast in that window; a vote arriving after the job fires schedules the next
+    one, guaranteeing a trailing render once the burst ends."""
     job_queue = context.job_queue
     if job_queue is None:
         return False
     name = f"render:{poll_id}"
-    for job in job_queue.get_jobs_by_name(name):
-        job.schedule_removal()
+    if job_queue.get_jobs_by_name(name):
+        # A render is already pending for this poll; it will pick up this vote.
+        return True
     job_queue.run_once(
         _render_poll_job,
         when=_POLL_RENDER_DEBOUNCE_SECONDS,

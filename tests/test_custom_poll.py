@@ -2516,8 +2516,10 @@ async def test_vote_schedules_debounced_render_instead_of_inline_edit(mock_updat
 
 @pytest.mark.asyncio
 async def test_rapid_votes_coalesce_to_single_pending_render(mock_update, mock_context):
-    """A burst of votes leaves exactly one pending render job: each new vote
-    cancels the previous job before scheduling its own."""
+    """A burst of votes leaves exactly one pending render job: the first vote
+    schedules it and later votes in the window leave it in place (throttle, not
+    debounce — so sustained voting can't starve the render and freeze the tally).
+    The pending job reads fresh state when it fires, so it reflects every vote."""
     chat_id, poll_id, user_id = 12345, "poll_12345_2", 111
     await _seed_basic_poll(chat_id, poll_id, 1, user_id)
     async with db.AsyncSessionLocal() as session:
@@ -2541,9 +2543,10 @@ async def test_rapid_votes_coalesce_to_single_pending_render(mock_update, mock_c
         mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
         await custom_poll_vote_callback(mock_update, mock_context)
 
-    # Two votes scheduled two jobs but the first was cancelled → one live job.
+    # The first vote scheduled the only job; the second reused it instead of
+    # cancelling and rescheduling → one live job, nothing removed (no starvation).
     assert len(mock_context.job_queue.pending(f"render:{poll_id}")) == 1
-    assert sum(j.removed for j in mock_context.job_queue.jobs) == 1
+    assert sum(j.removed for j in mock_context.job_queue.jobs) == 0
 
 
 @pytest.mark.asyncio
