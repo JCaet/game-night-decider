@@ -16,6 +16,7 @@ from src.bot.handlers import (
     create_poll,
     custom_poll_action_callback,
     custom_poll_vote_callback,
+    get_session_valid_games,
     join_lobby_callback,
     poll_add_select_callback,
     poll_settings_callback,
@@ -2420,6 +2421,136 @@ async def test_render_poll_long_name_with_vote_keeps_count_visible(mock_update, 
 
     # The count suffix lives on the last visual line of the wrapped label.
     assert long_button.split("\n")[-1].endswith(" (1)")
+
+
+# ============================================================================
+# Keyboard Pagination Tests (large game lists)
+# ============================================================================
+
+
+async def _seed_poll_with_complexities(chat_id, poll_id, complexities):
+    """Seed a custom poll whose single player owns one game per entry in
+    `complexities` (complexity floats). player_count is 1 so every game is valid.
+    Games get ids 1..N in order."""
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(User(telegram_id=111, telegram_name="Solo"))
+        await session.flush()
+        games = [
+            Game(
+                id=i + 1,
+                name=f"Game{i + 1:03d}",
+                min_players=1,
+                max_players=8,
+                playing_time=60,
+                complexity=c,
+            )
+            for i, c in enumerate(complexities)
+        ]
+        session.add_all(games)
+        await session.flush()
+        session.add_all([Collection(user_id=111, game_id=g.id) for g in games])
+        session.add(SessionPlayer(session_id=chat_id, user_id=111))
+        session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
+        await session.commit()
+
+
+def _vote_button_ids(markup):
+    return [
+        int(btn.callback_data.split(":")[2])
+        for row in markup.inline_keyboard
+        for btn in row
+        if btn.callback_data and btn.callback_data.startswith("vote:")
+    ]
+
+
+def _page_targets(markup):
+    return [
+        btn.callback_data
+        for row in markup.inline_keyboard
+        for btn in row
+        if btn.callback_data and btn.callback_data.startswith("poll_page:")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_small_poll_renders_all_games_without_pagination(mock_context):
+    """A poll that fits one keyboard shows every game and no page navigation."""
+    chat_id, poll_id = 12345, "poll_small"
+    await _seed_poll_with_complexities(chat_id, poll_id, [2.0] * 5)
+
+    async with db.AsyncSessionLocal() as session:
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        await render_poll_message(
+            mock_context.bot, chat_id, 999, session, poll_id, valid_games, priority_ids
+        )
+
+    markup = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
+    assert sorted(_vote_button_ids(markup)) == [1, 2, 3, 4, 5]
+    assert _page_targets(markup) == []  # no nav row
+
+
+@pytest.mark.asyncio
+async def test_large_poll_shows_one_complexity_category_per_page(mock_context):
+    """Over the size threshold, the keyboard paginates: page 1 shows only the
+    highest-complexity category and offers a 'next' button."""
+    chat_id, poll_id = 12345, "poll_big"
+    # 40 level-4 games (ids 1-40) + 40 level-2 games (ids 41-80) = 80 > threshold.
+    await _seed_poll_with_complexities(chat_id, poll_id, [4.0] * 40 + [2.0] * 40)
+
+    async with db.AsyncSessionLocal() as session:
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        await render_poll_message(
+            mock_context.bot, chat_id, 999, session, poll_id, valid_games, priority_ids
+        )
+
+    markup = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
+    ids = _vote_button_ids(markup)
+    # Only the level-4 category (ids 1-40) is on the first page.
+    assert len(ids) == 40
+    assert all(1 <= i <= 40 for i in ids)
+    # A "next page" navigation button is present.
+    assert f"poll_page:{poll_id}:1" in _page_targets(markup)
+
+
+@pytest.mark.asyncio
+async def test_poll_page_navigation_switches_category_and_persists(mock_update, mock_context):
+    """Tapping a page button renders the next category and persists the page so
+    later vote re-renders stay on it."""
+    chat_id, poll_id = 12345, "poll_nav"
+    await _seed_poll_with_complexities(chat_id, poll_id, [4.0] * 40 + [2.0] * 40)
+
+    mock_update.callback_query.data = f"poll_page:{poll_id}:1"
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        game_poll = await session.get(GameNightPoll, poll_id)
+        assert game_poll.current_page == 1
+
+    markup = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
+    ids = _vote_button_ids(markup)
+    # Page 2 is the level-2 category (ids 41-80).
+    assert len(ids) == 40
+    assert all(41 <= i <= 80 for i in ids)
+
+
+@pytest.mark.asyncio
+async def test_oversized_single_category_splits_into_subpages(mock_context):
+    """A single complexity category larger than one page is capped per page so
+    the reply_markup never exceeds Telegram's limit."""
+    chat_id, poll_id = 12345, "poll_onecat"
+    await _seed_poll_with_complexities(chat_id, poll_id, [2.0] * 70)  # one category, 70 games
+
+    async with db.AsyncSessionLocal() as session:
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        await render_poll_message(
+            mock_context.bot, chat_id, 999, session, poll_id, valid_games, priority_ids
+        )
+
+    markup = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
+    # First sub-page is capped at the page size, not all 70 games.
+    assert len(_vote_button_ids(markup)) == 50
+    assert f"poll_page:{poll_id}:1" in _page_targets(markup)
 
 
 # ============================================================================

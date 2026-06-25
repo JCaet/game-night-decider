@@ -171,6 +171,13 @@ class GameNightPoll(Base):
     # NULL on legacy rows / native polls (Telegram handles shuffle server-side).
     shuffle_seed: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # Currently displayed keyboard page for large custom polls. When the full
+    # game keyboard would exceed Telegram's reply_markup size limit, the buttons
+    # are paginated one complexity category per page; this tracks which page the
+    # shared poll message is showing so vote-driven re-renders stay on it.
+    # NULL/0 = first page (and the only value for polls small enough to fit).
+    current_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Relationships
     votes: Mapped[list["PollVote"]] = relationship(
         back_populates="poll", cascade="all, delete-orphan"

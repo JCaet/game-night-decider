@@ -167,6 +167,15 @@ _BUTTON_MAX_LINES = 3
 # to wrap or fall back to the ellipsis placeholder.
 _BUTTON_LONG_THRESHOLD = 18
 
+# Custom-poll keyboard pagination. A single inline keyboard's serialized
+# reply_markup has a size limit; large game lists overflow it and Telegram
+# rejects the edit with "Reply markup is too long", silently freezing the poll.
+# At or below the threshold we render every complexity group in one keyboard
+# (no behaviour change). Above it we paginate one complexity category per page,
+# capping each page's game buttons so a page always stays under the limit.
+_POLL_KEYBOARD_PAGE_THRESHOLD = 60
+_POLL_KEYBOARD_PAGE_SIZE = 50
+
 
 def _wrap_button_label(prefix: str, name: str, suffix: str) -> str:
     """Build an inline-button label that wraps the name across multiple lines.
@@ -3247,50 +3256,91 @@ async def render_poll_message(
     # Build Keyboard with Complexity Grouping
     keyboard = []
 
-    # Grouped by Complexity (Descending)
-    for level in sorted(groups.keys(), reverse=True):
+    def _sorted_group(level):
+        """Order a complexity group's games for display.
+
+        Shuffle when enabled (per-group seed so adding/removing a game in one
+        group doesn't reshuffle others; id-sorted first for reproducibility),
+        otherwise sort by votes/starred. Reused whether we render every group at
+        once or paginate one group at a time.
+        """
         group = groups[level]
-
-        # Shuffle game order within group if enabled, otherwise sort by votes/starred.
-        # Use a per-group seed so adding/removing a game in one complexity group
-        # doesn't reshuffle others. Input is sorted by id first so the shuffle is
-        # reproducible regardless of DB row order.
         if shuffle:
-            sorted_group = sorted(group, key=lambda g: g.id)
-            random.Random(shuffle_seed ^ level).shuffle(sorted_group)
-        else:
-            sorted_group = sorted(group, key=sort_key)
+            sg = sorted(group, key=lambda g: g.id)
+            random.Random(shuffle_seed ^ level).shuffle(sg)
+            return sg
+        return sorted(group, key=sort_key)
 
-        # Add Separator/Header with Category Vote action
-        # Show category vote count on header (hidden when hide_results is on)
+    def _emit_group(level, group_games):
+        """Append a category-vote header row followed by this group's buttons."""
         cat_count = category_vote_counts.get(level, 0)
         show_count = cat_count > 0 and not hide_results
-        if level > 0:
-            header_text = f"--- {level} ---" if not show_count else f"--- {level} ({cat_count}) ---"
-        else:
-            header_text = "--- Unrated ---" if not show_count else f"--- Unrated ({cat_count}) ---"
+        level_name = level if level > 0 else "Unrated"
+        header_text = (
+            f"--- {level_name} ---" if not show_count else f"--- {level_name} ({cat_count}) ---"
+        )
         keyboard.append(
             [InlineKeyboardButton(header_text, callback_data=f"poll_random_vote:{poll_id}:{level}")]
         )
 
-        # When any game in the group has a long name, render the group at
-        # one button per row so wrapping has more horizontal room. Other
-        # groups stay at two-per-row to keep the keyboard compact.
-        columns = 1 if any(len(g.name) > _BUTTON_LONG_THRESHOLD for g in sorted_group) else 2
-
+        # One button per row when any name is long (more room to wrap), else two.
+        columns = 1 if any(len(g.name) > _BUTTON_LONG_THRESHOLD for g in group_games) else 2
         current_row = []
-        for g in sorted_group:
+        for g in group_games:
             count = vote_counts[g.id]
             prefix = "⭐ " if g.id in priority_ids else ""
             suffix = f" ({count})" if count > 0 and not hide_results else ""
             label = _wrap_button_label(prefix, g.name, suffix)
             current_row.append(InlineKeyboardButton(label, callback_data=f"vote:{poll_id}:{g.id}"))
-
             if len(current_row) == columns:
                 keyboard.append(current_row)
                 current_row = []
         if current_row:
             keyboard.append(current_row)
+
+    levels_desc = sorted(groups.keys(), reverse=True)
+    total_game_buttons = sum(len(groups[level]) for level in levels_desc)
+
+    if total_game_buttons <= _POLL_KEYBOARD_PAGE_THRESHOLD:
+        # Fits one keyboard: render every complexity group at once (unchanged
+        # behaviour for typical polls).
+        for level in levels_desc:
+            _emit_group(level, _sorted_group(level))
+    else:
+        # Too many buttons for a single reply_markup — Telegram rejects it with
+        # "Reply markup is too long", which silently froze large polls. Show one
+        # complexity category per page (splitting any oversized category into
+        # sub-pages) with navigation between them.
+        pages = []  # each entry: (level, games_subset)
+        for level in levels_desc:
+            sg = _sorted_group(level)
+            for i in range(0, len(sg), _POLL_KEYBOARD_PAGE_SIZE):
+                pages.append((level, sg[i : i + _POLL_KEYBOARD_PAGE_SIZE]))
+
+        current_page = (game_poll.current_page if game_poll else None) or 0
+        current_page = max(0, min(current_page, len(pages) - 1))
+        page_level, page_games = pages[current_page]
+
+        # Navigation row: arrows appear only when there's somewhere to go; the
+        # centre label is a no-op that just re-renders the current page.
+        nav_row = []
+        if current_page > 0:
+            nav_row.append(
+                InlineKeyboardButton("◀", callback_data=f"poll_page:{poll_id}:{current_page - 1}")
+            )
+        level_name = page_level if page_level > 0 else "Unrated"
+        nav_row.append(
+            InlineKeyboardButton(
+                f"📄 Complexity {level_name} · {current_page + 1}/{len(pages)}",
+                callback_data=f"poll_page:{poll_id}:{current_page}",
+            )
+        )
+        if current_page < len(pages) - 1:
+            nav_row.append(
+                InlineKeyboardButton("▶", callback_data=f"poll_page:{poll_id}:{current_page + 1}")
+            )
+        keyboard.append(nav_row)
+        _emit_group(page_level, page_games)
 
     # Add action row
     row_actions = [
@@ -3415,6 +3465,30 @@ async def _handle_poll_refresh(query, context: ContextTypes.DEFAULT_TYPE, poll_i
                 valid_games,
                 priority_ids,
             )
+
+
+async def _handle_poll_page(
+    query, context: ContextTypes.DEFAULT_TYPE, poll_id: str, page: int
+) -> None:
+    """Switch a paginated poll's shared message to the requested keyboard page.
+
+    The page is persisted on the poll so vote-driven re-renders stay on it
+    instead of snapping back to the first page. Rendered inline (not debounced)
+    so navigation feels immediate.
+    """
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
+    async with db.AsyncSessionLocal() as session:
+        game_poll = await session.get(GameNightPoll, poll_id)
+        if not game_poll:
+            return
+        game_poll.current_page = page
+        await session.commit()
+        chat_id = game_poll.chat_id
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        await render_poll_message(
+            context.bot, chat_id, game_poll.message_id, session, poll_id, valid_games, priority_ids
+        )
 
 
 async def _handle_poll_category_vote(
@@ -3724,6 +3798,7 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
     - poll_random_vote:<poll_id>:<level>
     - poll_close:<poll_id>
     - poll_add:<poll_id>
+    - poll_page:<poll_id>:<page_index>
     """
     query = update.callback_query
     data = query.data
@@ -3733,6 +3808,13 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
 
     if action == "poll_refresh":
         await _handle_poll_refresh(query, context, poll_id)
+
+    elif action == "poll_page":
+        if len(parts) < 3:
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("Invalid data")
+            return
+        await _handle_poll_page(query, context, poll_id, int(parts[2]))
 
     elif action == "poll_random_vote":
         if len(parts) < 3:

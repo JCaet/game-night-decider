@@ -88,6 +88,7 @@ def main():
     app.add_handler(CallbackQueryHandler(custom_poll_vote_callback, pattern=r"^vote:"))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_refresh:"))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_close:"))
+    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_page:"))
     app.add_handler(
         CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_random_vote:")
     )
