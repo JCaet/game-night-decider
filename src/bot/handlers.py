@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
+from telegram.helpers import escape_markdown
 
 from src.core import db
 from src.core.bgg import BGGClient
@@ -3136,7 +3137,13 @@ async def render_poll_message(
     active_levels = set(group_games_by_complexity(games).keys()) if games else set()
 
     for v in all_votes:
-        voter_display = voter_name_map.get(v.user_id, v.user_name or f"User {v.user_id}")
+        # Escape voter names for the Markdown message below: Telegram usernames
+        # and first names routinely contain '_'/'*' which, left raw, make the
+        # legacy-Markdown parser reject the whole edit (BadRequest: can't parse
+        # entities) — silently freezing the poll on the first such voter.
+        voter_display = escape_markdown(
+            voter_name_map.get(v.user_id, v.user_name or f"User {v.user_id}"), version=1
+        )
         if v.vote_type == VoteType.CATEGORY:
             level = v.category_level
             if level not in active_levels:
@@ -3235,7 +3242,12 @@ async def render_poll_message(
                         else:
                             voters_text = ", ".join(voters_by_game[g.id])
 
-                        text_lines.append(f"**{count}** - {star}{g.name}")
+                        # Escape the game name for Markdown (BGG titles can
+                        # contain '_'/'*'/'['); button labels below are literal
+                        # text and must stay unescaped.
+                        text_lines.append(
+                            f"**{count}** - {star}{escape_markdown(g.name, version=1)}"
+                        )
                         text_lines.append(f"   └ _{voters_text}_")
                         leader_found = True
 
@@ -3301,18 +3313,35 @@ async def render_poll_message(
         row_actions.insert(1, InlineKeyboardButton("➕ Add", callback_data=f"poll_add:{poll_id}"))
     keyboard.append(row_actions)
 
+    markup = InlineKeyboardMarkup(keyboard)
     try:
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
             text=text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=markup,
             parse_mode="Markdown",
         )
     except Exception as e:
         # Ignore "Message is not modified" errors (common in rapid updates)
-        if "Message is not modified" not in str(e):
-            logger.warning(f"Failed to update poll message: {e}")
+        if "Message is not modified" in str(e):
+            return
+        # Any other failure (e.g. a Markdown parse error from content we didn't
+        # escape) would otherwise silently freeze the poll: the bad text stays in
+        # place, so every later edit fails too and the tally stops updating. Fall
+        # back to a plain-text edit (literal markup, but live counts) so the poll
+        # keeps working, and log the real error so the cause stays diagnosable.
+        logger.warning(f"Failed to update poll message ({e}); retrying without Markdown")
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=markup,
+            )
+        except Exception as e2:
+            if "Message is not modified" not in str(e2):
+                logger.warning(f"Plain-text poll update also failed: {e2}")
 
 
 # Debounce window for coalescing vote-driven re-renders. A burst of votes within
