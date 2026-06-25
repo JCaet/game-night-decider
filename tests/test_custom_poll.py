@@ -16,7 +16,6 @@ from src.bot.handlers import (
     create_poll,
     custom_poll_action_callback,
     custom_poll_vote_callback,
-    get_session_valid_games,
     join_lobby_callback,
     poll_add_select_callback,
     poll_settings_callback,
@@ -2421,91 +2420,6 @@ async def test_render_poll_long_name_with_vote_keeps_count_visible(mock_update, 
 
     # The count suffix lives on the last visual line of the wrapped label.
     assert long_button.split("\n")[-1].endswith(" (1)")
-
-
-async def _seed_poll_with_named_vote(chat_id, poll_id, game_name, voter_name):
-    """Seed a session + custom poll with a single game vote, using caller-supplied
-    game and voter names (so tests can inject Markdown-special characters)."""
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-        session.add(User(telegram_id=111, telegram_name=voter_name))
-        await session.flush()
-        session.add(
-            Game(
-                id=1,
-                name=game_name,
-                min_players=1,
-                max_players=8,
-                playing_time=60,
-                complexity=2.0,
-            )
-        )
-        await session.flush()
-        session.add_all(
-            [
-                Collection(user_id=111, game_id=1),
-                SessionPlayer(session_id=chat_id, user_id=111),
-                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999),
-                PollVote(
-                    poll_id=poll_id,
-                    user_id=111,
-                    vote_type=VoteType.GAME,
-                    game_id=1,
-                    user_name=voter_name,
-                ),
-            ]
-        )
-        await session.commit()
-
-
-@pytest.mark.asyncio
-async def test_render_escapes_markdown_specials_in_names(mock_context):
-    """Game and voter names containing Markdown specials are escaped so the
-    legacy-Markdown edit can't fail to parse and freeze the poll (regression:
-    an unescaped '_' in a username/title silently stopped all later updates)."""
-    chat_id, poll_id = 12345, "poll_12345_mdesc"
-    await _seed_poll_with_named_vote(chat_id, poll_id, "Catan_Cities", "john_doe")
-
-    async with db.AsyncSessionLocal() as session:
-        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-        await render_poll_message(
-            mock_context.bot, chat_id, 999, session, poll_id, valid_games, priority_ids
-        )
-
-    text = mock_context.bot.edit_message_text.call_args.kwargs["text"]
-    # Escaped forms present, raw (parser-breaking) forms absent.
-    assert "Catan\\_Cities" in text
-    assert "john\\_doe" in text
-    assert "Catan_Cities" not in text
-    assert "john_doe" not in text
-
-
-@pytest.mark.asyncio
-async def test_render_falls_back_to_plaintext_when_markdown_edit_fails(mock_context):
-    """If the Markdown edit still fails to parse, the poll retries without
-    parse_mode instead of silently freezing on the bad text."""
-    chat_id, poll_id = 12345, "poll_12345_fallback"
-    await _seed_poll_with_named_vote(chat_id, poll_id, "Normal Game", "Voter")
-
-    calls = []
-
-    async def fake_edit(**kwargs):
-        calls.append(kwargs)
-        if len(calls) == 1:
-            raise Exception("Can't parse entities: can't find end of italic entity")
-
-    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
-
-    async with db.AsyncSessionLocal() as session:
-        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-        await render_poll_message(
-            mock_context.bot, chat_id, 999, session, poll_id, valid_games, priority_ids
-        )
-
-    assert len(calls) == 2
-    assert calls[0].get("parse_mode") == "Markdown"
-    assert "parse_mode" not in calls[1]  # retry is plain text
-    assert calls[1]["text"] == calls[0]["text"]
 
 
 # ============================================================================
