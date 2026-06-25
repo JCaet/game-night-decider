@@ -128,6 +128,21 @@ jobs:
             --cpu-boost
             --allow-unauthenticated
 
+      - name: Job summary
+        if: always()
+        run: |
+          ref="${{ inputs.ref || github.sha }}"
+          {
+            echo "## Cloud Run deploy"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Deployed ref | \`$ref\` |"
+            echo "| Image | \`$SERVICE_NAME:$ref\` |"
+            echo "| Region | \`$REGION\` |"
+            echo "| Triggered by | \`${{ github.event_name }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Smoke test
         run: |
           status=$(curl -s -o /dev/null -w '%{http_code}' "${{ vars.WEBHOOK_URL }}/telegram")
