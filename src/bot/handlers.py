@@ -2989,8 +2989,10 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
         # Use PollService for vote casting
         vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
 
-        # Calculate valid games count for auto-limit (include user-added games)
-        valid_games, _ = await get_session_valid_games(session, chat_id)
+        # Fetch valid games once and reuse for both the vote-limit check and the
+        # UI render below — the game set can't change while casting a vote, so a
+        # second fetch would be wasted work (and a wasted Cloud SQL round-trip).
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
         valid_games = await _merge_added_games(session, poll_id, valid_games)
         game_count = len(valid_games) if valid_games else 0
         valid_game_ids = {g.id for g in valid_games}
@@ -3013,15 +3015,16 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
             valid_category_levels=valid_category_levels,
         )
 
-        await session.commit()
+        # cast_vote commits internally; no extra commit needed here.
         with contextlib.suppress(telegram.error.BadRequest):
             await query.answer(result.message)
 
-        if result.success:
-            # Refresh UI
-            priority_ids = set()  # Optimized: re-fetch inside get_session_valid_games
-            valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-
+        # Debounce the re-render so a burst of votes collapses into one edit.
+        # Fall back to an inline render (reusing the games already fetched
+        # above) if the job queue isn't available.
+        if result.success and not _schedule_poll_render(
+            context, chat_id, game_poll.message_id, poll_id
+        ):
             await render_poll_message(
                 context.bot,
                 chat_id,
@@ -3030,6 +3033,7 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
                 poll_id,
                 valid_games,
                 priority_ids,
+                already_merged=True,
             )
 
 
@@ -3092,10 +3096,17 @@ async def _merge_added_games(session, poll_id: str, games: list) -> list:
     return merged
 
 
-async def render_poll_message(bot, chat_id, message_id, session, poll_id, games, priority_ids):
-    """Update custom poll message with current vote state."""
+async def render_poll_message(
+    bot, chat_id, message_id, session, poll_id, games, priority_ids, already_merged=False
+):
+    """Update custom poll message with current vote state.
+
+    Set already_merged=True when the caller has already folded user-added games
+    into `games` (via _merge_added_games), to skip a redundant query.
+    """
     # Include user-added games (from allow_adding_options)
-    games = await _merge_added_games(session, poll_id, games)
+    if not already_merged:
+        games = await _merge_added_games(session, poll_id, games)
 
     # Fetch all votes for this poll, then drop votes from users who have left
     # the lobby. Rows stay in the DB (so a rejoin auto-resumes them) but are
@@ -3304,6 +3315,65 @@ async def render_poll_message(bot, chat_id, message_id, session, poll_id, games,
             logger.warning(f"Failed to update poll message: {e}")
 
 
+# Debounce window for coalescing vote-driven re-renders. A burst of votes within
+# this window collapses into a single edit_message_text call, which avoids
+# Telegram's per-message edit rate limit (the cause of the laggy top-of-poll
+# tally) and cuts redundant DB renders.
+_POLL_RENDER_DEBOUNCE_SECONDS = 0.5
+
+
+async def _render_poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job-queue callback that renders a poll from fresh state.
+
+    Runs after the debounce window so it reflects every vote cast during the
+    burst, not just the one that scheduled it.
+    """
+    data = cast(dict, context.job.data)
+    poll_id = data["poll_id"]
+    chat_id = data["chat_id"]
+    message_id = data["message_id"]
+    async with db.AsyncSessionLocal() as session:
+        # The poll may have been closed during the debounce window — closing
+        # deletes the record and rewrites the message to show results. Skip the
+        # render so we don't clobber the results message with a stale tally.
+        if await session.get(GameNightPoll, poll_id) is None:
+            return
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        await render_poll_message(
+            context.bot, chat_id, message_id, session, poll_id, valid_games, priority_ids
+        )
+
+
+def _schedule_poll_render(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, poll_id: str
+) -> bool:
+    """Debounce a poll re-render: cancel any pending render for this poll and
+    schedule a fresh one. Returns False if no job queue is available (caller
+    should then render inline as a fallback)."""
+    job_queue = context.job_queue
+    if job_queue is None:
+        return False
+    name = f"render:{poll_id}"
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    job_queue.run_once(
+        _render_poll_job,
+        when=_POLL_RENDER_DEBOUNCE_SECONDS,
+        name=name,
+        data={"chat_id": chat_id, "message_id": message_id, "poll_id": poll_id},
+    )
+    return True
+
+
+def _cancel_poll_render(context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
+    """Cancel any pending debounced render for a poll (e.g. on close)."""
+    job_queue = context.job_queue
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(f"render:{poll_id}"):
+        job.schedule_removal()
+
+
 # ---------------------------------------------------------------------------- #
 # Poll Action Handlers (extracted from custom_poll_action_callback)
 # ---------------------------------------------------------------------------- #
@@ -3392,11 +3462,14 @@ async def _handle_poll_category_vote(
             valid_category_levels=valid_category_levels,
         )
 
-        await session.commit()
+        # cast_vote commits internally; no extra commit needed here.
         await query.answer(result.message)
 
-        if result.success:
-            # Refresh UI
+        # Debounce the re-render (see custom_poll_vote_callback). Inline
+        # fallback reuses the already-merged games from above.
+        if result.success and not _schedule_poll_render(
+            context, chat_id, query.message.message_id, poll_id
+        ):
             await render_poll_message(
                 context.bot,
                 chat_id,
@@ -3405,6 +3478,7 @@ async def _handle_poll_category_vote(
                 poll_id,
                 valid_games,
                 priority_ids,
+                already_merged=True,
             )
 
 
@@ -3412,6 +3486,10 @@ async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id:
     """Close the poll, resolve category votes, calculate winner, and end session."""
     await query.answer("Closing poll...")
     chat_id = query.message.chat.id
+
+    # Drop any pending debounced render so it can't fire after close and
+    # overwrite the results message with a stale tally.
+    _cancel_poll_render(context, poll_id)
 
     async with db.AsyncSessionLocal() as session:
         game_poll = await session.get(GameNightPoll, poll_id)
