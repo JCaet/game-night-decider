@@ -121,11 +121,12 @@ jobs:
           flags: |
             --cpu=1
             --memory=512Mi
-            --min-instances=0
+            --min-instances=1
             --max-instances=3
             --concurrency=40
             --timeout=30s
             --cpu-boost
+            --no-cpu-throttling
             --allow-unauthenticated
 
       - name: Smoke test
