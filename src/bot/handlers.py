@@ -1,4 +1,5 @@
 import contextlib
+import json
 import logging
 import math
 import random
@@ -166,6 +167,123 @@ _BUTTON_MAX_LINES = 3
 # giving the wrapper twice the horizontal room and reducing how often it has
 # to wrap or fall back to the ellipsis placeholder.
 _BUTTON_LONG_THRESHOLD = 18
+
+# Telegram rejects an oversized inline keyboard with "Reply markup is too long",
+# which (since the error was swallowed) silently froze polls whose game list was
+# too big to fit one keyboard. We cap the serialized reply_markup to a safe byte
+# budget: game buttons are added highest-complexity-first and we stop before the
+# budget is exceeded, so the games that don't get an individual button are the
+# lowest-complexity ones (still votable via their complexity-category button).
+# The exact server limit isn't documented, so render_poll_message also halves
+# this budget and retries if an edit is still rejected — it self-corrects rather
+# than freezing. Category headers and the action row are always kept.
+_REPLY_MARKUP_BUDGET_BYTES = 9000
+_RENDER_MAX_ATTEMPTS = 4
+
+
+def _button_bytes(button: InlineKeyboardButton) -> int:
+    """Approximate the serialized byte cost of one inline-keyboard button.
+
+    Counts UTF-8 bytes of the compact JSON (emoji/non-ASCII counted at their
+    real byte size) plus a couple of bytes for surrounding array punctuation.
+    Used to budget the keyboard; the retry in render_poll_message covers any
+    slack between this estimate and Telegram's actual accounting.
+    """
+    payload = json.dumps(button.to_dict(), ensure_ascii=False, separators=(",", ":"))
+    return len(payload.encode("utf-8")) + 2
+
+
+def _build_poll_keyboard(
+    poll_id: str,
+    levels_desc: list[int],
+    sorted_by_level: dict[int, list],
+    vote_counts: dict[int, int],
+    priority_ids: set[int],
+    category_vote_counts: dict[int, int],
+    hide_results: bool,
+    allow_adding: bool,
+    budget_bytes: int,
+) -> tuple[list[list[InlineKeyboardButton]], int, int]:
+    """Build the custom-poll keyboard within a serialized-size budget.
+
+    Returns (keyboard, shown_games, hidden_games). A category-vote header is
+    emitted for every complexity level (so dropped games stay votable) and the
+    action row is always included; individual game buttons are added
+    highest-complexity-first until the next would exceed ``budget_bytes``, so any
+    games left without a button are the lowest-complexity ones.
+    """
+
+    def _game_button(g) -> InlineKeyboardButton:
+        count = vote_counts.get(g.id, 0)
+        prefix = "⭐ " if g.id in priority_ids else ""
+        suffix = f" ({count})" if count > 0 and not hide_results else ""
+        label = _wrap_button_label(prefix, g.name, suffix)
+        return InlineKeyboardButton(label, callback_data=f"vote:{poll_id}:{g.id}")
+
+    # Action row is fixed; reserve its cost up front.
+    action_row = [
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"poll_refresh:{poll_id}"),
+        InlineKeyboardButton("🛑 Close", callback_data=f"poll_close:{poll_id}"),
+    ]
+    if allow_adding:
+        action_row.insert(1, InlineKeyboardButton("➕ Add", callback_data=f"poll_add:{poll_id}"))
+
+    used = sum(_button_bytes(b) for b in action_row)
+
+    # Reserve every level's category header (cheap, ≤6) so dropped games keep a
+    # category-vote path.
+    headers: dict[int, InlineKeyboardButton] = {}
+    for level in levels_desc:
+        cat_count = category_vote_counts.get(level, 0)
+        show_count = cat_count > 0 and not hide_results
+        level_name = level if level > 0 else "Unrated"
+        header_text = (
+            f"--- {level_name} ---" if not show_count else f"--- {level_name} ({cat_count}) ---"
+        )
+        header = InlineKeyboardButton(
+            header_text, callback_data=f"poll_random_vote:{poll_id}:{level}"
+        )
+        headers[level] = header
+        used += _button_bytes(header)
+
+    # Add game buttons highest-complexity-first until the budget is reached.
+    shown_by_level: dict[int, list] = {level: [] for level in levels_desc}
+    shown = 0
+    total = 0
+    budget_reached = False
+    for level in levels_desc:
+        for g in sorted_by_level[level]:
+            total += 1
+            if budget_reached:
+                continue
+            cost = _button_bytes(_game_button(g))
+            if used + cost > budget_bytes:
+                budget_reached = True
+                continue
+            used += cost
+            shown_by_level[level].append(g)
+            shown += 1
+
+    # Assemble the keyboard: header + this level's shown buttons, per level.
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for level in levels_desc:
+        keyboard.append([headers[level]])
+        games = shown_by_level[level]
+        if not games:
+            continue
+        # One button per row when any name is long (more room to wrap), else two.
+        columns = 1 if any(len(g.name) > _BUTTON_LONG_THRESHOLD for g in games) else 2
+        current_row: list[InlineKeyboardButton] = []
+        for g in games:
+            current_row.append(_game_button(g))
+            if len(current_row) == columns:
+                keyboard.append(current_row)
+                current_row = []
+        if current_row:
+            keyboard.append(current_row)
+
+    keyboard.append(action_row)
+    return keyboard, shown, total - shown
 
 
 def _wrap_button_label(prefix: str, name: str, suffix: str) -> str:
@@ -3242,77 +3360,65 @@ async def render_poll_message(
     if not leader_found:
         text_lines.append("_No votes yet! Tap buttons below._")
 
-    text = "\n".join(text_lines)
-
-    # Build Keyboard with Complexity Grouping
-    keyboard = []
-
-    # Grouped by Complexity (Descending)
-    for level in sorted(groups.keys(), reverse=True):
+    # Pre-sort each complexity level's games once (shuffle or vote/star order).
+    # A per-group seed keeps order stable across re-renders and isolates groups
+    # from each other's changes. The keyboard builder consumes these and may
+    # include only a subset to stay within Telegram's reply_markup size limit.
+    levels_desc = sorted(groups.keys(), reverse=True)
+    sorted_by_level: dict[int, list] = {}
+    for level in levels_desc:
         group = groups[level]
-
-        # Shuffle game order within group if enabled, otherwise sort by votes/starred.
-        # Use a per-group seed so adding/removing a game in one complexity group
-        # doesn't reshuffle others. Input is sorted by id first so the shuffle is
-        # reproducible regardless of DB row order.
         if shuffle:
-            sorted_group = sorted(group, key=lambda g: g.id)
-            random.Random(shuffle_seed ^ level).shuffle(sorted_group)
+            sg = sorted(group, key=lambda g: g.id)
+            random.Random(shuffle_seed ^ level).shuffle(sg)
         else:
-            sorted_group = sorted(group, key=sort_key)
+            sg = sorted(group, key=sort_key)
+        sorted_by_level[level] = sg
 
-        # Add Separator/Header with Category Vote action
-        # Show category vote count on header (hidden when hide_results is on)
-        cat_count = category_vote_counts.get(level, 0)
-        show_count = cat_count > 0 and not hide_results
-        if level > 0:
-            header_text = f"--- {level} ---" if not show_count else f"--- {level} ({cat_count}) ---"
-        else:
-            header_text = "--- Unrated ---" if not show_count else f"--- Unrated ({cat_count}) ---"
-        keyboard.append(
-            [InlineKeyboardButton(header_text, callback_data=f"poll_random_vote:{poll_id}:{level}")]
+    # Build + edit within a shrinking size budget. If Telegram still rejects the
+    # keyboard as too long, halve the budget and retry so the poll can never
+    # freeze — it just shows fewer game buttons (dropping lowest complexity
+    # first; those games stay votable via their complexity-category button).
+    budget = _REPLY_MARKUP_BUDGET_BYTES
+    for attempt in range(_RENDER_MAX_ATTEMPTS):
+        keyboard, shown, hidden = _build_poll_keyboard(
+            poll_id,
+            levels_desc,
+            sorted_by_level,
+            vote_counts,
+            priority_ids,
+            category_vote_counts,
+            hide_results,
+            allow_adding,
+            budget,
         )
-
-        # When any game in the group has a long name, render the group at
-        # one button per row so wrapping has more horizontal room. Other
-        # groups stay at two-per-row to keep the keyboard compact.
-        columns = 1 if any(len(g.name) > _BUTTON_LONG_THRESHOLD for g in sorted_group) else 2
-
-        current_row = []
-        for g in sorted_group:
-            count = vote_counts[g.id]
-            prefix = "⭐ " if g.id in priority_ids else ""
-            suffix = f" ({count})" if count > 0 and not hide_results else ""
-            label = _wrap_button_label(prefix, g.name, suffix)
-            current_row.append(InlineKeyboardButton(label, callback_data=f"vote:{poll_id}:{g.id}"))
-
-            if len(current_row) == columns:
-                keyboard.append(current_row)
-                current_row = []
-        if current_row:
-            keyboard.append(current_row)
-
-    # Add action row
-    row_actions = [
-        InlineKeyboardButton("🔄 Refresh", callback_data=f"poll_refresh:{poll_id}"),
-        InlineKeyboardButton("🛑 Close", callback_data=f"poll_close:{poll_id}"),
-    ]
-    if allow_adding:
-        row_actions.insert(1, InlineKeyboardButton("➕ Add", callback_data=f"poll_add:{poll_id}"))
-    keyboard.append(row_actions)
-
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        # Ignore "Message is not modified" errors (common in rapid updates)
-        if "Message is not modified" not in str(e):
+        lines = list(text_lines)
+        if hidden > 0 and not hide_results:
+            lines.insert(
+                3,
+                f"🎛️ _Showing {shown} of {shown + hidden} games as buttons — "
+                f"lower-complexity games are votable via their complexity category._",
+            )
+        text = "\n".join(lines)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown",
+            )
+            return
+        except Exception as e:
+            msg = str(e)
+            # Ignore "Message is not modified" errors (common in rapid updates).
+            if "Message is not modified" in msg:
+                return
+            if "too long" in msg.lower() and attempt < _RENDER_MAX_ATTEMPTS - 1:
+                budget //= 2  # keyboard still too big — shrink and retry
+                continue
             logger.warning(f"Failed to update poll message: {e}")
+            return
 
 
 # Debounce window for coalescing vote-driven re-renders. A burst of votes within
