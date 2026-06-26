@@ -5,12 +5,16 @@ This tests the alternative poll mechanism that uses inline buttons
 instead of native Telegram polls to overcome the 10-option limit.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select
+from telegram import InlineKeyboardMarkup
 
+import src.bot.handlers as handlers
 from src.bot.handlers import (
+    _build_poll_keyboard,
     _render_poll_job,
     _wrap_button_label,
     create_poll,
@@ -2575,3 +2579,150 @@ async def test_render_job_skips_closed_poll(mock_context):
     await _render_poll_job(mock_context)
 
     mock_context.bot.edit_message_text.assert_not_called()
+
+
+# ============================================================================
+# Keyboard Size-Budget Tests (large game lists)
+# ============================================================================
+
+
+def _vote_ids_from_markup(markup):
+    return [
+        int(btn.callback_data.split(":")[2])
+        for row in markup.inline_keyboard
+        for btn in row
+        if btn.callback_data and btn.callback_data.startswith("vote:")
+    ]
+
+
+def _category_levels_from_markup(markup):
+    return [
+        int(btn.callback_data.split(":")[2])
+        for row in markup.inline_keyboard
+        for btn in row
+        if btn.callback_data and btn.callback_data.startswith("poll_random_vote:")
+    ]
+
+
+def test_build_poll_keyboard_drops_lowest_complexity_first():
+    """Within a tight budget, only the highest-complexity games get buttons; the
+    lowest-complexity ones are dropped but keep their category-vote header."""
+    poll_id = "poll_budget"
+    levels_desc = [4, 2]
+    sorted_by_level = {
+        4: [SimpleNamespace(id=i, name=f"G{i}") for i in range(1, 21)],
+        2: [SimpleNamespace(id=i, name=f"G{i}") for i in range(101, 121)],
+    }
+    vote_counts = {g.id: 0 for games in sorted_by_level.values() for g in games}
+
+    keyboard, shown, hidden = _build_poll_keyboard(
+        poll_id, levels_desc, sorted_by_level, vote_counts, set(), {}, False, False, 400
+    )
+
+    markup = InlineKeyboardMarkup(keyboard)
+    vote_ids = _vote_ids_from_markup(markup)
+    assert vote_ids, "at least one high-complexity game should fit"
+    assert all(1 <= i <= 20 for i in vote_ids)  # only level-4 games (ids 1-20)
+    assert shown == len(vote_ids)
+    assert hidden == 40 - shown > 0  # some games were dropped
+    # Both categories keep a header so dropped games stay votable.
+    assert set(_category_levels_from_markup(markup)) == {4, 2}
+
+
+async def _seed_poll_with_levels(chat_id, poll_id, level_counts, message_id=999):
+    """Seed a custom poll whose single player owns games spread across complexity
+    levels. `level_counts` maps complexity float -> count. Game ids are assigned
+    sequentially in the iteration order of `level_counts`."""
+    async with db.AsyncSessionLocal() as session:
+        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(User(telegram_id=111, telegram_name="Solo"))
+        await session.flush()
+        gid = 0
+        games = []
+        for complexity, count in level_counts.items():
+            for _ in range(count):
+                gid += 1
+                games.append(
+                    Game(
+                        id=gid,
+                        name=f"Game{gid:03d}",
+                        min_players=1,
+                        max_players=8,
+                        playing_time=60,
+                        complexity=complexity,
+                    )
+                )
+        session.add_all(games)
+        await session.flush()
+        session.add_all([Collection(user_id=111, game_id=g.id) for g in games])
+        session.add(SessionPlayer(session_id=chat_id, user_id=111))
+        session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=message_id))
+        await session.commit()
+        return [g.id for g in games]
+
+
+@pytest.mark.asyncio
+async def test_small_poll_shows_all_games_and_no_note(mock_context):
+    """A poll that fits the budget shows every game and adds no truncation note."""
+    chat_id, poll_id = 12345, "poll_small"
+    ids = await _seed_poll_with_levels(chat_id, poll_id, {2.0: 5})
+
+    async with db.AsyncSessionLocal() as session:
+        games = list((await session.execute(select(Game))).scalars().all())
+        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
+
+    call = mock_context.bot.edit_message_text.call_args
+    assert "games as buttons" not in call.kwargs["text"]
+    assert sorted(_vote_ids_from_markup(call.kwargs["reply_markup"])) == sorted(ids)
+
+
+@pytest.mark.asyncio
+async def test_large_poll_drops_lowest_complexity_and_notes_it(mock_context, monkeypatch):
+    """Over the budget, the poll keeps high-complexity game buttons, drops the
+    lowest-complexity ones, and tells users where to find them."""
+    monkeypatch.setattr(handlers, "_REPLY_MARKUP_BUDGET_BYTES", 500)
+    chat_id, poll_id = 12345, "poll_big"
+    # ids 1-10 = complexity 4 (high), ids 11-20 = complexity 2 (low).
+    await _seed_poll_with_levels(chat_id, poll_id, {4.0: 10, 2.0: 10})
+
+    async with db.AsyncSessionLocal() as session:
+        games = list((await session.execute(select(Game))).scalars().all())
+        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
+
+    call = mock_context.bot.edit_message_text.call_args
+    markup = call.kwargs["reply_markup"]
+    vote_ids = _vote_ids_from_markup(markup)
+    assert vote_ids and all(1 <= i <= 10 for i in vote_ids)  # only high-complexity shown
+    assert len(vote_ids) < 20  # some dropped
+    assert "games as buttons" in call.kwargs["text"]
+    # Both complexity categories keep a header (low-complexity games votable there).
+    assert set(_category_levels_from_markup(markup)) == {4, 2}
+
+
+@pytest.mark.asyncio
+async def test_render_retries_when_reply_markup_too_long(mock_context):
+    """If Telegram still rejects the keyboard as too long, the render retries
+    (with a smaller budget) instead of silently freezing the poll."""
+    chat_id, poll_id = 12345, "poll_retry"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 12})
+
+    calls = []
+
+    async def fake_edit(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise Exception("Bad Request: reply markup is too long")
+
+    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
+
+    async with db.AsyncSessionLocal() as session:
+        games = list((await session.execute(select(Game))).scalars().all())
+        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
+
+    assert len(calls) == 2  # first failed, retried once
+
+    def n_votes(kwargs):
+        return len(_vote_ids_from_markup(kwargs["reply_markup"]))
+
+    # Retry shrinks the budget, so it never shows more buttons than the failed try.
+    assert n_votes(calls[1]) <= n_votes(calls[0])
