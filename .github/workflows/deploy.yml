@@ -58,7 +58,7 @@ jobs:
           token_format: 'access_token'
 
       - name: Docker Login to Artifact Registry
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4
         with:
           registry: us-central1-docker.pkg.dev
           username: oauth2accesstoken
