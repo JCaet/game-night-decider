@@ -85,6 +85,11 @@ def main():
     app.add_handler(CallbackQueryHandler(toggle_weights_callback, pattern="^toggle_weights$"))
     app.add_handler(CallbackQueryHandler(poll_settings_callback, pattern="^poll_settings$"))
     app.add_handler(CallbackQueryHandler(toggle_poll_mode_callback, pattern="^toggle_poll_mode$"))
+    # Short forms ("v:<game_id>", "c:<level>") omit the poll id to keep the poll
+    # keyboard inside Telegram's reply_markup size limit; the long forms are kept
+    # registered so keyboards already sent to chats keep working after deploy.
+    app.add_handler(CallbackQueryHandler(custom_poll_vote_callback, pattern=r"^v:"))
+    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^c:"))
     app.add_handler(CallbackQueryHandler(custom_poll_vote_callback, pattern=r"^vote:"))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_refresh:"))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_close:"))

@@ -1126,8 +1126,8 @@ async def test_custom_poll_ui_grouping(mock_update, mock_context):
     assert "--- 4 ---" in labels or any("--- 4" in label for label in labels)
     assert "--- 1 ---" in labels or any("--- 1" in label for label in labels)
 
-    # Verify Callback data
-    assert any("poll_random_vote" in cb for cb in callbacks)
+    # Verify Callback data: category headers carry the short category prefix
+    assert any(cb.startswith(handlers._CB_CATEGORY) for cb in callbacks)
 
 
 @pytest.mark.asyncio
@@ -1430,7 +1430,7 @@ async def test_shuffle_is_stable_across_renders(mock_context):
             btn.callback_data
             for row in kb.inline_keyboard
             for btn in row
-            if btn.callback_data and btn.callback_data.startswith("vote:")
+            if btn.callback_data and btn.callback_data.startswith(handlers._CB_VOTE)
         ]
 
     async with db.AsyncSessionLocal() as session:
@@ -2314,11 +2314,11 @@ async def test_render_poll_long_name_group_renders_one_per_row(mock_update, mock
     await custom_poll_action_callback(mock_update, mock_context)
 
     keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
-    # Find the two game-vote rows (callback_data starts with "vote:")
+    # Find the two game-vote rows (callback_data starts with the vote prefix)
     vote_rows = [
         row
         for row in keyboard.inline_keyboard
-        if row and row[0].callback_data and row[0].callback_data.startswith("vote:")
+        if row and row[0].callback_data and row[0].callback_data.startswith(handlers._CB_VOTE)
     ]
     assert len(vote_rows) == 2, "expected one row per game when group has a long name"
     assert all(len(row) == 1 for row in vote_rows), "long-name group should be one-per-row"
@@ -2367,7 +2367,7 @@ async def test_render_poll_short_names_stay_two_per_row(mock_update, mock_contex
     vote_rows = [
         row
         for row in keyboard.inline_keyboard
-        if row and row[0].callback_data and row[0].callback_data.startswith("vote:")
+        if row and row[0].callback_data and row[0].callback_data.startswith(handlers._CB_VOTE)
     ]
     assert len(vote_rows) == 1, "expected a single row holding both short-name buttons"
     assert len(vote_rows[0]) == 2, "short-name group should stay two-per-row"
@@ -2588,19 +2588,19 @@ async def test_render_job_skips_closed_poll(mock_context):
 
 def _vote_ids_from_markup(markup):
     return [
-        int(btn.callback_data.split(":")[2])
+        int(btn.callback_data.removeprefix(handlers._CB_VOTE))
         for row in markup.inline_keyboard
         for btn in row
-        if btn.callback_data and btn.callback_data.startswith("vote:")
+        if btn.callback_data and btn.callback_data.startswith(handlers._CB_VOTE)
     ]
 
 
 def _category_levels_from_markup(markup):
     return [
-        int(btn.callback_data.split(":")[2])
+        int(btn.callback_data.removeprefix(handlers._CB_CATEGORY))
         for row in markup.inline_keyboard
         for btn in row
-        if btn.callback_data and btn.callback_data.startswith("poll_random_vote:")
+        if btn.callback_data and btn.callback_data.startswith(handlers._CB_CATEGORY)
     ]
 
 
@@ -2726,3 +2726,162 @@ async def test_render_retries_when_reply_markup_too_long(mock_context):
 
     # Retry shrinks the budget, so it never shows more buttons than the failed try.
     assert n_votes(calls[1]) <= n_votes(calls[0])
+
+
+def test_build_poll_keyboard_keeps_starred_and_voted_over_complexity():
+    """The budget is spent on relevance, not raw complexity: a starred or
+    already-voted low-complexity game keeps its button while plain
+    high-complexity games lose theirs."""
+    levels_desc = [4, 2]
+    high = [SimpleNamespace(id=i, name=f"H{i}") for i in range(1, 21)]
+    low = [SimpleNamespace(id=i, name=f"L{i}") for i in range(101, 121)]
+    sorted_by_level = {4: high, 2: low}
+    vote_counts = {g.id: 0 for g in high + low}
+    vote_counts[110] = 5  # a low-complexity game people actually voted for
+    priority_ids = {115}  # a starred low-complexity game
+
+    keyboard, shown, hidden = _build_poll_keyboard(
+        "poll_rank", levels_desc, sorted_by_level, vote_counts, priority_ids, {}, False, False, 500
+    )
+
+    vote_ids = _vote_ids_from_markup(InlineKeyboardMarkup(keyboard))
+    assert hidden > 0, "budget must be tight enough to force a cut"
+    assert 115 in vote_ids, "starred game must survive the cut"
+    assert 110 in vote_ids, "voted game must survive the cut"
+    # Those two displaced plain high-complexity games rather than being dropped.
+    assert not all(1 <= i <= 20 for i in vote_ids)
+    assert shown == len(vote_ids)
+
+
+def test_poll_keyboard_callback_data_omits_poll_id():
+    """Game and category buttons use the short encoding, so a long poll id
+    doesn't cost ~30 bytes of budget on every button."""
+    games = [SimpleNamespace(id=42, name="Brass Birmingham")]
+    keyboard, _, _ = _build_poll_keyboard(
+        "poll_-1001234567890_1760000000", [3], {3: games}, {}, set(), {}, False, False, 8000
+    )
+    callbacks = [b.callback_data for row in keyboard for b in row]
+
+    assert "v:42" in callbacks
+    assert "c:3" in callbacks
+    assert not any(c.startswith("vote:") or c.startswith("poll_random_vote:") for c in callbacks)
+
+
+@pytest.mark.asyncio
+async def test_short_vote_callback_resolves_poll_from_message(mock_update, mock_context):
+    """A "v:<game_id>" button carries no poll id, so the handler finds the poll
+    from the message it was tapped on."""
+    chat_id, poll_id = 31337, "poll_short_cb"
+    ids = await _seed_poll_with_levels(chat_id, poll_id, {3.0: 2}, message_id=4242)
+
+    mock_update.callback_query.data = f"v:{ids[0]}"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 4242
+    mock_context.bot.edit_message_text = AsyncMock()
+
+    await custom_poll_vote_callback(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        votes = (
+            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
+            .scalars()
+            .all()
+        )
+    assert [v.game_id for v in votes] == [ids[0]]
+
+
+@pytest.mark.asyncio
+async def test_legacy_vote_callback_still_works(mock_update, mock_context):
+    """Keyboards already sitting in chats use the long form; it must keep
+    working after deploy rather than answering "Poll not found"."""
+    chat_id, poll_id = 31338, "poll_legacy_cb"
+    ids = await _seed_poll_with_levels(chat_id, poll_id, {3.0: 2}, message_id=4343)
+
+    mock_update.callback_query.data = f"vote:{poll_id}:{ids[0]}"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 4343
+    mock_context.bot.edit_message_text = AsyncMock()
+
+    await custom_poll_vote_callback(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        votes = (
+            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
+            .scalars()
+            .all()
+        )
+    assert [v.game_id for v in votes] == [ids[0]]
+
+
+@pytest.mark.asyncio
+async def test_legacy_category_callback_still_works(mock_update, mock_context):
+    """Same for a category header from an older keyboard."""
+    chat_id, poll_id = 31339, "poll_legacy_cat"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 2}, message_id=4444)
+
+    mock_update.callback_query.data = f"poll_random_vote:{poll_id}:3"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 4444
+    mock_context.bot.edit_message_text = AsyncMock()
+
+    await custom_poll_action_callback(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        votes = (
+            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
+            .scalars()
+            .all()
+        )
+    assert [v.category_level for v in votes] == [3]
+
+
+@pytest.mark.asyncio
+async def test_message_too_long_does_not_shrink_the_keyboard(mock_context):
+    """ "Message is too long" is about the text, not the keyboard. Shrinking the
+    keyboard can't fix it, and it must not poison the learned budget."""
+    chat_id, poll_id = 12345, "poll_text_long"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 6})
+    before = handlers._learned_markup_budget
+
+    calls = []
+
+    async def fake_edit(**kwargs):
+        calls.append(kwargs)
+        raise Exception("Bad Request: message is too long")
+
+    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
+
+    async with db.AsyncSessionLocal() as session:
+        games = list((await session.execute(select(Game))).scalars().all())
+        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
+
+    assert len(calls) == 1, "a text-length error must not trigger keyboard retries"
+    assert handlers._learned_markup_budget == before
+
+
+@pytest.mark.asyncio
+async def test_learned_budget_skips_the_rejected_call_on_later_renders(mock_context):
+    """Once Telegram has rejected a keyboard size, later renders start from the
+    smaller budget instead of paying for the same doomed call every time."""
+    chat_id, poll_id = 12345, "poll_learned"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 12})
+
+    calls = []
+
+    async def fake_edit(**kwargs):
+        calls.append(kwargs)
+        # Reject anything built to the original budget, accept the halved one.
+        if len(calls) == 1:
+            raise Exception("Bad Request: reply markup is too long")
+
+    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
+
+    async with db.AsyncSessionLocal() as session:
+        games = list((await session.execute(select(Game))).scalars().all())
+        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
+        assert len(calls) == 2  # first rejected, retry accepted
+        assert handlers._learned_markup_budget < handlers._REPLY_MARKUP_BUDGET_BYTES
+
+        # Second render: no wasted first attempt this time.
+        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
+    assert len(calls) == 3
