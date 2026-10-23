@@ -168,17 +168,49 @@ _BUTTON_MAX_LINES = 3
 # to wrap or fall back to the ellipsis placeholder.
 _BUTTON_LONG_THRESHOLD = 18
 
+# Callback-data prefixes for the two button kinds that repeat once per game /
+# per category in the poll keyboard. These omit the poll id (~30 bytes of a
+# ~90-byte button): the poll is identified by the message the button lives on,
+# so the handlers resolve it from (chat_id, message_id) instead. On a 151-game
+# poll that frees several KB of the reply_markup budget for real game buttons.
+# The long "vote:<poll_id>:<game_id>" / "poll_random_vote:<poll_id>:<level>"
+# forms are still accepted so keyboards already sent to chats keep working.
+_CB_VOTE = "v:"
+_CB_CATEGORY = "c:"
+
 # Telegram rejects an oversized inline keyboard with "Reply markup is too long",
 # which (since the error was swallowed) silently froze polls whose game list was
 # too big to fit one keyboard. We cap the serialized reply_markup to a safe byte
-# budget: game buttons are added highest-complexity-first and we stop before the
-# budget is exceeded, so the games that don't get an individual button are the
-# lowest-complexity ones (still votable via their complexity-category button).
-# The exact server limit isn't documented, so render_poll_message also halves
-# this budget and retries if an edit is still rejected — it self-corrects rather
-# than freezing. Category headers and the action row are always kept.
-_REPLY_MARKUP_BUDGET_BYTES = 9000
+# budget: game buttons are added in relevance order (starred, then most-voted,
+# then highest-complexity) and we stop before the budget is exceeded, so the
+# games left without an individual button are the least relevant ones (still
+# votable via their complexity-category button).
+#
+# The exact server limit isn't documented. 9000 was previously used here, but it
+# sits *above* the real ceiling: a full keyboard built to that budget serializes
+# to ~9047 bytes and was rejected every time, so large polls always fell through
+# to the halved 4500 budget and showed ~40 of 151 games. We now start below the
+# observed rejection point and, because the ceiling is a property of the server
+# rather than of any one poll, remember a rejection in _learned_markup_budget so
+# later renders don't keep paying for a call we know will fail.
+_REPLY_MARKUP_BUDGET_BYTES = 8000
 _RENDER_MAX_ATTEMPTS = 4
+
+# Smallest budget a rejection may ratchet us down to; below this the keyboard is
+# too sparse to be useful and the real problem is something other than size.
+_REPLY_MARKUP_MIN_BUDGET_BYTES = 2000
+
+# _button_bytes prices a button but not the "[...]," wrapping its row, and the
+# row layout isn't known until assembly. Reserving an allowance up front keeps
+# the emitted markup inside the budget; at one row per game a 150-game keyboard
+# owes ~450 bytes of punctuation. Capped at a tenth of the budget, since the row
+# count — and so the punctuation — scales with the budget it has to fit in.
+_MARKUP_ROW_HEADROOM_BYTES = 500
+
+# Best-effort, per-process memory of the largest reply_markup Telegram accepted.
+# Cloud Run instances are ephemeral and there may be several, so this is a cache
+# that saves a wasted API call within an instance's life, not durable state.
+_learned_markup_budget = _REPLY_MARKUP_BUDGET_BYTES
 
 
 def _button_bytes(button: InlineKeyboardButton) -> int:
@@ -208,9 +240,13 @@ def _build_poll_keyboard(
 
     Returns (keyboard, shown_games, hidden_games). A category-vote header is
     emitted for every complexity level (so dropped games stay votable) and the
-    action row is always included; individual game buttons are added
-    highest-complexity-first until the next would exceed ``budget_bytes``, so any
-    games left without a button are the lowest-complexity ones.
+    action row is always included.
+
+    Game buttons are *selected* in relevance order — starred first, then by vote
+    count, then by complexity — until the next would exceed ``budget_bytes``, so
+    the games left without a button are the ones nobody has singled out. They are
+    still *displayed* grouped under their complexity header in the per-level
+    order the caller supplied, which keeps the shuffle setting meaningful.
     """
 
     def _game_button(g) -> InlineKeyboardButton:
@@ -218,7 +254,7 @@ def _build_poll_keyboard(
         prefix = "⭐ " if g.id in priority_ids else ""
         suffix = f" ({count})" if count > 0 and not hide_results else ""
         label = _wrap_button_label(prefix, g.name, suffix)
-        return InlineKeyboardButton(label, callback_data=f"vote:{poll_id}:{g.id}")
+        return InlineKeyboardButton(label, callback_data=f"{_CB_VOTE}{g.id}")
 
     # Action row is fixed; reserve its cost up front.
     action_row = [
@@ -228,7 +264,8 @@ def _build_poll_keyboard(
     if allow_adding:
         action_row.insert(1, InlineKeyboardButton("➕ Add", callback_data=f"poll_add:{poll_id}"))
 
-    used = sum(_button_bytes(b) for b in action_row)
+    headroom = min(_MARKUP_ROW_HEADROOM_BYTES, budget_bytes // 10)
+    used = headroom + sum(_button_bytes(b) for b in action_row)
 
     # Reserve every level's category header (cheap, ≤6) so dropped games keep a
     # category-vote path.
@@ -240,29 +277,34 @@ def _build_poll_keyboard(
         header_text = (
             f"--- {level_name} ---" if not show_count else f"--- {level_name} ({cat_count}) ---"
         )
-        header = InlineKeyboardButton(
-            header_text, callback_data=f"poll_random_vote:{poll_id}:{level}"
-        )
+        header = InlineKeyboardButton(header_text, callback_data=f"{_CB_CATEGORY}{level}")
         headers[level] = header
         used += _button_bytes(header)
 
-    # Add game buttons highest-complexity-first until the budget is reached.
-    shown_by_level: dict[int, list] = {level: [] for level in levels_desc}
-    shown = 0
-    total = 0
-    budget_reached = False
-    for level in levels_desc:
-        for g in sorted_by_level[level]:
-            total += 1
-            if budget_reached:
-                continue
-            cost = _button_bytes(_game_button(g))
-            if used + cost > budget_bytes:
-                budget_reached = True
-                continue
-            used += cost
-            shown_by_level[level].append(g)
-            shown += 1
+    # Rank every game globally so the budget is spent on the games people have
+    # actually singled out. Position within its own level is the last tiebreak,
+    # which preserves the caller's shuffle for games that are otherwise equal.
+    ranked = [
+        (-int(g.id in priority_ids), -vote_counts.get(g.id, 0), -level, index, g)
+        for level in levels_desc
+        for index, g in enumerate(sorted_by_level[level])
+    ]
+    ranked.sort(key=lambda entry: entry[:4])
+
+    # Fill in relevance order, stopping at the first game that doesn't fit.
+    selected: set[int] = set()
+    total = len(ranked)
+    for *_, g in ranked:
+        cost = _button_bytes(_game_button(g))
+        if used + cost > budget_bytes:
+            break
+        used += cost
+        selected.add(g.id)
+
+    shown_by_level: dict[int, list] = {
+        level: [g for g in sorted_by_level[level] if g.id in selected] for level in levels_desc
+    }
+    shown = len(selected)
 
     # Assemble the keyboard: header + this level's shown buttons, per level.
     keyboard: list[list[InlineKeyboardButton]] = []
@@ -3077,18 +3119,59 @@ async def create_custom_poll(
         )
 
 
+def _poll_callback_arg(data: str, short_prefix: str, legacy_action: str) -> int | None:
+    """Read the trailing int argument of a poll callback in either encoding.
+
+    Short form is ``<prefix><arg>``; the legacy form that older keyboards still
+    carry is ``<action>:<poll_id>:<arg>``. Returns None if neither parses.
+    """
+    if data.startswith(short_prefix):
+        tail = data[len(short_prefix) :]
+    else:
+        parts = data.split(":")
+        if len(parts) < 3 or parts[0] != legacy_action:
+            return None
+        tail = parts[2]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
+async def _poll_for_callback(session, query, legacy_action: str) -> GameNightPoll | None:
+    """Find the poll a keyboard button belongs to.
+
+    The short callback forms omit the poll id to save reply_markup bytes, so the
+    poll is resolved from the message the button is attached to — unique per
+    chat. Legacy keyboards still carry the id, so those are looked up directly.
+    """
+    parts = (query.data or "").split(":")
+    if parts[0] == legacy_action and len(parts) >= 2:
+        return cast(GameNightPoll | None, await session.get(GameNightPoll, parts[1]))
+    message = query.message
+    if message is None:
+        return None
+    # chat.id rather than chat_id: an old button can arrive on an
+    # InaccessibleMessage, which carries chat but not the chat_id shortcut.
+    found = await session.scalar(
+        select(GameNightPoll).where(
+            GameNightPoll.chat_id == message.chat.id,
+            GameNightPoll.message_id == message.message_id,
+        )
+    )
+    return cast(GameNightPoll | None, found)
+
+
 async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle votes on custom poll."""
     query = update.callback_query
-    # Split data: "vote:<poll_id>:<game_id>"
-    parts = query.data.split(":")
-    if len(parts) < 3:
+    # Data is "v:<game_id>", or "vote:<poll_id>:<game_id>" from an older keyboard.
+    game_id = _poll_callback_arg(query.data or "", _CB_VOTE, "vote")
+    if game_id is None:
         with contextlib.suppress(telegram.error.BadRequest):
             await query.answer("Invalid vote data")
         return
 
-    poll_id = parts[1]
-    game_id = int(parts[2])
     user_id = query.from_user.id
     user_name = query.from_user.first_name
     user_last_name = query.from_user.last_name
@@ -3096,10 +3179,12 @@ async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAUL
 
     async with db.AsyncSessionLocal() as session:
         # Get poll and session info for vote limit
-        game_poll = await session.get(GameNightPoll, poll_id)
+        game_poll = await _poll_for_callback(session, query, "vote")
         if not game_poll:
             await query.answer("Poll not found")
             return
+
+        poll_id = game_poll.poll_id
 
         chat_id = game_poll.chat_id
         session_obj = await session.get(Session, chat_id)
@@ -3377,9 +3462,12 @@ async def render_poll_message(
 
     # Build + edit within a shrinking size budget. If Telegram still rejects the
     # keyboard as too long, halve the budget and retry so the poll can never
-    # freeze — it just shows fewer game buttons (dropping lowest complexity
+    # freeze — it just shows fewer game buttons (dropping the least relevant
     # first; those games stay votable via their complexity-category button).
-    budget = _REPLY_MARKUP_BUDGET_BYTES
+    global _learned_markup_budget
+    # The configured constant stays the authoritative upper bound, so lowering it
+    # in a deploy takes effect even on an instance that learned a value already.
+    budget = min(_REPLY_MARKUP_BUDGET_BYTES, _learned_markup_budget)
     for attempt in range(_RENDER_MAX_ATTEMPTS):
         keyboard, shown, hidden = _build_poll_keyboard(
             poll_id,
@@ -3397,7 +3485,7 @@ async def render_poll_message(
             lines.insert(
                 3,
                 f"🎛️ _Showing {shown} of {shown + hidden} games as buttons — "
-                f"lower-complexity games are votable via their complexity category._",
+                f"the rest are votable via their complexity category._",
             )
         text = "\n".join(lines)
         try:
@@ -3411,12 +3499,62 @@ async def render_poll_message(
             return
         except Exception as e:
             msg = str(e)
+            lowered = msg.lower()
             # Ignore "Message is not modified" errors (common in rapid updates).
             if "Message is not modified" in msg:
                 return
-            if "too long" in msg.lower() and attempt < _RENDER_MAX_ATTEMPTS - 1:
-                budget //= 2  # keyboard still too big — shrink and retry
-                continue
+
+            # "Message is too long" (text over 4096 chars) also contains "too
+            # long", so it must not be mistaken for an oversized keyboard —
+            # shrinking the keyboard cannot fix it, and letting it ratchet the
+            # learned budget down would starve every later poll on this instance.
+            text_too_long = "message is too long" in lowered
+            markup_too_long = not text_too_long and "too long" in lowered
+
+            if markup_too_long:
+                # Permanent prod event, not a one-off diagnostic: this is the only
+                # place the real (undocumented) reply_markup ceiling is observable,
+                # and the numbers say where to set the budget next.
+                logger.warning(
+                    "Telegram rejected poll reply_markup as too long: "
+                    "poll=%s attempt=%d/%d budget=%d markup_bytes=%d "
+                    "buttons=%d shown=%d hidden=%d error=%s",
+                    poll_id,
+                    attempt + 1,
+                    _RENDER_MAX_ATTEMPTS,
+                    budget,
+                    len(
+                        json.dumps(
+                            InlineKeyboardMarkup(keyboard).to_dict(),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ),
+                    sum(len(row) for row in keyboard),
+                    shown,
+                    hidden,
+                    msg,
+                )
+                if attempt < _RENDER_MAX_ATTEMPTS - 1:
+                    budget = max(budget // 2, _REPLY_MARKUP_MIN_BUDGET_BYTES)
+                    # The ceiling belongs to the server, not to this poll, so
+                    # remember it and spare later renders the rejected call.
+                    if budget < _learned_markup_budget:
+                        _learned_markup_budget = budget
+                        logger.warning(
+                            "Lowered reply_markup budget to %d bytes for this instance",
+                            budget,
+                        )
+                    continue
+
+            if text_too_long:
+                logger.warning(
+                    "Poll message text too long: poll=%s text_chars=%d error=%s",
+                    poll_id,
+                    len(text),
+                    msg,
+                )
+
             logger.warning(f"Failed to update poll message: {e}")
             return
 
@@ -3826,27 +3964,43 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
     Dispatcher for custom poll actions: Refresh, Close, Category vote, Add.
 
     Callback data formats:
+    - c:<level>                            (category vote; poll from the message)
+    - poll_random_vote:<poll_id>:<level>   (same, from an older keyboard)
     - poll_refresh:<poll_id>
-    - poll_random_vote:<poll_id>:<level>
     - poll_close:<poll_id>
     - poll_add:<poll_id>
     """
     query = update.callback_query
-    data = query.data
+    data = query.data or ""
     parts = data.split(":")
     action = parts[0]
+
+    # Category headers use the short form that omits the poll id. The action row
+    # still carries it — it's 3 buttons per keyboard, not worth the churn.
+    if data.startswith(_CB_CATEGORY) or action == "poll_random_vote":
+        level = _poll_callback_arg(data, _CB_CATEGORY, "poll_random_vote")
+        if level is None:
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("Invalid data")
+            return
+        async with db.AsyncSessionLocal() as session:
+            game_poll = await _poll_for_callback(session, query, "poll_random_vote")
+            poll_id = game_poll.poll_id if game_poll else None
+        if poll_id is None:
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("Poll not found")
+            return
+        await _handle_poll_category_vote(query, context, poll_id, level)
+        return
+
+    if len(parts) < 2:
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer("Invalid data")
+        return
     poll_id = parts[1]
 
     if action == "poll_refresh":
         await _handle_poll_refresh(query, context, poll_id)
-
-    elif action == "poll_random_vote":
-        if len(parts) < 3:
-            with contextlib.suppress(telegram.error.BadRequest):
-                await query.answer("Invalid data")
-            return
-        level = int(parts[2])
-        await _handle_poll_category_vote(query, context, poll_id, level)
 
     elif action == "poll_close":
         await _handle_poll_close(query, context, poll_id)

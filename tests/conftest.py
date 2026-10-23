@@ -7,11 +7,25 @@ from sqlalchemy.pool import StaticPool
 from telegram import CallbackQuery, Message, Update
 from telegram.ext import ContextTypes
 
+from src.bot import handlers
 from src.core import db
 from src.core.models import Base
 
 # Configure logging for tests
 logging.basicConfig(level=logging.INFO)
+
+
+@pytest.fixture(scope="function", autouse=True)
+def reset_learned_markup_budget():
+    """Keep the per-process reply_markup budget from leaking between tests.
+
+    render_poll_message remembers a Telegram "reply markup is too long"
+    rejection in a module global so later renders skip a call they know fails.
+    That is deliberate in production but would make test order significant.
+    """
+    original = handlers._learned_markup_budget
+    yield
+    handlers._learned_markup_budget = original
 
 
 @pytest.fixture(scope="function", autouse=True)
