@@ -3291,3 +3291,32 @@ async def test_picker_page_indicator_is_inert(mock_update, mock_context):
 
     mock_update.callback_query.answer.assert_called_once_with()
     mock_update.callback_query.edit_message_text.assert_not_called()
+
+
+def test_pagination_never_places_one_level_twice_on_a_page():
+    """A level appearing twice on a page renders two identical separators and
+    undoes the even spread. It happened when a balanced chunk was placed and the
+    remainder then flowed back onto the same page."""
+    # 100 games in one level, 60 to a page: the chunk is 50, leaving 50 with 10
+    # slots still free on that page — the shape that used to refill it.
+    pages = handlers._paginate_games_by_category(_levelled([(1, 100)]), page_size=60, min_chunk=8)
+    for page in pages:
+        levels = [level for level, _ in page]
+        assert len(levels) == len(set(levels)), f"level repeated on one page: {levels}"
+    assert [sum(len(g) for _, g in page) for page in pages] == [50, 50]
+
+
+def test_pagination_balanced_chunks_stay_balanced():
+    """The even spread must survive: a group over a page gets equal pieces, not
+    a full page followed by a remainder."""
+    for total, page_size, expected in [
+        (65, 60, [33, 32]),
+        (100, 60, [50, 50]),
+        (130, 60, [44, 43, 43]),  # rebalanced per remainder, not a fixed chunk
+    ]:
+        pages = handlers._paginate_games_by_category(
+            _levelled([(3, total)]), page_size=page_size, min_chunk=8
+        )
+        sizes = [sum(len(g) for _, g in page) for page in pages]
+        assert sizes == expected, f"{total} over {page_size}: {sizes}"
+        assert sum(sizes) == total
