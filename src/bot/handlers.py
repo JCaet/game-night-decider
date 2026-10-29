@@ -3358,15 +3358,21 @@ def _paginate_games_by_category(
 
             if used == 0 and rest > page_size:
                 # Bigger than a page on its own: spread it evenly rather than
-                # filling pages and leaving a remainder.
+                # filling pages and leaving a remainder. The chunk *is* the
+                # page -- closing it here keeps the balance, and stops the
+                # remainder flowing back onto the same page, which would place
+                # this level twice and render two identical separators.
                 chunks = (rest + page_size - 1) // page_size
                 take = (rest + chunks - 1) // chunks
-            else:
-                take = space
+                current.append((level, games[i : i + take]))
+                pages.append(current)
+                current, used = [], 0
+                i += take
+                continue
 
-            current.append((level, games[i : i + take]))
-            used += take
-            i += take
+            current.append((level, games[i : i + space]))
+            used += space
+            i += space
 
     if current:
         pages.append(current)
