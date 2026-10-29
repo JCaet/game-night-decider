@@ -210,7 +210,15 @@ _CB_SEPARATOR = "sep:"
 #   pk:x:<owner>                   dismiss
 #   pk:n                           page indicator, inert
 _CB_PICK = "pk:"
-_POLL_PICKER_PAGE_SIZE = 24
+
+# Games per picker page, and the smallest slice of a complexity group worth
+# leaving on a page. Pages break on complexity boundaries where that is
+# reasonable, so a page reads as whole groups rather than an arbitrary cut;
+# _paginate_games_by_category explains how the two interact. 60 games costs
+# ~70 buttons and ~6.5KB once separators and navigation are added, comfortably
+# inside the 100-button edit limit.
+_POLL_PICKER_PAGE_SIZE = 60
+_POLL_PICKER_MIN_CHUNK = 8
 
 # Telegram's keyboard limits are undocumented apart from callback_data, so they
 # were measured against the live API (scripts/probe_telegram_keyboard_limits.py).
@@ -3307,8 +3315,66 @@ async def _active_poll_for_chat(session, chat_id: int) -> GameNightPoll | None:
     return cast(GameNightPoll | None, found)
 
 
+def _paginate_games_by_category(
+    level_groups: list[tuple[int, list]],
+    page_size: int = _POLL_PICKER_PAGE_SIZE,
+    min_chunk: int = _POLL_PICKER_MIN_CHUNK,
+) -> list[list[tuple[int, list]]]:
+    """Split complexity groups into pages, breaking on group boundaries.
+
+    Each page is a list of ``(level, games)`` segments, so a page reads as whole
+    complexity groups instead of an arbitrary slice of an alphabetical list.
+
+    A group that does not fit the space left on a page is only split when both
+    resulting pieces are worth showing — at least ``min_chunk`` games. Otherwise
+    the whole group moves to a fresh page, which is what stops a group from
+    leaving one or two stranded games behind on the previous page.
+
+    A group too large for a whole page has to be split regardless; it is then
+    spread evenly over the pages it needs, so the last page of that group isn't
+    a sliver either.
+    """
+    pages: list[list[tuple[int, list]]] = []
+    current: list[tuple[int, list]] = []
+    used = 0
+
+    for level, games in level_groups:
+        i = 0
+        while i < len(games):
+            space = page_size - used
+            rest = len(games) - i
+
+            if rest <= space:  # the whole remainder of this group fits
+                current.append((level, games[i:]))
+                used += rest
+                break
+
+            # Splitting here would strand a sliver on one side or the other, and
+            # there is already something on this page — start a fresh one.
+            if current and (space < min_chunk or rest - space < min_chunk):
+                pages.append(current)
+                current, used = [], 0
+                continue
+
+            if used == 0 and rest > page_size:
+                # Bigger than a page on its own: spread it evenly rather than
+                # filling pages and leaving a remainder.
+                chunks = (rest + page_size - 1) // page_size
+                take = (rest + chunks - 1) // chunks
+            else:
+                take = space
+
+            current.append((level, games[i : i + take]))
+            used += take
+            i += take
+
+    if current:
+        pages.append(current)
+    return pages or [[]]
+
+
 def _build_picker_keyboard(
-    games: list,
+    level_groups: list[tuple[int, list]],
     page: int,
     voted_ids: set[int],
     priority_ids: set[int],
@@ -3321,26 +3387,34 @@ def _build_picker_keyboard(
     the group chat, where its buttons are tappable by all, and its page would
     otherwise jump under the owner's feet.
     """
-    total_pages = max(1, (len(games) + _POLL_PICKER_PAGE_SIZE - 1) // _POLL_PICKER_PAGE_SIZE)
+    pages = _paginate_games_by_category(level_groups)
+    total_pages = len(pages)
     page = max(0, min(page, total_pages - 1))
-    start = page * _POLL_PICKER_PAGE_SIZE
-    page_games = games[start : start + _POLL_PICKER_PAGE_SIZE]
+    segments = pages[page]
 
     keyboard: list[list[InlineKeyboardButton]] = []
-    row: list[InlineKeyboardButton] = []
-    for g in page_games:
-        mark = "✅ " if g.id in voted_ids else ("⭐ " if g.id in priority_ids else "")
-        label = _wrap_button_label(mark, g.name, "")
-        row.append(
-            InlineKeyboardButton(label, callback_data=f"{_CB_PICK}v:{g.id}:{page}:{owner_id}")
+    for level, page_games in segments:
+        level_name = level if level > 0 else "Unrated"
+        keyboard.append(
+            [InlineKeyboardButton(f"--- {level_name} ---", callback_data=f"{_CB_SEPARATOR}{level}")]
         )
-        # Two per row unless a name is long enough to need the full width.
-        columns = 1 if any(len(x.name) > _BUTTON_LONG_THRESHOLD for x in page_games) else 2
-        if len(row) == min(columns, _MAX_BUTTONS_PER_ROW):
+        # Two per row unless a name in this group needs the full width.
+        columns = (
+            1 if any(x.name and len(x.name) > _BUTTON_LONG_THRESHOLD for x in page_games) else 2
+        )
+        columns = min(columns, _MAX_BUTTONS_PER_ROW)
+        row: list[InlineKeyboardButton] = []
+        for g in page_games:
+            mark = "✅ " if g.id in voted_ids else ("⭐ " if g.id in priority_ids else "")
+            label = _wrap_button_label(mark, g.name, "")
+            row.append(
+                InlineKeyboardButton(label, callback_data=f"{_CB_PICK}v:{g.id}:{page}:{owner_id}")
+            )
+            if len(row) == columns:
+                keyboard.append(row)
+                row = []
+        if row:
             keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
 
     nav: list[InlineKeyboardButton] = []
     if page > 0:
@@ -3364,7 +3438,13 @@ async def _picker_view(session, poll_id: str, chat_id: int, user_id: int, page: 
     """Gather everything one picker page needs: (text, keyboard)."""
     valid_games, priority_ids = await get_session_valid_games(session, chat_id)
     valid_games = await _merge_added_games(session, poll_id, valid_games)
-    games = sorted(valid_games, key=lambda g: g.name)
+
+    # Same grouping and ordering the poll uses, so a game sits where a voter
+    # expects it. group_games_by_complexity already sorts each group by name and
+    # drops empty levels; highest complexity first mirrors the poll keyboard.
+    groups = group_games_by_complexity(valid_games) if valid_games else {}
+    level_groups = [(level, groups[level]) for level in sorted(groups, reverse=True)]
+    total_games = sum(len(g) for _, g in level_groups)
 
     voted = await session.execute(
         select(PollVote.game_id).where(
@@ -3376,12 +3456,12 @@ async def _picker_view(session, poll_id: str, chat_id: int, user_id: int, page: 
     voted_ids = {gid for gid in voted.scalars().all() if gid is not None}
 
     keyboard, page, total_pages = _build_picker_keyboard(
-        games, page, voted_ids, priority_ids, user_id
+        level_groups, page, voted_ids, priority_ids, user_id
     )
     text = "\n".join(
         [
             "🔍 **All games**",
-            f"_Page {page + 1} of {total_pages} · {len(games)} games · "
+            f"_Page {page + 1} of {total_pages} · {total_games} games · "
             f"{len(voted_ids)} of them voted by you_",
             "",
             "_Tap a game to vote or unvote. ✅ marks your votes._",

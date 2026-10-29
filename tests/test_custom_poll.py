@@ -3057,39 +3057,65 @@ def _picker_game_ids(keyboard):
     ]
 
 
+def _levelled(counts):
+    """Build (level, games) groups with the given per-level sizes."""
+    gid = iter(range(1000, 100000))
+    return [
+        (level, [SimpleNamespace(id=next(gid), name=f"L{level} Game {i}") for i in range(n)])
+        for level, n in counts
+    ]
+
+
 def test_picker_pages_reach_every_game():
     """The picker exists so that no game is unreachable: paging through it must
     cover the whole collection exactly once."""
-    games = [SimpleNamespace(id=1000 + i, name=f"Game {i}") for i in range(151)]
+    level_groups = _levelled([(5, 25), (4, 33), (3, 27), (2, 15), (1, 20), (0, 31)])
+    all_ids = [g.id for _, games in level_groups for g in games]
+
     seen: list[int] = []
-    _, _, total_pages = handlers._build_picker_keyboard(games, 0, set(), set(), 42)
+    _, _, total_pages = handlers._build_picker_keyboard(level_groups, 0, set(), set(), 42)
     for page in range(total_pages):
-        keyboard, got_page, _ = handlers._build_picker_keyboard(games, page, set(), set(), 42)
+        keyboard, got_page, _ = handlers._build_picker_keyboard(
+            level_groups, page, set(), set(), 42
+        )
         assert got_page == page
         seen.extend(_picker_game_ids(keyboard))
 
-    assert sorted(seen) == sorted(g.id for g in games)
+    assert sorted(seen) == sorted(all_ids)
     assert len(seen) == len(set(seen)), "no game should appear on two pages"
 
 
 def test_picker_page_is_clamped_and_fits_the_edit_limits():
     """Pages are edited into place, so each must stay under the 100-button and
     8-per-row limits that editMessageText enforces silently."""
-    games = [
-        SimpleNamespace(id=1000 + i, name=f"Game Number {i} With A Long Name") for i in range(151)
+    level_groups = [
+        (
+            level,
+            [
+                SimpleNamespace(id=level * 1000 + i, name=f"Game Number {i} With A Long Name")
+                for i in range(40)
+            ],
+        )
+        for level in (5, 4, 3, 2)
     ]
-    keyboard, page, total_pages = handlers._build_picker_keyboard(games, 999, set(), set(), 42)
+    _, _, total_pages = handlers._build_picker_keyboard(level_groups, 0, set(), set(), 42)
 
+    for page in range(total_pages):
+        keyboard, got, _ = handlers._build_picker_keyboard(level_groups, page, set(), set(), 42)
+        assert sum(len(r) for r in keyboard) <= handlers._MAX_KEYBOARD_BUTTONS
+        assert max(len(r) for r in keyboard) <= handlers._MAX_BUTTONS_PER_ROW
+        longest = max(len(b.callback_data) for row in keyboard for b in row if b.callback_data)
+        assert longest <= 64, "callback_data has a documented 64-byte limit"
+
+    keyboard, page, total_pages = handlers._build_picker_keyboard(
+        level_groups, 999, set(), set(), 42
+    )
     assert page == total_pages - 1, "an out-of-range page clamps to the last one"
-    assert sum(len(r) for r in keyboard) <= handlers._MAX_KEYBOARD_BUTTONS
-    assert max(len(r) for r in keyboard) <= handlers._MAX_BUTTONS_PER_ROW
-    longest = max(len(b.callback_data) for row in keyboard for b in row if b.callback_data)
-    assert longest <= 64, "callback_data has a documented 64-byte limit"
 
 
 def test_picker_marks_the_users_own_votes():
     games = [SimpleNamespace(id=1, name="Voted"), SimpleNamespace(id=2, name="Not voted")]
-    keyboard, _, _ = handlers._build_picker_keyboard(games, 0, {1}, set(), 42)
+    keyboard, _, _ = handlers._build_picker_keyboard([(3, games)], 0, {1}, set(), 42)
     labels = {
         int(b.callback_data.split(":")[2]): b.text
         for row in keyboard
@@ -3098,6 +3124,68 @@ def test_picker_marks_the_users_own_votes():
     }
     assert labels[1].startswith("✅")
     assert not labels[2].startswith("✅")
+
+
+def test_picker_pages_are_labelled_by_complexity():
+    """Each page carries a separator per group it shows, so a page reads as
+    whole complexity groups rather than an arbitrary alphabetical slice."""
+    keyboard, _, _ = handlers._build_picker_keyboard(
+        _levelled([(4, 3), (2, 3)]), 0, set(), set(), 42
+    )
+    levels = _separator_levels_from_markup(InlineKeyboardMarkup(keyboard))
+    assert levels == [4, 2], "separators appear once per group, highest first"
+
+
+def test_pagination_keeps_whole_groups_together_when_they_fit():
+    pages = handlers._paginate_games_by_category(
+        _levelled([(5, 20), (4, 20), (3, 20)]), page_size=60, min_chunk=8
+    )
+    assert len(pages) == 1
+    assert [level for level, _ in pages[0]] == [5, 4, 3]
+
+
+def test_pagination_moves_a_group_rather_than_stranding_a_sliver():
+    """The case this exists for: a group that would leave one or two games
+    behind on the previous page is moved whole to the next page instead."""
+    # 55 placed, so only 5 slots remain — fewer than min_chunk.
+    pages = handlers._paginate_games_by_category(
+        _levelled([(5, 55), (4, 20)]), page_size=60, min_chunk=8
+    )
+    assert len(pages) == 2
+    assert [level for level, _ in pages[0]] == [5]
+    assert [(level, len(g)) for level, g in pages[1]] == [(4, 20)]
+
+
+def test_pagination_splits_a_group_when_both_halves_are_worth_showing():
+    """Splitting is fine when neither side is a sliver — that keeps page count
+    down instead of leaving half a page empty."""
+    pages = handlers._paginate_games_by_category(
+        _levelled([(5, 30), (4, 40)]), page_size=60, min_chunk=8
+    )
+    assert len(pages) == 2
+    assert [(level, len(g)) for level, g in pages[0]] == [(5, 30), (4, 30)]
+    assert [(level, len(g)) for level, g in pages[1]] == [(4, 10)]
+
+
+def test_pagination_spreads_an_oversized_group_evenly():
+    """A group bigger than a page must be split regardless; the pieces are
+    balanced so the last one isn't a sliver."""
+    pages = handlers._paginate_games_by_category(_levelled([(3, 65)]), page_size=60, min_chunk=8)
+    sizes = [len(g) for page in pages for _, g in page]
+    assert sizes == [33, 32], "65 over two pages, not 60 + 5"
+    assert sum(sizes) == 65
+
+
+def test_pagination_loses_nothing():
+    """Whatever the shape, every game appears exactly once."""
+    level_groups = _levelled([(5, 7), (4, 61), (3, 2), (2, 58), (1, 9), (0, 14)])
+    expected = [g.id for _, games in level_groups for g in games]
+    pages = handlers._paginate_games_by_category(level_groups, page_size=60, min_chunk=8)
+    got = [g.id for page in pages for _, games in page for g in games]
+    assert sorted(got) == sorted(expected)
+    assert len(got) == len(set(got))
+    for page in pages:
+        assert sum(len(games) for _, games in page) <= 60
 
 
 def test_browse_button_appears_only_when_games_are_left_out():
