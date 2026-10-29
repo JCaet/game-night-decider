@@ -2885,3 +2885,115 @@ async def test_learned_budget_skips_the_rejected_call_on_later_renders(mock_cont
         # Second render: no wasted first attempt this time.
         await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
     assert len(calls) == 3
+
+
+def test_clamp_message_text_leaves_short_text_alone():
+    lines = ["📊 **Poll Active**", "**3** - Brass Birmingham", "   └ _Joao, Maria_"]
+    assert handlers._clamp_message_text(lines) == "\n".join(lines)
+
+
+def test_clamp_message_text_truncates_a_long_tally():
+    """A big tally must not exceed Telegram's text limit: the whole edit —
+    keyboard included — is rejected with Message_too_long, freezing the poll."""
+    lines = [f"**{i}** - Some Rather Long Game Name Here" for i in range(400)]
+    text = handlers._clamp_message_text(lines)
+
+    assert len(text) <= handlers._MESSAGE_TEXT_LIMIT
+    assert "truncated" in text
+    # Keeps the top of the tally, drops the tail.
+    assert text.startswith("**0** - ")
+    # Cuts only on line boundaries, so Markdown emphasis is never split.
+    assert all(line.count("**") % 2 == 0 for line in text.split("\n") if "**" in line)
+
+
+def test_build_poll_keyboard_respects_the_button_count_cap():
+    """Past the server's button limit Telegram drops buttons silently, so the
+    builder must stop on count as well as bytes."""
+    monkey_games = [SimpleNamespace(id=i, name=f"G{i}") for i in range(1, 600)]
+    keyboard, shown, hidden = _build_poll_keyboard(
+        "poll_cap",
+        [3],
+        {3: monkey_games},
+        {},
+        set(),
+        {},
+        False,
+        True,
+        10**9,  # effectively unlimited bytes, so only the count cap can bite
+    )
+    total_buttons = sum(len(row) for row in keyboard)
+    assert total_buttons <= handlers._MAX_KEYBOARD_BUTTONS
+    assert hidden > 0 and shown + hidden == len(monkey_games)
+    assert max(len(row) for row in keyboard) <= handlers._MAX_BUTTONS_PER_ROW
+
+
+@pytest.mark.asyncio
+async def test_underscored_message_too_long_is_not_a_keyboard_error(mock_context):
+    """Telegram returns "Message_too_long" (underscores) for an over-long text.
+    A plain "too long" substring test misses it, so it must be matched
+    explicitly — shrinking the keyboard cannot fix a text problem."""
+    chat_id, poll_id = 12345, "poll_underscore"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 6})
+    before = handlers._learned_markup_budget
+
+    calls = []
+
+    async def fake_edit(**kwargs):
+        calls.append(kwargs)
+        raise Exception("Message_too_long")
+
+    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
+
+    async with db.AsyncSessionLocal() as session:
+        games = list((await session.execute(select(Game))).scalars().all())
+        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
+
+    assert len(calls) == 1, "must not retry: a smaller keyboard cannot fix a long text"
+    assert handlers._learned_markup_budget == before, "must not poison the learned budget"
+
+
+@pytest.mark.asyncio
+async def test_silently_dropped_buttons_are_logged(mock_context, caplog):
+    """Over 300 buttons (or 12 per row) Telegram returns HTTP 200 and quietly
+    keeps fewer. There is no error to retry on, so the mismatch has to be
+    noticed by comparing what came back with what we sent."""
+    chat_id, poll_id = 12345, "poll_dropped"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 6})
+
+    async def fake_edit(**kwargs):
+        # Echo back a keyboard with one row removed, as the server would.
+        kept = kwargs["reply_markup"].inline_keyboard[:-1]
+        return SimpleNamespace(reply_markup=InlineKeyboardMarkup(kept))
+
+    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
+
+    async with db.AsyncSessionLocal() as session:
+        games = list((await session.execute(select(Game))).scalars().all())
+        with caplog.at_level("WARNING"):
+            await render_poll_message(
+                mock_context.bot, chat_id, 999, session, poll_id, games, set()
+            )
+
+    assert "silently dropped poll buttons" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_full_keyboard_is_not_reported_as_dropped(mock_context, caplog):
+    """The happy path must stay quiet: an echo of exactly what we sent is not a
+    truncation, and neither is a non-Message return value."""
+    chat_id, poll_id = 12345, "poll_intact"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 6})
+
+    async def fake_edit(**kwargs):
+        return SimpleNamespace(reply_markup=kwargs["reply_markup"])
+
+    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
+
+    async with db.AsyncSessionLocal() as session:
+        games = list((await session.execute(select(Game))).scalars().all())
+        with caplog.at_level("WARNING"):
+            await render_poll_message(
+                mock_context.bot, chat_id, 999, session, poll_id, games, set()
+            )
+
+    assert "silently dropped" not in caplog.text
