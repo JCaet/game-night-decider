@@ -178,6 +178,19 @@ _BUTTON_LONG_THRESHOLD = 18
 _CB_VOTE = "v:"
 _CB_CATEGORY = "c:"
 
+# Complexity headers are separators, not controls: they label the group of game
+# buttons under them and do nothing when tapped. Telegram has no truly inert
+# button on this API version -- one with neither callback_data nor url is
+# rejected ("text buttons are not allowed in the inline keyboard") -- so they
+# carry a callback that is answered and discarded.
+#
+# Bot API 10.3 added a real `disabled` field, and it was verified to work
+# server-side, but python-telegram-bot 22.x has no support for it: using it
+# means hand-building the whole reply_markup as raw JSON through api_kwargs,
+# and how older clients render it is unknown. Swap to it once PTB ships
+# Bot API 10.3 and this prefix can go away.
+_CB_SEPARATOR = "sep:"
+
 # Telegram's keyboard limits are undocumented apart from callback_data, so they
 # were measured against the live API (scripts/probe_telegram_keyboard_limits.py).
 # They differ by METHOD, which is the detail that matters here:
@@ -288,8 +301,9 @@ def _build_poll_keyboard(
     headroom = min(_MARKUP_ROW_HEADROOM_BYTES, budget_bytes // 10)
     used = headroom + sum(_button_bytes(b) for b in action_row)
 
-    # Reserve every level's category header (cheap, ≤6) so dropped games keep a
-    # category-vote path.
+    # Reserve one separator per level (cheap, ≤6) so every group stays labelled
+    # even when all of its games were cut. A count only appears for a poll that
+    # still carries category votes cast before they were retired.
     headers: dict[int, InlineKeyboardButton] = {}
     for level in levels_desc:
         cat_count = category_vote_counts.get(level, 0)
@@ -298,7 +312,7 @@ def _build_poll_keyboard(
         header_text = (
             f"--- {level_name} ---" if not show_count else f"--- {level_name} ({cat_count}) ---"
         )
-        header = InlineKeyboardButton(header_text, callback_data=f"{_CB_CATEGORY}{level}")
+        header = InlineKeyboardButton(header_text, callback_data=f"{_CB_SEPARATOR}{level}")
         headers[level] = header
         used += _button_bytes(header)
 
@@ -3248,6 +3262,18 @@ async def _poll_for_callback(session, query, legacy_action: str) -> GameNightPol
     return cast(GameNightPoll | None, found)
 
 
+async def poll_separator_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Absorb a tap on a complexity separator.
+
+    Separators exist to label the group of games beneath them. Telegram has no
+    inert button on this API version, so the tap still arrives and is answered
+    with nothing — which stops the client's loading spinner and leaves the poll
+    untouched.
+    """
+    with contextlib.suppress(telegram.error.BadRequest):
+        await update.callback_query.answer()
+
+
 async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle votes on custom poll."""
     query = update.callback_query
@@ -3570,8 +3596,9 @@ async def render_poll_message(
         if hidden > 0 and not hide_results:
             lines.insert(
                 3,
-                f"🎛️ _Showing {shown} of {shown + hidden} games as buttons — "
-                f"the rest are votable via their complexity category._",
+                f"🎛️ _Showing {shown} of {shown + hidden} games — Telegram allows "
+                f"only {_MAX_KEYBOARD_BUTTONS} buttons per message, so the least "
+                f"starred and least voted games are left out._",
             )
         text = _clamp_message_text(lines)
         try:
