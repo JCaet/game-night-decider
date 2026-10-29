@@ -5,10 +5,12 @@ This tests the alternative poll mechanism that uses inline buttons
 instead of native Telegram polls to overcome the 10-option limit.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import telegram
 from sqlalchemy import select
 from telegram import InlineKeyboardMarkup
 
@@ -3205,30 +3207,94 @@ def test_browse_button_appears_only_when_games_are_left_out():
     assert any(b.callback_data.startswith(handlers._CB_PICK) for row in keyboard for b in row)
 
 
-@pytest.mark.asyncio
-async def test_picker_rejects_another_users_taps(mock_update, mock_context):
-    """The picker sits in the group chat, so its buttons are tappable by anyone.
-    Paging on someone else's picker would move it under their feet, so a tap
-    from a non-owner is turned away without recording anything."""
-    chat_id, poll_id = 24680, "poll_pick_owner"
-    ids = await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
+def _ephemeral_params(call):
+    """The ephemeral parameters a send_message call carried, as a dict."""
+    raw = call.kwargs.get("api_kwargs", {}).get("ephemeral_message_parameters")
+    return json.loads(raw) if raw else None
 
-    mock_update.callback_query.data = f"pk:v:{ids[0]}:0:999999"  # owned by someone else
+
+@pytest.mark.asyncio
+async def test_picker_is_sent_only_to_the_person_who_opened_it(mock_update, mock_context):
+    """A picker everyone could see filled the group with other people's lists
+    and told them off for tapping the wrong one. It goes out as a Bot API 10.2
+    ephemeral message addressed to one receiver instead."""
+    chat_id, poll_id = 24683, "poll_pick_eph"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
+
+    mock_update.callback_query.data = "pk:p:0:0"
     mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 778
+    mock_update.callback_query.message.message_id = 777
     mock_update.callback_query.from_user.id = 111
 
     await handlers.poll_picker_callback(mock_update, mock_context)
 
-    async with db.AsyncSessionLocal() as session:
-        votes = (
-            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
-            .scalars()
-            .all()
-        )
-    assert votes == []
-    args = mock_update.callback_query.answer.call_args
-    assert "someone else" in args.args[0].lower()
+    call = mock_context.bot.send_message.call_args
+    params = _ephemeral_params(call)
+    assert params is not None, "the picker must not be sent as an ordinary message"
+    assert params["receiver_user_id"] == 111
+    assert call.kwargs["chat_id"] == chat_id, "ephemeral messages live in the group"
+
+
+@pytest.mark.asyncio
+async def test_opening_never_replaces_the_poll_message(mock_update, mock_context):
+    """replace_callback_query_message puts the new message where the tapped one
+    was. On the first open the tapped message is the *poll*, so replacing would
+    destroy it — that only becomes safe once the picker itself is tapped."""
+    chat_id, poll_id = 24684, "poll_pick_noreplace"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
+
+    mock_update.callback_query.data = "pk:p:0:0"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 777
+    mock_update.callback_query.from_user.id = 111
+
+    await handlers.poll_picker_callback(mock_update, mock_context)
+
+    params = _ephemeral_params(mock_context.bot.send_message.call_args)
+    assert "replace_callback_query_message" not in params
+    assert "callback_query_id" not in params
+
+
+@pytest.mark.asyncio
+async def test_paging_replaces_the_picker_in_place(mock_update, mock_context):
+    """Paging must not stack up a message per tap."""
+    chat_id, poll_id = 24685, "poll_pick_replace"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
+
+    mock_update.callback_query.data = f"pk:p:0:{chat_id}"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 778
+    mock_update.callback_query.from_user.id = 111
+    mock_update.callback_query.id = "cbq-1"
+
+    await handlers.poll_picker_callback(mock_update, mock_context)
+
+    params = _ephemeral_params(mock_context.bot.send_message.call_args)
+    assert params["replace_callback_query_message"] is True
+    assert params["callback_query_id"] == "cbq-1"
+
+
+@pytest.mark.asyncio
+async def test_picker_says_so_when_the_bot_is_not_admin(mock_update, mock_context):
+    """Ephemeral messages need admin rights. Without them the picker must say
+    why rather than falling back to a message the whole group can see."""
+    chat_id, poll_id = 24686, "poll_pick_notadmin"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
+
+    mock_context.bot.send_message = AsyncMock(
+        side_effect=telegram.error.BadRequest("Bot_not_admin")
+    )
+    mock_update.callback_query.data = "pk:p:0:0"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 777
+    mock_update.callback_query.from_user.id = 111
+
+    await handlers.poll_picker_callback(mock_update, mock_context)
+
+    said = " ".join(
+        str(a) for c in mock_update.callback_query.answer.call_args_list for a in c.args
+    )
+    assert "admin" in said.lower()
 
 
 @pytest.mark.asyncio
@@ -3238,9 +3304,10 @@ async def test_picker_vote_records_and_refreshes_the_shared_poll(mock_update, mo
     chat_id, poll_id = 24681, "poll_pick_vote"
     ids = await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
 
-    mock_update.callback_query.data = f"pk:v:{ids[0]}:0:111"
+    mock_update.callback_query.data = f"pk:v:{ids[0]}:0:{chat_id}"
     mock_update.callback_query.message.chat.id = chat_id
     mock_update.callback_query.message.message_id = 778
+    mock_update.callback_query.id = "cbq-vote"
     mock_update.callback_query.from_user.id = 111
     mock_update.callback_query.from_user.first_name = "Solo"
     mock_update.callback_query.from_user.last_name = None
@@ -3256,8 +3323,8 @@ async def test_picker_vote_records_and_refreshes_the_shared_poll(mock_update, mo
             .all()
         )
     assert [v.game_id for v in votes] == [ids[0]]
-    # The picker itself is edited in place to show the new ✅.
-    mock_update.callback_query.edit_message_text.assert_called()
+    # The picker is re-sent ephemerally so the new tick shows.
+    assert _ephemeral_params(mock_context.bot.send_message.call_args) is not None
 
 
 @pytest.mark.asyncio

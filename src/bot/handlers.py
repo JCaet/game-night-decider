@@ -199,16 +199,24 @@ _CB_SEPARATOR = "sep:"
 #
 # The page lives in callback_data rather than in the poll row, which is what
 # makes this safe: paginating the shared poll keyboard moved everyone's page at
-# once (#90, reverted in #92) because the poll is a single shared message. Each
-# picker is a separate message and carries its owner's id, so one voter paging
-# cannot disturb another. Bot API 10.2 ephemeral messages would let the picker
-# be invisible to everyone else, but PTB 22.x cannot send them yet.
+# once (#90, reverted in #92) because the poll is a single shared message.
 #
-# Callback forms (all well inside the 64-byte limit):
-#   pk:p:<page>:<owner>            turn to a page
-#   pk:v:<game_id>:<page>:<owner>  toggle a vote, stay on the page
-#   pk:x:<owner>                   dismiss
-#   pk:n                           page indicator, inert
+# Each picker is delivered as a Bot API 10.2 ephemeral message, visible to the
+# one person who opened it. A first attempt posted it as an ordinary group
+# message guarded by an owner check; in a real game night that filled the chat
+# with everyone's pickers and told people off for tapping the wrong one.
+# Ephemeral messages remove both problems at the source — nobody else sees a
+# picker, so nobody else can tap it. The bot must be a group admin to send
+# them; without that the picker says so rather than appearing publicly.
+#
+# Callback forms (all well inside the 64-byte limit). The trailing value is
+# the group's chat id, so a handler reached from an ephemeral message never has
+# to assume how such a message reports its own chat; the poll's entry button
+# carries 0, meaning "read it from the message this was tapped on".
+#   pk:p:<page>:<chat>            turn to a page
+#   pk:v:<game_id>:<page>:<chat>  toggle a vote, stay on the page
+#   pk:x:<chat>                   dismiss
+#   pk:n                          page indicator, inert
 _CB_PICK = "pk:"
 
 # Games per picker page, and the smallest slice of a complexity group worth
@@ -3393,14 +3401,13 @@ def _build_picker_keyboard(
     page: int,
     voted_ids: set[int],
     priority_ids: set[int],
-    owner_id: int,
+    chat_id: int,
 ) -> tuple[list[list[InlineKeyboardButton]], int, int]:
     """Build one page of the browse-all-games picker.
 
     Returns (keyboard, clamped_page, total_pages). Every button carries the
-    owner's id so a tap from anyone else can be turned away: the picker sits in
-    the group chat, where its buttons are tappable by all, and its page would
-    otherwise jump under the owner's feet.
+    group's chat id, because the picker is delivered as an ephemeral message and
+    the handler should not have to guess how one reports its own chat.
     """
     pages = _paginate_games_by_category(level_groups)
     total_pages = len(pages)
@@ -3423,7 +3430,7 @@ def _build_picker_keyboard(
             mark = "✅ " if g.id in voted_ids else ("⭐ " if g.id in priority_ids else "")
             label = _wrap_button_label(mark, g.name, "")
             row.append(
-                InlineKeyboardButton(label, callback_data=f"{_CB_PICK}v:{g.id}:{page}:{owner_id}")
+                InlineKeyboardButton(label, callback_data=f"{_CB_PICK}v:{g.id}:{page}:{chat_id}")
             )
             if len(row) == columns:
                 keyboard.append(row)
@@ -3434,18 +3441,18 @@ def _build_picker_keyboard(
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(
-            InlineKeyboardButton("◀️ Prev", callback_data=f"{_CB_PICK}p:{page - 1}:{owner_id}")
+            InlineKeyboardButton("◀️ Prev", callback_data=f"{_CB_PICK}p:{page - 1}:{chat_id}")
         )
     if total_pages > 1:
         nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"{_CB_PICK}n"))
     if page < total_pages - 1:
         nav.append(
-            InlineKeyboardButton("Next ▶️", callback_data=f"{_CB_PICK}p:{page + 1}:{owner_id}")
+            InlineKeyboardButton("Next ▶️", callback_data=f"{_CB_PICK}p:{page + 1}:{chat_id}")
         )
     if nav:
         keyboard.append(nav)
 
-    keyboard.append([InlineKeyboardButton("✅ Done", callback_data=f"{_CB_PICK}x:{owner_id}")])
+    keyboard.append([InlineKeyboardButton("✅ Done", callback_data=f"{_CB_PICK}x:{chat_id}")])
     return keyboard, page, total_pages
 
 
@@ -3471,7 +3478,7 @@ async def _picker_view(session, poll_id: str, chat_id: int, user_id: int, page: 
     voted_ids = {gid for gid in voted.scalars().all() if gid is not None}
 
     keyboard, page, total_pages = _build_picker_keyboard(
-        level_groups, page, voted_ids, priority_ids, user_id
+        level_groups, page, voted_ids, priority_ids, chat_id
     )
     text = "\n".join(
         [
@@ -3485,8 +3492,56 @@ async def _picker_view(session, poll_id: str, chat_id: int, user_id: int, page: 
     return text, keyboard
 
 
+async def _send_ephemeral_picker(
+    context, chat_id: int, query, text: str, keyboard: list, replace: bool
+) -> bool:
+    """Show the picker to one person only, inside the group chat.
+
+    Bot API 10.2 ephemeral messages are visible to a single receiver, which is
+    what the picker needs: a picker everyone can see clutters the chat and
+    invites taps from people it does not belong to. python-telegram-bot 22.x has
+    no support for them, but they are plain sendMessage parameters, so they go
+    through api_kwargs the same way this module already passes unsupported poll
+    options.
+
+    ``replace`` uses Bot API 10.3's replace_callback_query_message to put the
+    new page where the old one was, so paging does not stack up messages. It is
+    never used for the first open, because there the callback query belongs to
+    the *poll* message and replacing that would destroy the poll.
+
+    Returns False if the bot lacks the rights to send one, so the caller can say
+    so instead of silently showing nothing.
+    """
+    params: dict = {"receiver_user_id": query.from_user.id}
+    if replace:
+        params["callback_query_id"] = query.id
+        params["replace_callback_query_message"] = True
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+            api_kwargs={"ephemeral_message_parameters": json.dumps(params)},
+        )
+        return True
+    except telegram.error.TelegramError as e:
+        msg = str(e)
+        if "not_admin" in msg.lower() or "not admin" in msg.lower():
+            logger.info("Cannot send ephemeral picker in chat %s: %s", chat_id, msg)
+            return False
+        raise
+
+
 async def poll_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drive the browse-all-games picker: open, page, vote, dismiss."""
+    """Drive the browse-all-games picker: open, page, vote, dismiss.
+
+    Every render is an ephemeral message, so a picker is visible only to the
+    person who opened it. Nobody else sees it and nobody else can tap it, which
+    is why there is no owner check here: the first open sends a new one, and
+    every later tap replaces it in place.
+    """
     query = update.callback_query
     parts = (query.data or "").removeprefix(_CB_PICK).split(":")
     action = parts[0] if parts else ""
@@ -3497,24 +3552,19 @@ async def poll_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer()
         return
 
-    # Every form but the poll's own entry button carries the owner's id. The
-    # entry button uses owner 0, meaning "whoever tapped it owns the picker".
-    owner = int(parts[-1]) if parts[-1].lstrip("-").isdigit() else 0
-    if owner and owner != user_id:
-        with contextlib.suppress(telegram.error.BadRequest):
-            await query.answer(
-                "That's someone else's list — tap 🔍 All games to open your own.",
-                show_alert=True,
-            )
-        return
+    # The poll's own entry button carries chat 0, meaning "read the chat from
+    # the message this was tapped on". Picker buttons carry the group's id, so
+    # the handler never has to assume how an ephemeral message reports its chat.
+    tail = int(parts[-1]) if parts[-1].lstrip("-").isdigit() else 0
+    opening = tail == 0
+    chat_id = query.message.chat.id if opening else tail
 
     if action == "x":
         with contextlib.suppress(telegram.error.BadRequest):
             await query.answer()
-            await query.message.delete()  # type: ignore[attr-defined]
+        await _send_ephemeral_picker(context, chat_id, query, "✅ _Closed._", [], replace=True)
         return
 
-    chat_id = query.message.chat.id
     async with db.AsyncSessionLocal() as session:
         game_poll = await _active_poll_for_chat(session, chat_id)
         if game_poll is None:
@@ -3533,26 +3583,21 @@ async def poll_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         page = int(parts[2]) if action == "v" else int(parts[1])
         text, keyboard = await _picker_view(session, poll_id, chat_id, user_id, page)
 
-    # Opening comes from the poll's own button (owner 0), so the picker needs a
-    # message of its own; paging and voting edit the picker already on screen.
-    if owner == 0:
+    if opening:
         with contextlib.suppress(telegram.error.BadRequest):
             await query.answer()
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
-        )
-        return
 
-    try:
-        await query.edit_message_text(
-            text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
-        )
-    except telegram.error.BadRequest as e:
-        if "not modified" not in str(e).lower():
-            logger.warning("Failed to update picker: %s", e)
+    # Replacing is only safe once the picker itself is the message being tapped.
+    sent = await _send_ephemeral_picker(
+        context, chat_id, query, text, keyboard, replace=not opening
+    )
+    if not sent:
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer(
+                "I need to be an admin in this group to show you the game list "
+                "privately. Promote me and tap again.",
+                show_alert=True,
+            )
 
 
 async def _picker_cast_vote(session, context, query, game_poll, game_id: int) -> None:
