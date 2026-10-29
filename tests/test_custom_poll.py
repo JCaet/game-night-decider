@@ -1127,7 +1127,7 @@ async def test_custom_poll_ui_grouping(mock_update, mock_context):
     assert "--- 1 ---" in labels or any("--- 1" in label for label in labels)
 
     # Verify Callback data: category headers carry the short category prefix
-    assert any(cb.startswith(handlers._CB_CATEGORY) for cb in callbacks)
+    assert any(cb.startswith(handlers._CB_SEPARATOR) for cb in callbacks)
 
 
 @pytest.mark.asyncio
@@ -2595,12 +2595,12 @@ def _vote_ids_from_markup(markup):
     ]
 
 
-def _category_levels_from_markup(markup):
+def _separator_levels_from_markup(markup):
     return [
-        int(btn.callback_data.removeprefix(handlers._CB_CATEGORY))
+        int(btn.callback_data.removeprefix(handlers._CB_SEPARATOR))
         for row in markup.inline_keyboard
         for btn in row
-        if btn.callback_data and btn.callback_data.startswith(handlers._CB_CATEGORY)
+        if btn.callback_data and btn.callback_data.startswith(handlers._CB_SEPARATOR)
     ]
 
 
@@ -2626,7 +2626,7 @@ def test_build_poll_keyboard_drops_lowest_complexity_first():
     assert shown == len(vote_ids)
     assert hidden == 40 - shown > 0  # some games were dropped
     # Both categories keep a header so dropped games stay votable.
-    assert set(_category_levels_from_markup(markup)) == {4, 2}
+    assert set(_separator_levels_from_markup(markup)) == {4, 2}
 
 
 async def _seed_poll_with_levels(chat_id, poll_id, level_counts, message_id=999):
@@ -2672,7 +2672,7 @@ async def test_small_poll_shows_all_games_and_no_note(mock_context):
         await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
 
     call = mock_context.bot.edit_message_text.call_args
-    assert "games as buttons" not in call.kwargs["text"]
+    assert "Showing" not in call.kwargs["text"]
     assert sorted(_vote_ids_from_markup(call.kwargs["reply_markup"])) == sorted(ids)
 
 
@@ -2694,9 +2694,9 @@ async def test_large_poll_drops_lowest_complexity_and_notes_it(mock_context, mon
     vote_ids = _vote_ids_from_markup(markup)
     assert vote_ids and all(1 <= i <= 10 for i in vote_ids)  # only high-complexity shown
     assert len(vote_ids) < 20  # some dropped
-    assert "games as buttons" in call.kwargs["text"]
+    assert "Showing" in call.kwargs["text"]
     # Both complexity categories keep a header (low-complexity games votable there).
-    assert set(_category_levels_from_markup(markup)) == {4, 2}
+    assert set(_separator_levels_from_markup(markup)) == {4, 2}
 
 
 @pytest.mark.asyncio
@@ -2763,7 +2763,7 @@ def test_poll_keyboard_callback_data_omits_poll_id():
     callbacks = [b.callback_data for row in keyboard for b in row]
 
     assert "v:42" in callbacks
-    assert "c:3" in callbacks
+    assert "sep:3" in callbacks
     assert not any(c.startswith("vote:") or c.startswith("poll_random_vote:") for c in callbacks)
 
 
@@ -2997,3 +2997,52 @@ async def test_full_keyboard_is_not_reported_as_dropped(mock_context, caplog):
             )
 
     assert "silently dropped" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_separator_tap_does_nothing(mock_update, mock_context):
+    """Complexity separators only label the group beneath them. Telegram has no
+    inert button on this API version, so the tap arrives and must be absorbed
+    without casting a vote or touching the poll."""
+    chat_id, poll_id = 54321, "poll_sep"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=4545)
+
+    mock_update.callback_query.data = "sep:3"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 4545
+    mock_context.bot.edit_message_text = AsyncMock()
+
+    await handlers.poll_separator_callback(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        votes = (
+            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
+            .scalars()
+            .all()
+        )
+    assert votes == [], "a separator must never record a vote"
+    mock_context.bot.edit_message_text.assert_not_called()
+    mock_update.callback_query.answer.assert_called_once_with()
+
+
+def test_separators_are_emitted_for_every_level():
+    """Every complexity group keeps its separator even when all of its games
+    were cut, so the remaining buttons stay grouped and labelled."""
+    levels_desc = [4, 2]
+    sorted_by_level = {
+        4: [SimpleNamespace(id=i, name=f"H{i}") for i in range(1, 21)],
+        2: [SimpleNamespace(id=i, name=f"L{i}") for i in range(101, 121)],
+    }
+    keyboard, shown, hidden = _build_poll_keyboard(
+        "poll_sep2", levels_desc, sorted_by_level, {}, set(), {}, False, False, 400
+    )
+    markup = InlineKeyboardMarkup(keyboard)
+    assert hidden > 0, "budget must be tight enough to drop a whole level"
+    assert set(_separator_levels_from_markup(markup)) == {4, 2}
+    # Separators are not vote buttons.
+    assert not any(
+        btn.callback_data.startswith(handlers._CB_VOTE)
+        for row in markup.inline_keyboard
+        for btn in row
+        if btn.callback_data.startswith(handlers._CB_SEPARATOR)
+    )
