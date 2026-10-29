@@ -191,6 +191,35 @@ _CB_CATEGORY = "c:"
 # Bot API 10.3 and this prefix can go away.
 _CB_SEPARATOR = "sep:"
 
+# Per-user "browse all games" picker.
+#
+# Telegram allows 100 buttons on an edited message, so a collection bigger than
+# ~91 games cannot be shown in the poll at all. The picker covers the remainder
+# by paging through every game in its own message.
+#
+# The page lives in callback_data rather than in the poll row, which is what
+# makes this safe: paginating the shared poll keyboard moved everyone's page at
+# once (#90, reverted in #92) because the poll is a single shared message. Each
+# picker is a separate message and carries its owner's id, so one voter paging
+# cannot disturb another. Bot API 10.2 ephemeral messages would let the picker
+# be invisible to everyone else, but PTB 22.x cannot send them yet.
+#
+# Callback forms (all well inside the 64-byte limit):
+#   pk:p:<page>:<owner>            turn to a page
+#   pk:v:<game_id>:<page>:<owner>  toggle a vote, stay on the page
+#   pk:x:<owner>                   dismiss
+#   pk:n                           page indicator, inert
+_CB_PICK = "pk:"
+
+# Games per picker page, and the smallest slice of a complexity group worth
+# leaving on a page. Pages break on complexity boundaries where that is
+# reasonable, so a page reads as whole groups rather than an arbitrary cut;
+# _paginate_games_by_category explains how the two interact. 60 games costs
+# ~70 buttons and ~6.5KB once separators and navigation are added, comfortably
+# inside the 100-button edit limit.
+_POLL_PICKER_PAGE_SIZE = 60
+_POLL_PICKER_MIN_CHUNK = 8
+
 # Telegram's keyboard limits are undocumented apart from callback_data, so they
 # were measured against the live API (scripts/probe_telegram_keyboard_limits.py).
 # They differ by METHOD, which is the detail that matters here:
@@ -290,16 +319,21 @@ def _build_poll_keyboard(
         label = _wrap_button_label(prefix, g.name, suffix)
         return InlineKeyboardButton(label, callback_data=f"{_CB_VOTE}{g.id}")
 
-    # Action row is fixed; reserve its cost up front.
+    # Action row is fixed; reserve its cost up front. The browse button is
+    # reserved unconditionally even though it is only emitted when games had to
+    # be left out — whether that happens isn't known until selection is done,
+    # and over-reserving one button is cheaper than a second pass.
+    browse_button = InlineKeyboardButton("🔍 All games", callback_data=f"{_CB_PICK}p:0:0")
     action_row = [
         InlineKeyboardButton("🔄 Refresh", callback_data=f"poll_refresh:{poll_id}"),
         InlineKeyboardButton("🛑 Close", callback_data=f"poll_close:{poll_id}"),
     ]
     if allow_adding:
         action_row.insert(1, InlineKeyboardButton("➕ Add", callback_data=f"poll_add:{poll_id}"))
+    reserved_action_row = [*action_row, browse_button]
 
     headroom = min(_MARKUP_ROW_HEADROOM_BYTES, budget_bytes // 10)
-    used = headroom + sum(_button_bytes(b) for b in action_row)
+    used = headroom + sum(_button_bytes(b) for b in reserved_action_row)
 
     # Reserve one separator per level (cheap, ≤6) so every group stays labelled
     # even when all of its games were cut. A count only appears for a poll that
@@ -332,7 +366,7 @@ def _build_poll_keyboard(
     # overshoots would show fewer games than the message claims.
     selected: set[int] = set()
     total = len(ranked)
-    buttons_used = len(action_row) + len(headers)
+    buttons_used = len(reserved_action_row) + len(headers)
     for *_, g in ranked:
         cost = _button_bytes(_game_button(g))
         if used + cost > budget_bytes or buttons_used >= _MAX_KEYBOARD_BUTTONS:
@@ -367,6 +401,9 @@ def _build_poll_keyboard(
         if current_row:
             keyboard.append(current_row)
 
+    # Only offer the picker when there is something it can reach.
+    if total - shown > 0:
+        action_row = [*action_row, browse_button]
     keyboard.append(action_row)
     return keyboard, shown, total - shown
 
@@ -3262,6 +3299,295 @@ async def _poll_for_callback(session, query, legacy_action: str) -> GameNightPol
     return cast(GameNightPoll | None, found)
 
 
+async def _active_poll_for_chat(session, chat_id: int) -> GameNightPoll | None:
+    """The chat's current poll.
+
+    The picker lives in its own message, so it cannot be resolved the way poll
+    buttons are (by the message they sit on). Closing a poll deletes its row, so
+    a chat has at most one; the newest is taken in case a stale row survives.
+    """
+    found = await session.scalar(
+        select(GameNightPoll)
+        .where(GameNightPoll.chat_id == chat_id)
+        .order_by(GameNightPoll.poll_id.desc())
+        .limit(1)
+    )
+    return cast(GameNightPoll | None, found)
+
+
+def _paginate_games_by_category(
+    level_groups: list[tuple[int, list]],
+    page_size: int = _POLL_PICKER_PAGE_SIZE,
+    min_chunk: int = _POLL_PICKER_MIN_CHUNK,
+) -> list[list[tuple[int, list]]]:
+    """Split complexity groups into pages, breaking on group boundaries.
+
+    Each page is a list of ``(level, games)`` segments, so a page reads as whole
+    complexity groups instead of an arbitrary slice of an alphabetical list.
+
+    A group that does not fit the space left on a page is only split when both
+    resulting pieces are worth showing — at least ``min_chunk`` games. Otherwise
+    the whole group moves to a fresh page, which is what stops a group from
+    leaving one or two stranded games behind on the previous page.
+
+    A group too large for a whole page has to be split regardless; it is then
+    spread evenly over the pages it needs, so the last page of that group isn't
+    a sliver either.
+    """
+    pages: list[list[tuple[int, list]]] = []
+    current: list[tuple[int, list]] = []
+    used = 0
+
+    for level, games in level_groups:
+        i = 0
+        while i < len(games):
+            space = page_size - used
+            rest = len(games) - i
+
+            if rest <= space:  # the whole remainder of this group fits
+                current.append((level, games[i:]))
+                used += rest
+                break
+
+            # Splitting here would strand a sliver on one side or the other, and
+            # there is already something on this page — start a fresh one.
+            if current and (space < min_chunk or rest - space < min_chunk):
+                pages.append(current)
+                current, used = [], 0
+                continue
+
+            if used == 0 and rest > page_size:
+                # Bigger than a page on its own: spread it evenly rather than
+                # filling pages and leaving a remainder.
+                chunks = (rest + page_size - 1) // page_size
+                take = (rest + chunks - 1) // chunks
+            else:
+                take = space
+
+            current.append((level, games[i : i + take]))
+            used += take
+            i += take
+
+    if current:
+        pages.append(current)
+    return pages or [[]]
+
+
+def _build_picker_keyboard(
+    level_groups: list[tuple[int, list]],
+    page: int,
+    voted_ids: set[int],
+    priority_ids: set[int],
+    owner_id: int,
+) -> tuple[list[list[InlineKeyboardButton]], int, int]:
+    """Build one page of the browse-all-games picker.
+
+    Returns (keyboard, clamped_page, total_pages). Every button carries the
+    owner's id so a tap from anyone else can be turned away: the picker sits in
+    the group chat, where its buttons are tappable by all, and its page would
+    otherwise jump under the owner's feet.
+    """
+    pages = _paginate_games_by_category(level_groups)
+    total_pages = len(pages)
+    page = max(0, min(page, total_pages - 1))
+    segments = pages[page]
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for level, page_games in segments:
+        level_name = level if level > 0 else "Unrated"
+        keyboard.append(
+            [InlineKeyboardButton(f"--- {level_name} ---", callback_data=f"{_CB_SEPARATOR}{level}")]
+        )
+        # Two per row unless a name in this group needs the full width.
+        columns = (
+            1 if any(x.name and len(x.name) > _BUTTON_LONG_THRESHOLD for x in page_games) else 2
+        )
+        columns = min(columns, _MAX_BUTTONS_PER_ROW)
+        row: list[InlineKeyboardButton] = []
+        for g in page_games:
+            mark = "✅ " if g.id in voted_ids else ("⭐ " if g.id in priority_ids else "")
+            label = _wrap_button_label(mark, g.name, "")
+            row.append(
+                InlineKeyboardButton(label, callback_data=f"{_CB_PICK}v:{g.id}:{page}:{owner_id}")
+            )
+            if len(row) == columns:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton("◀️ Prev", callback_data=f"{_CB_PICK}p:{page - 1}:{owner_id}")
+        )
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"{_CB_PICK}n"))
+    if page < total_pages - 1:
+        nav.append(
+            InlineKeyboardButton("Next ▶️", callback_data=f"{_CB_PICK}p:{page + 1}:{owner_id}")
+        )
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("✅ Done", callback_data=f"{_CB_PICK}x:{owner_id}")])
+    return keyboard, page, total_pages
+
+
+async def _picker_view(session, poll_id: str, chat_id: int, user_id: int, page: int):
+    """Gather everything one picker page needs: (text, keyboard)."""
+    valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+    valid_games = await _merge_added_games(session, poll_id, valid_games)
+
+    # Same grouping and ordering the poll uses, so a game sits where a voter
+    # expects it. group_games_by_complexity already sorts each group by name and
+    # drops empty levels; highest complexity first mirrors the poll keyboard.
+    groups = group_games_by_complexity(valid_games) if valid_games else {}
+    level_groups = [(level, groups[level]) for level in sorted(groups, reverse=True)]
+    total_games = sum(len(g) for _, g in level_groups)
+
+    voted = await session.execute(
+        select(PollVote.game_id).where(
+            PollVote.poll_id == poll_id,
+            PollVote.user_id == user_id,
+            PollVote.vote_type == VoteType.GAME,
+        )
+    )
+    voted_ids = {gid for gid in voted.scalars().all() if gid is not None}
+
+    keyboard, page, total_pages = _build_picker_keyboard(
+        level_groups, page, voted_ids, priority_ids, user_id
+    )
+    text = "\n".join(
+        [
+            "🔍 **All games**",
+            f"_Page {page + 1} of {total_pages} · {total_games} games · "
+            f"{len(voted_ids)} of them voted by you_",
+            "",
+            "_Tap a game to vote or unvote. ✅ marks your votes._",
+        ]
+    )
+    return text, keyboard
+
+
+async def poll_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drive the browse-all-games picker: open, page, vote, dismiss."""
+    query = update.callback_query
+    parts = (query.data or "").removeprefix(_CB_PICK).split(":")
+    action = parts[0] if parts else ""
+    user_id = query.from_user.id
+
+    if action == "n":  # page indicator, inert
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer()
+        return
+
+    # Every form but the poll's own entry button carries the owner's id. The
+    # entry button uses owner 0, meaning "whoever tapped it owns the picker".
+    owner = int(parts[-1]) if parts[-1].lstrip("-").isdigit() else 0
+    if owner and owner != user_id:
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer(
+                "That's someone else's list — tap 🔍 All games to open your own.",
+                show_alert=True,
+            )
+        return
+
+    if action == "x":
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer()
+            await query.message.delete()  # type: ignore[attr-defined]
+        return
+
+    chat_id = query.message.chat.id
+    async with db.AsyncSessionLocal() as session:
+        game_poll = await _active_poll_for_chat(session, chat_id)
+        if game_poll is None:
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("Poll not found", show_alert=True)
+            return
+        poll_id = game_poll.poll_id
+
+        if action == "v":
+            await _picker_cast_vote(session, context, query, game_poll, int(parts[1]))
+        elif action != "p":
+            with contextlib.suppress(telegram.error.BadRequest):
+                await query.answer("Unknown action")
+            return
+
+        page = int(parts[2]) if action == "v" else int(parts[1])
+        text, keyboard = await _picker_view(session, poll_id, chat_id, user_id, page)
+
+    # Opening comes from the poll's own button (owner 0), so the picker needs a
+    # message of its own; paging and voting edit the picker already on screen.
+    if owner == 0:
+        with contextlib.suppress(telegram.error.BadRequest):
+            await query.answer()
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        await query.edit_message_text(
+            text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+        )
+    except telegram.error.BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("Failed to update picker: %s", e)
+
+
+async def _picker_cast_vote(session, context, query, game_poll, game_id: int) -> None:
+    """Record a vote cast from the picker and refresh the shared poll."""
+    chat_id = game_poll.chat_id
+    poll_id = game_poll.poll_id
+    session_obj = await session.get(Session, chat_id)
+    vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
+
+    valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+    valid_games = await _merge_added_games(session, poll_id, valid_games)
+    valid_category_levels = (
+        set(group_games_by_complexity(valid_games).keys()) if valid_games else set()
+    )
+
+    result = await PollService.cast_vote(
+        session=session,
+        poll_id=poll_id,
+        user_id=query.from_user.id,
+        target_id=game_id,
+        vote_type=VoteType.GAME,
+        user_name=query.from_user.first_name,
+        vote_limit=vote_limit,
+        game_count=len(valid_games) if valid_games else 0,
+        user_last_name=query.from_user.last_name,
+        user_tg_username=query.from_user.username,
+        valid_game_ids={g.id for g in valid_games},
+        valid_category_levels=valid_category_levels,
+    )
+
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer(result.message)
+
+    # The shared poll shows the tally, so it has to catch up too. Reuse the
+    # debounce that keeps a burst of votes down to a single edit.
+    if result.success and not _schedule_poll_render(
+        context, chat_id, game_poll.message_id, poll_id
+    ):
+        await render_poll_message(
+            context.bot,
+            chat_id,
+            game_poll.message_id,
+            session,
+            poll_id,
+            valid_games,
+            priority_ids,
+            already_merged=True,
+        )
+
+
 async def poll_separator_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Absorb a tap on a complexity separator.
 
@@ -3596,9 +3922,9 @@ async def render_poll_message(
         if hidden > 0 and not hide_results:
             lines.insert(
                 3,
-                f"🎛️ _Showing {shown} of {shown + hidden} games — Telegram allows "
-                f"only {_MAX_KEYBOARD_BUTTONS} buttons per message, so the least "
-                f"starred and least voted games are left out._",
+                f"🎛️ _Showing the top {shown} of {shown + hidden} games — Telegram "
+                f"allows only {_MAX_KEYBOARD_BUTTONS} buttons per message. "
+                f"Tap 🔍 All games to browse and vote for any of them._",
             )
         text = _clamp_message_text(lines)
         try:
