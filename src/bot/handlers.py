@@ -217,8 +217,11 @@ _CB_PICK = "pk:"
 # _paginate_games_by_category explains how the two interact. 60 games costs
 # ~70 buttons and ~6.5KB once separators and navigation are added, comfortably
 # inside the 100-button edit limit.
-_POLL_PICKER_PAGE_SIZE = 60
-_POLL_PICKER_MIN_CHUNK = 8
+# TEMPORARY -- REVERT WITH THE BUTTON CAP ABOVE.
+# Lowered from 60 so a 68-game collection pages several times instead of
+# twice, which is what makes the paging actually testable by hand.
+_POLL_PICKER_PAGE_SIZE = 12
+_POLL_PICKER_MIN_CHUNK = 4
 
 # Telegram's keyboard limits are undocumented apart from callback_data, so they
 # were measured against the live API (scripts/probe_telegram_keyboard_limits.py).
@@ -244,7 +247,13 @@ _RENDER_MAX_ATTEMPTS = 4
 # (2-3) and one header per complexity level (up to 6) are reserved first, so
 # roughly 91 game buttons remain. A game list longer than that cannot fit in a
 # single message at all, which is why the message says how many it is showing.
-_MAX_KEYBOARD_BUTTONS = 100
+#
+# TEMPORARY -- REVERT BEFORE RELYING ON THIS IN A REAL GAME NIGHT.
+# Lowered from the measured Telegram limit of 100 to force the browse picker to
+# appear on a collection that would otherwise fit, so the paging, the ownership
+# refusal and the vote marks can be exercised with real people in a real group.
+# Telegram's actual limit is unchanged at 100; this only makes us stop earlier.
+_MAX_KEYBOARD_BUTTONS = 30
 _MAX_BUTTONS_PER_ROW = 8
 
 # Secondary guard. With the count capped at 100 the keyboard runs ~6KB, well
