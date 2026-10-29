@@ -30,6 +30,13 @@ version_toml = ["pyproject.toml:project.version"]
 branch = "main"
 upload_to_release = true
 commit_message = "{version} [skip ci]"
+# uv records the project's own version in uv.lock, but semantic-release only
+# patches version_toml — so every release left the lockfile a version behind and
+# the next `uv` invocation dirtied the working tree. Re-lock after the bump and
+# include the result in the release commit. `uv lock` does not upgrade existing
+# pins, so this only rewrites the project version line.
+build_command = "uv lock"
+assets = ["uv.lock"]
 
 [tool.semantic_release.changelog]
 exclude_commit_patterns = []
