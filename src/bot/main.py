@@ -30,6 +30,7 @@ from src.bot.handlers import (  # noqa: E402
     manage_collection,
     manage_collection_callback,
     poll_add_select_callback,
+    poll_picker_callback,
     poll_separator_callback,
     poll_settings_callback,
     receive_poll_answer,
@@ -94,6 +95,8 @@ def main():
     # the client's spinner stops. "c:" is the retired category-vote prefix, kept
     # registered for keyboards already sitting in chats.
     app.add_handler(CallbackQueryHandler(poll_separator_callback, pattern=r"^sep:"))
+    # Browse-all-games picker: its own message, paged per user.
+    app.add_handler(CallbackQueryHandler(poll_picker_callback, pattern=r"^pk:"))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^c:"))
     app.add_handler(CallbackQueryHandler(custom_poll_vote_callback, pattern=r"^vote:"))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_refresh:"))

@@ -3046,3 +3046,160 @@ def test_separators_are_emitted_for_every_level():
         for btn in row
         if btn.callback_data.startswith(handlers._CB_SEPARATOR)
     )
+
+
+def _picker_game_ids(keyboard):
+    return [
+        int(b.callback_data.split(":")[2])
+        for row in keyboard
+        for b in row
+        if b.callback_data.startswith(f"{handlers._CB_PICK}v:")
+    ]
+
+
+def test_picker_pages_reach_every_game():
+    """The picker exists so that no game is unreachable: paging through it must
+    cover the whole collection exactly once."""
+    games = [SimpleNamespace(id=1000 + i, name=f"Game {i}") for i in range(151)]
+    seen: list[int] = []
+    _, _, total_pages = handlers._build_picker_keyboard(games, 0, set(), set(), 42)
+    for page in range(total_pages):
+        keyboard, got_page, _ = handlers._build_picker_keyboard(games, page, set(), set(), 42)
+        assert got_page == page
+        seen.extend(_picker_game_ids(keyboard))
+
+    assert sorted(seen) == sorted(g.id for g in games)
+    assert len(seen) == len(set(seen)), "no game should appear on two pages"
+
+
+def test_picker_page_is_clamped_and_fits_the_edit_limits():
+    """Pages are edited into place, so each must stay under the 100-button and
+    8-per-row limits that editMessageText enforces silently."""
+    games = [
+        SimpleNamespace(id=1000 + i, name=f"Game Number {i} With A Long Name") for i in range(151)
+    ]
+    keyboard, page, total_pages = handlers._build_picker_keyboard(games, 999, set(), set(), 42)
+
+    assert page == total_pages - 1, "an out-of-range page clamps to the last one"
+    assert sum(len(r) for r in keyboard) <= handlers._MAX_KEYBOARD_BUTTONS
+    assert max(len(r) for r in keyboard) <= handlers._MAX_BUTTONS_PER_ROW
+    longest = max(len(b.callback_data) for row in keyboard for b in row if b.callback_data)
+    assert longest <= 64, "callback_data has a documented 64-byte limit"
+
+
+def test_picker_marks_the_users_own_votes():
+    games = [SimpleNamespace(id=1, name="Voted"), SimpleNamespace(id=2, name="Not voted")]
+    keyboard, _, _ = handlers._build_picker_keyboard(games, 0, {1}, set(), 42)
+    labels = {
+        int(b.callback_data.split(":")[2]): b.text
+        for row in keyboard
+        for b in row
+        if b.callback_data.startswith(f"{handlers._CB_PICK}v:")
+    }
+    assert labels[1].startswith("✅")
+    assert not labels[2].startswith("✅")
+
+
+def test_browse_button_appears_only_when_games_are_left_out():
+    """A picker with nothing to reach is just clutter."""
+    small = [SimpleNamespace(id=i, name=f"G{i}") for i in range(1, 6)]
+    keyboard, shown, hidden = _build_poll_keyboard(
+        "poll_small_browse", [3], {3: small}, {}, set(), {}, False, False, 9800
+    )
+    assert hidden == 0
+    assert not any(b.callback_data.startswith(handlers._CB_PICK) for row in keyboard for b in row)
+
+    many = [SimpleNamespace(id=i, name=f"Game Number {i}") for i in range(1, 400)]
+    keyboard, shown, hidden = _build_poll_keyboard(
+        "poll_big_browse", [3], {3: many}, {}, set(), {}, False, False, 9800
+    )
+    assert hidden > 0
+    assert any(b.callback_data.startswith(handlers._CB_PICK) for row in keyboard for b in row)
+
+
+@pytest.mark.asyncio
+async def test_picker_rejects_another_users_taps(mock_update, mock_context):
+    """The picker sits in the group chat, so its buttons are tappable by anyone.
+    Paging on someone else's picker would move it under their feet, so a tap
+    from a non-owner is turned away without recording anything."""
+    chat_id, poll_id = 24680, "poll_pick_owner"
+    ids = await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
+
+    mock_update.callback_query.data = f"pk:v:{ids[0]}:0:999999"  # owned by someone else
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 778
+    mock_update.callback_query.from_user.id = 111
+
+    await handlers.poll_picker_callback(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        votes = (
+            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
+            .scalars()
+            .all()
+        )
+    assert votes == []
+    args = mock_update.callback_query.answer.call_args
+    assert "someone else" in args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_picker_vote_records_and_refreshes_the_shared_poll(mock_update, mock_context):
+    """A vote cast in the picker is a real vote: it lands in the DB and the
+    shared poll's tally is brought up to date."""
+    chat_id, poll_id = 24681, "poll_pick_vote"
+    ids = await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
+
+    mock_update.callback_query.data = f"pk:v:{ids[0]}:0:111"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 778
+    mock_update.callback_query.from_user.id = 111
+    mock_update.callback_query.from_user.first_name = "Solo"
+    mock_update.callback_query.from_user.last_name = None
+    mock_update.callback_query.from_user.username = None
+    mock_context.bot.edit_message_text = AsyncMock()
+
+    await handlers.poll_picker_callback(mock_update, mock_context)
+
+    async with db.AsyncSessionLocal() as session:
+        votes = (
+            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
+            .scalars()
+            .all()
+        )
+    assert [v.game_id for v in votes] == [ids[0]]
+    # The picker itself is edited in place to show the new ✅.
+    mock_update.callback_query.edit_message_text.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_picker_opens_in_its_own_message(mock_update, mock_context):
+    """The poll's browse button carries owner 0, meaning "whoever tapped owns
+    it" — that opens a fresh picker rather than editing the poll."""
+    chat_id, poll_id = 24682, "poll_pick_open"
+    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
+
+    mock_update.callback_query.data = "pk:p:0:0"
+    mock_update.callback_query.message.chat.id = chat_id
+    mock_update.callback_query.message.message_id = 777
+    mock_update.callback_query.from_user.id = 111
+
+    await handlers.poll_picker_callback(mock_update, mock_context)
+
+    mock_context.bot.send_message.assert_called_once()
+    kwargs = mock_context.bot.send_message.call_args.kwargs
+    assert kwargs["chat_id"] == chat_id
+    assert "All games" in kwargs["text"]
+    # The poll message must not be touched by opening a picker.
+    mock_update.callback_query.edit_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_picker_page_indicator_is_inert(mock_update, mock_context):
+    mock_update.callback_query.data = "pk:n"
+    mock_update.callback_query.from_user.id = 111
+
+    await handlers.poll_picker_callback(mock_update, mock_context)
+
+    mock_update.callback_query.answer.assert_called_once_with()
+    mock_update.callback_query.edit_message_text.assert_not_called()
