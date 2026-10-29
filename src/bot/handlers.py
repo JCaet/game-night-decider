@@ -178,34 +178,55 @@ _BUTTON_LONG_THRESHOLD = 18
 _CB_VOTE = "v:"
 _CB_CATEGORY = "c:"
 
-# Telegram rejects an oversized inline keyboard with "Reply markup is too long",
-# which (since the error was swallowed) silently froze polls whose game list was
-# too big to fit one keyboard. We cap the serialized reply_markup to a safe byte
-# budget: game buttons are added in relevance order (starred, then most-voted,
-# then highest-complexity) and we stop before the budget is exceeded, so the
-# games left without an individual button are the least relevant ones (still
-# votable via their complexity-category button).
+# Telegram's keyboard limits are undocumented apart from callback_data, so they
+# were measured against the live API (scripts/probe_telegram_keyboard_limits.py).
+# They differ by METHOD, which is the detail that matters here:
 #
-# The exact server limit isn't documented. 9000 was previously used here, but it
-# sits *above* the real ceiling: a full keyboard built to that budget serializes
-# to ~9047 bytes and was rejected every time, so large polls always fell through
-# to the halved 4500 budget and showed ~40 of 151 games. We now start below the
-# observed rejection point and, because the ceiling is a property of the server
-# rather than of any one poll, remember a rejection in _learned_markup_budget so
-# later renders don't keep paying for a call we know will fail.
-_REPLY_MARKUP_BUDGET_BYTES = 8000
+#                     sendMessage      editMessageText
+#   total buttons     300              100     <- silently truncated, HTTP 200
+#   buttons per row   12               8       <- silently truncated, HTTP 200
+#
+#   message text      4096 chars       -> error "Message_too_long"
+#   callback_data     1-64 bytes       (the only documented limit)
+#   reply_markup size >= 12,000 bytes accepted on the edit path; not crisp and
+#                     never the binding constraint once the count cap applies
+#
+# The poll sends a keyboard-less placeholder and then *edits* it on every
+# render, so the stricter edit limits are the only ones that ever apply: 100
+# buttons and 8 per row. Over them Telegram returns success and quietly drops
+# the excess, so nothing raises and the message would claim more games than it
+# shows -- the count has to be enforced here instead.
 _RENDER_MAX_ATTEMPTS = 4
+
+# Total buttons the keyboard may contain, controls included: the action row
+# (2-3) and one header per complexity level (up to 6) are reserved first, so
+# roughly 91 game buttons remain. A game list longer than that cannot fit in a
+# single message at all, which is why the message says how many it is showing.
+_MAX_KEYBOARD_BUTTONS = 100
+_MAX_BUTTONS_PER_ROW = 8
+
+# Secondary guard. With the count capped at 100 the keyboard runs ~6KB, well
+# under any size Telegram rejected, so this almost never binds -- it stays as a
+# backstop for unusually long game names and keeps the retry path meaningful.
+_REPLY_MARKUP_BUDGET_BYTES = 9800
+
+# Telegram rejects a message over this many characters with "Message_too_long",
+# which fails the whole edit -- keyboard included -- and freezes the poll. The
+# tally grows with every voted game, so it is clamped before sending.
+_MESSAGE_TEXT_LIMIT = 4096
 
 # Smallest budget a rejection may ratchet us down to; below this the keyboard is
 # too sparse to be useful and the real problem is something other than size.
 _REPLY_MARKUP_MIN_BUDGET_BYTES = 2000
 
 # _button_bytes prices a button but not the "[...]," wrapping its row, and the
-# row layout isn't known until assembly. Reserving an allowance up front keeps
-# the emitted markup inside the budget; at one row per game a 150-game keyboard
-# owes ~450 bytes of punctuation. Capped at a tenth of the budget, since the row
-# count — and so the punctuation — scales with the budget it has to fit in.
-_MARKUP_ROW_HEADROOM_BYTES = 500
+# row layout isn't known until assembly, so a flat allowance is reserved up
+# front. Measured: a 156-row/158-button keyboard needs 175 bytes beyond the sum
+# of _button_bytes, i.e. ~1.1 bytes per row — the "+2" each button already
+# carries covers most of it. 300 is roughly double the measured need, which is
+# margin enough without costing games. Capped at a tenth of the budget so the
+# tiny budgets used in tests aren't swallowed whole.
+_MARKUP_ROW_HEADROOM_BYTES = 300
 
 # Best-effort, per-process memory of the largest reply_markup Telegram accepted.
 # Cloud Run instances are ephemeral and there may be several, so this is a cache
@@ -291,14 +312,19 @@ def _build_poll_keyboard(
     ]
     ranked.sort(key=lambda entry: entry[:4])
 
-    # Fill in relevance order, stopping at the first game that doesn't fit.
+    # Fill in relevance order, stopping at the first game that doesn't fit
+    # either budget. The button count matters as much as the bytes: past the
+    # server's limit Telegram drops buttons silently, so a keyboard that
+    # overshoots would show fewer games than the message claims.
     selected: set[int] = set()
     total = len(ranked)
+    buttons_used = len(action_row) + len(headers)
     for *_, g in ranked:
         cost = _button_bytes(_game_button(g))
-        if used + cost > budget_bytes:
+        if used + cost > budget_bytes or buttons_used >= _MAX_KEYBOARD_BUTTONS:
             break
         used += cost
+        buttons_used += 1
         selected.add(g.id)
 
     shown_by_level: dict[int, list] = {
@@ -314,7 +340,10 @@ def _build_poll_keyboard(
         if not games:
             continue
         # One button per row when any name is long (more room to wrap), else two.
+        # Clamped to the per-row limit, over which Telegram silently drops the
+        # extra buttons in the row rather than complaining.
         columns = 1 if any(len(g.name) > _BUTTON_LONG_THRESHOLD for g in games) else 2
+        columns = min(columns, _MAX_BUTTONS_PER_ROW)
         current_row: list[InlineKeyboardButton] = []
         for g in games:
             current_row.append(_game_button(g))
@@ -347,6 +376,63 @@ def _wrap_button_label(prefix: str, name: str, suffix: str) -> str:
     lines[0] = f"{prefix}{lines[0]}"
     lines[-1] = f"{lines[-1]}{suffix}"
     return "\n".join(lines)
+
+
+def _warn_if_buttons_dropped(poll_id: str, keyboard: list[list], sent) -> None:
+    """Log if Telegram stored fewer buttons than we sent.
+
+    Over 300 buttons, or 12 in one row, Telegram returns HTTP 200 and quietly
+    drops the excess — no error to retry on. The poll would then claim to show
+    more games than it does, and the votes for the missing ones would be
+    unreachable, so the discrepancy has to be noticed here or not at all.
+    """
+    # edit_message_text returns True (not a Message) for inline messages, and a
+    # test double can return anything at all — only a real row sequence is a
+    # trustworthy signal, so anything else is left alone rather than guessed at.
+    reply_markup = getattr(sent, "reply_markup", None)
+    rows = getattr(reply_markup, "inline_keyboard", None)
+    if not isinstance(rows, (list, tuple)):
+        return
+    want = sum(len(row) for row in keyboard)
+    got = sum(len(row) for row in rows)
+    if got < want:
+        logger.warning(
+            "Telegram silently dropped poll buttons: poll=%s sent=%d kept=%d "
+            "rows=%d widest_row=%d — keyboard exceeded a server limit",
+            poll_id,
+            want,
+            got,
+            len(keyboard),
+            max((len(row) for row in keyboard), default=0),
+        )
+
+
+def _clamp_message_text(lines: list[str], limit: int = _MESSAGE_TEXT_LIMIT) -> str:
+    """Join lines into a message guaranteed to fit Telegram's text limit.
+
+    The poll tally grows by two lines per voted game, so a big poll can exceed
+    the limit; Telegram then rejects the whole edit with "Message_too_long" and
+    the keyboard never updates either. Dropping trailing lines keeps the header
+    and the top of the tally, which is the part people read.
+
+    Cuts only on line boundaries so Markdown emphasis inside a line is never
+    split across the truncation point.
+    """
+    text = "\n".join(lines)
+    if len(text) <= limit:
+        return text
+
+    note = "\n_…tally truncated to fit Telegram's message limit._"
+    budget = limit - len(note)
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        cost = len(line) + (1 if kept else 0)
+        if used + cost > budget:
+            break
+        kept.append(line)
+        used += cost
+    return "\n".join(kept) + note
 
 
 def _build_poll_description(player_count: int, game_count: int, session_obj) -> str:
@@ -3487,15 +3573,16 @@ async def render_poll_message(
                 f"🎛️ _Showing {shown} of {shown + hidden} games as buttons — "
                 f"the rest are votable via their complexity category._",
             )
-        text = "\n".join(lines)
+        text = _clamp_message_text(lines)
         try:
-            await bot.edit_message_text(
+            sent = await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
                 text=text,
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown",
             )
+            _warn_if_buttons_dropped(poll_id, keyboard, sent)
             return
         except Exception as e:
             msg = str(e)
@@ -3504,11 +3591,14 @@ async def render_poll_message(
             if "Message is not modified" in msg:
                 return
 
-            # "Message is too long" (text over 4096 chars) also contains "too
-            # long", so it must not be mistaken for an oversized keyboard —
-            # shrinking the keyboard cannot fix it, and letting it ratchet the
-            # learned budget down would starve every later poll on this instance.
-            text_too_long = "message is too long" in lowered
+            # Telegram spells these two inconsistently — "Reply markup is too
+            # long" with spaces, "Message_too_long" with underscores — so each
+            # is matched explicitly. A plain "too long" test catches the first
+            # and misses the second entirely. They must not be confused:
+            # shrinking the keyboard cannot fix an over-long text, and letting a
+            # text error ratchet the learned budget down would starve every
+            # later poll on this instance.
+            text_too_long = "message_too_long" in lowered or "message is too long" in lowered
             markup_too_long = not text_too_long and "too long" in lowered
 
             if markup_too_long:
