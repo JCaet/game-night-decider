@@ -225,11 +225,8 @@ _CB_PICK = "pk:"
 # _paginate_games_by_category explains how the two interact. 60 games costs
 # ~70 buttons and ~6.5KB once separators and navigation are added, comfortably
 # inside the 100-button edit limit.
-# TEMPORARY -- REVERT WITH THE BUTTON CAP ABOVE.
-# Lowered from 60 so a 68-game collection pages several times instead of
-# twice, which is what makes the paging actually testable by hand.
-_POLL_PICKER_PAGE_SIZE = 12
-_POLL_PICKER_MIN_CHUNK = 4
+_POLL_PICKER_PAGE_SIZE = 60
+_POLL_PICKER_MIN_CHUNK = 8
 
 # Telegram's keyboard limits are undocumented apart from callback_data, so they
 # were measured against the live API (scripts/probe_telegram_keyboard_limits.py).
@@ -255,13 +252,7 @@ _RENDER_MAX_ATTEMPTS = 4
 # (2-3) and one header per complexity level (up to 6) are reserved first, so
 # roughly 91 game buttons remain. A game list longer than that cannot fit in a
 # single message at all, which is why the message says how many it is showing.
-#
-# TEMPORARY -- REVERT BEFORE RELYING ON THIS IN A REAL GAME NIGHT.
-# Lowered from the measured Telegram limit of 100 to force the browse picker to
-# appear on a collection that would otherwise fit, so the paging, the ownership
-# refusal and the vote marks can be exercised with real people in a real group.
-# Telegram's actual limit is unchanged at 100; this only makes us stop earlier.
-_MAX_KEYBOARD_BUTTONS = 30
+_MAX_KEYBOARD_BUTTONS = 100
 _MAX_BUTTONS_PER_ROW = 8
 
 # Secondary guard. With the count capped at 100 the keyboard runs ~6KB, well
@@ -513,20 +504,6 @@ def _build_poll_description(player_count: int, game_count: int, session_obj) -> 
     if session_obj.allow_adding_options:
         parts.append("suggestions enabled")
     return " · ".join(parts)
-
-
-def _poll_api_kwargs(session_obj, description: str) -> dict:
-    # Bot API 9.1/9.6 poll params that python-telegram-bot 22.x does not yet
-    # accept as native kwargs. Passed through via api_kwargs so they reach the
-    # Telegram HTTP layer unchanged. See issue tracker for the eventual swap
-    # back to native kwargs once PTB ships support.
-    return {
-        "allows_revoting": True,
-        "shuffle_options": session_obj.shuffle_options,
-        "hide_results_until_closes": session_obj.hide_results,
-        "allow_adding_options": session_obj.allow_adding_options,
-        "description": description,
-    }
 
 
 def build_player_names(players: Sequence[SessionPlayer]) -> list[str]:
@@ -1190,32 +1167,21 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             session.add(db_user)
             await session.commit()
 
-    async with db.AsyncSessionLocal() as session:
-        # Check if already joined
-        # Need to re-fetch user within this session? No, just use ID.
+        # Check if already joined. Same session as the upsert above: the join
+        # is a separate transaction, but it reuses one pooled connection
+        # instead of checking out a second one.
         player_stmt = select(SessionPlayer).where(
             SessionPlayer.session_id == chat_id, SessionPlayer.user_id == user.id
         )
         existing = (await session.execute(player_stmt)).scalar_one_or_none()
 
-        if existing:
-            # Already joined
-            pass
-        else:
-            # Join
+        joined = existing is None
+        if joined:
             player = SessionPlayer(session_id=chat_id, user_id=user.id)
             session.add(player)
             await session.commit()
 
-            # Send join notification
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"👋 **{user.first_name}** joined the game night!",
-                parse_mode="Markdown",
-            )
-
-        # Update message
-        # Get all players
+        # Update message -- get all players
         players_stmt = (
             select(SessionPlayer)
             .where(SessionPlayer.session_id == chat_id)
@@ -1225,8 +1191,14 @@ async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         names = build_player_names(players)
 
-        # Get session settings
-        session_obj = await session.get(Session, chat_id)
+    # Telegram I/O happens with no connection held: sending the notification
+    # inside the session pinned a cross-region connection for the round trip.
+    if joined:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"👋 **{user.first_name}** joined the game night!",
+            parse_mode="Markdown",
+        )
 
     keyboard = [
         [
@@ -1460,7 +1432,11 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             options=options,
             is_anonymous=False,
             allows_multiple_answers=True,
-            api_kwargs=_poll_api_kwargs(session_obj, poll_description),
+            allows_revoting=True,
+            shuffle_options=session_obj.shuffle_options,
+            hide_results_until_closes=session_obj.hide_results,
+            allow_adding_options=session_obj.allow_adding_options,
+            description=poll_description,
         )
 
         # Save poll to DB
@@ -2281,7 +2257,11 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             options=options,
             is_anonymous=False,
             allows_multiple_answers=True,
-            api_kwargs=_poll_api_kwargs(session_obj, poll_description),
+            allows_revoting=True,
+            shuffle_options=session_obj.shuffle_options,
+            hide_results_until_closes=session_obj.hide_results,
+            allow_adding_options=session_obj.allow_adding_options,
+            description=poll_description,
         )
 
         # Save poll to DB
