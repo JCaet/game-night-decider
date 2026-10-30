@@ -1,5 +1,5 @@
 from datetime import datetime
-from enum import Enum as PyEnum
+from enum import StrEnum
 
 from sqlalchemy import (
     BigInteger,
@@ -203,7 +203,7 @@ class PollAddedGame(Base):
     game: Mapped["Game"] = relationship(lazy="joined")
 
 
-class VoteType(str, PyEnum):
+class VoteType(StrEnum):
     GAME = "game"
     CATEGORY = "category"
 
