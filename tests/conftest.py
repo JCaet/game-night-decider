@@ -188,6 +188,27 @@ class BallotDriver:
 
 
 @pytest.fixture
+def refresh_poll(mock_context):
+    """Re-render a poll the way any vote, join or collection change does."""
+
+    async def refresh(poll_id: str) -> None:
+        async with db.AsyncSessionLocal() as session:
+            game_poll = await session.get(GameNightPoll, poll_id)
+            games, priority_ids = await handlers.get_session_valid_games(session, game_poll.chat_id)
+            await handlers.render_poll_message(
+                mock_context.bot,
+                game_poll.chat_id,
+                game_poll.message_id,
+                session,
+                poll_id,
+                games,
+                priority_ids,
+            )
+
+    return refresh
+
+
+@pytest.fixture
 def ballot(mock_context):
     """Vote the way players do now: through their ballot widget."""
     return BallotDriver(mock_context)

@@ -125,9 +125,10 @@ class WidgetQueryHandler(BaseHandler):
 class Ballot:
     """A rendered ballot and the game order everything about it is indexed by.
 
-    Game ids are deliberately absent from the HTML: at ~4 compressed bytes each
-    they cost a quarter of the room a game takes. The widget names a game by its
-    position instead, and game_ids turns that position back into an id.
+    The widget names a game by its position, and game_ids turns that position
+    back into an id. Ids appear in the HTML only to build each game's BGG link,
+    and are the first thing dropped when a ballot is too big: at ~4 compressed
+    bytes each they cost a quarter of the room a game takes.
     """
 
     html: str
@@ -138,9 +139,14 @@ class Ballot:
     levels: tuple[int, ...]
 
 
-def _catalog_entry(name: str, starred: bool) -> str | list[str]:
-    """A game on the ballot: its name, wrapped in a list when starred."""
-    return [name] if starred else name
+def _catalog_entry(name: str, game_id: int, starred: bool) -> str | list[str | int]:
+    """A game on the ballot: a bare name, or [name, BGG id, starred] cut short.
+
+    game_id is 0 on a ballot that carries no ids.
+    """
+    if starred:
+        return [name, game_id, 1]
+    return [name, game_id] if game_id else name
 
 
 @cache
@@ -163,14 +169,18 @@ def build_ballot(
     priority_ids: Collection[int],
     name_limit: int | None = None,
     shuffle_seed: int | None = None,
+    with_ids: bool = True,
 ) -> Ballot:
     """Render the ballot widget for a poll's games.
 
     Games are grouped by complexity, heaviest first, matching the order the
     poll has always listed them in; within a level the starred games lead, then
     the rest by name. With a shuffle_seed each level is shuffled instead, the
-    same way for every ballot of the poll. name_limit shortens long names to
-    buy room.
+    same way for every ballot of the poll.
+
+    Two things buy room on a ballot that is too big: with_ids=False leaves out
+    the BGG ids (each game then links to a BGG search for its name), and
+    name_limit shortens long names.
 
     Raises:
         WidgetTooLarge: the HTML is over the raw or the compressed limit.
@@ -179,8 +189,9 @@ def build_ballot(
     levels = tuple(sorted(groups, reverse=True))
     for level, group in groups.items():
         if shuffle_seed is None:
-            # Stable, so each half keeps the by-name order the grouping produced.
-            group.sort(key=lambda g: g.id not in priority_ids)
+            # The id settles ties between same-named games: positions must not
+            # depend on the order the database happened to return them in.
+            group.sort(key=lambda g: (g.id not in priority_ids, g.name, g.id))
         else:
             # Seeded per level, so one level changing leaves the others alone.
             group.sort(key=lambda g: g.id)
@@ -194,7 +205,17 @@ def build_ballot(
     catalog = {
         "n": title,
         "g": [
-            [level, [_catalog_entry(short(g.name), g.id in priority_ids) for g in groups[level]]]
+            [
+                level,
+                [
+                    # Manually entered games have made-up negative ids, which
+                    # are no use for a BGG link.
+                    _catalog_entry(
+                        short(g.name), g.id if with_ids and g.id > 0 else 0, g.id in priority_ids
+                    )
+                    for g in groups[level]
+                ],
+            ]
             for level in levels
         ],
     }
@@ -210,10 +231,14 @@ def build_ballot(
             f"(limits {WIDGET_HTML_MAX_BYTES} / {WIDGET_HTML_MAX_ZLIB_BYTES})"
         )
 
+    game_ids = tuple(g.id for level in levels for g in groups[level])
+    # The ids are hashed even when the HTML leaves them out, so swapping one
+    # game for another of the same name still counts as a different ballot.
+    fingerprint = f"{payload}{game_ids}".encode()
     return Ballot(
         html=html,
-        catalog_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16],
-        game_ids=tuple(g.id for level in levels for g in groups[level]),
+        catalog_hash=hashlib.sha256(fingerprint).hexdigest()[:16],
+        game_ids=game_ids,
         levels=levels,
     )
 

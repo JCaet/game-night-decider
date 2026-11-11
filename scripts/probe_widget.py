@@ -106,22 +106,24 @@ def sample_games(count: int) -> list[Game]:
 
 def measure() -> None:
     """Print how close each ballot size comes to the compressed-HTML limit."""
-    print(
-        f"{'games':>6} {'name cap':>9} {'raw':>7} {'zlib-9':>7}  limit {WIDGET_HTML_MAX_ZLIB_BYTES}"
-    )
+    print(f"{'games':>6} {'ids':>4} {'name cap':>9} {'raw':>7} {'zlib-9':>7}")
+    print(f"limit {WIDGET_HTML_MAX_ZLIB_BYTES} compressed")
+    # The same steps the bot takes when a ballot is too big: ids go first.
+    fits = ((None, True), (None, False), (24, False), (16, False))
     for count in (0, 25, 50, 75, 100, 125, 151, 200):
-        for name_limit in (None, 24, 16):
+        for name_limit, with_ids in fits:
             games = sample_games(count)
             starred = {g.id for g in games[::6]}
+            row = f"{count:>6} {'yes' if with_ids else 'no':>4} {name_limit or '-':>9}"
             try:
-                ballot = build_ballot("Friday Game Night", games, starred, name_limit)
+                ballot = build_ballot(
+                    "Friday Game Night", games, starred, name_limit, with_ids=with_ids
+                )
             except WidgetTooLarge as exc:
-                print(f"{count:>6} {name_limit or '-':>9}  too large: {exc}")
+                print(f"{row}  too large: {exc}")
                 continue
             raw = ballot.html.encode("utf-8")
-            print(
-                f"{count:>6} {name_limit or '-':>9} {len(raw):>7} {len(zlib.compress(raw, 9)):>7}"
-            )
+            print(f"{row} {len(raw):>7} {len(zlib.compress(raw, 9)):>7}")
     # Worst case for the state: every game has votes and the user voted a lot.
     games = sample_games(151)
     ballot = build_ballot("x", games[:25], set())

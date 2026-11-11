@@ -1,9 +1,11 @@
 import contextlib
 import functools
+import html
 import logging
 import math
 import random
 import textwrap
+import time
 from collections import namedtuple
 from collections.abc import Sequence
 from typing import cast
@@ -13,7 +15,13 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
-from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    CallbackQuery,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction, ChatType
 from telegram.ext import ContextTypes
 
@@ -183,20 +191,41 @@ _MESSAGE_TEXT_LIMIT = 4096
 # Start parameter of the deep link behind a poll's Vote button: /start b_<poll_id>
 _BALLOT_START_PREFIX = "b_"
 
-# Name lengths tried in turn when a ballot's HTML is over Telegram's size limit.
-_BALLOT_NAME_LIMITS = (None, 24, 16)
+# (name length, with BGG ids) tried in turn when a ballot's HTML is over
+# Telegram's size limit. Ids go first: without them a game's link falls back to
+# a BGG search for its name, which costs the voter less than a cut-off name.
+_BALLOT_FITS = ((None, True), (None, False), (24, False), (16, False))
+
+# Buttons cannot collect text, so the ones that need a name post a prompt and
+# the answer comes back as a reply to it (prompt_reply). A prompt carries no
+# state of its own: what it is asking for is read back out of its text, so
+# these strings are both what the player sees and what the reply is matched on.
+_GUEST_PROMPT = "reply to this message with the guest's name."
+_ADD_GAME_PROMPT = "reply to this message with a game to add to your collection."
+# Followed by the guest's name, which runs to the end of the message.
+_GUEST_GAME_PROMPT = "reply to this message with a game for the guest: "
 
 
 def _build_poll_keyboard(bot, poll_id: str, allow_adding: bool) -> list[list[InlineKeyboardButton]]:
     """The poll message's controls. Voting itself happens on each player's ballot."""
-    actions = [
-        InlineKeyboardButton("🔄 Refresh", callback_data=f"poll_refresh:{poll_id}"),
-        InlineKeyboardButton("🛑 Close", callback_data=f"poll_close:{poll_id}"),
-    ]
-    if allow_adding:
-        actions.append(InlineKeyboardButton("➕ Add", callback_data=f"poll_add:{poll_id}"))
+    # No refresh button: joins, leaves, votes and collection changes all
+    # re-render the poll by themselves.
     vote_url = f"https://t.me/{bot.username}?start={_BALLOT_START_PREFIX}{poll_id}"
-    return [[InlineKeyboardButton("🗳 Vote", url=vote_url)], actions]
+    last_row = [InlineKeyboardButton("🛑 Close", callback_data=f"poll_close:{poll_id}")]
+    if allow_adding:
+        # Puts a game the player already owns on this poll; "Add my game"
+        # above it adds a new game to their collection.
+        last_row.insert(
+            0, InlineKeyboardButton("➕ Add to poll", callback_data=f"poll_add:{poll_id}")
+        )
+    return [
+        [InlineKeyboardButton("🗳 Vote", url=vote_url)],
+        [
+            InlineKeyboardButton("👤 Guest", callback_data=f"poll_guest:{poll_id}"),
+            InlineKeyboardButton("📚 Add my game", callback_data=f"poll_mygame:{poll_id}"),
+        ],
+        last_row,
+    ]
 
 
 def _wrap_button_label(prefix: str, name: str, suffix: str) -> str:
@@ -1544,7 +1573,61 @@ async def add_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /addguest <name>")
         return
 
-    guest_name = " ".join(context.args)
+    await _add_guest(update, context, " ".join(context.args))
+
+
+async def _send_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user, body: str) -> None:
+    """Ask one player for a piece of text, to be given as a reply. `body` is HTML."""
+    # Selective force-reply opens the reply box only for the person mentioned.
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{user.mention_html()}, {body}",
+        parse_mode="HTML",
+        reply_markup=ForceReply(selective=True),
+    )
+
+
+async def prompt_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Act on a reply to one of the poll buttons' prompts.
+
+    The reply's text becomes the arguments of the command the button stands in
+    for, so a button and its command cannot drift apart.
+    """
+    message = update.message
+    prompt = message.reply_to_message if message else None
+    if prompt is None or prompt.from_user is None or prompt.from_user.id != context.bot.id:
+        return
+    asked = prompt.text or ""
+    answer = (message.text or "").strip()
+    if not answer:
+        return
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    if asked.endswith(_GUEST_PROMPT):
+        if await _add_guest(update, context, answer):
+            # A guest with no games changes nothing but the head count, so go
+            # straight on to asking for one.
+            await _send_prompt(context, chat_id, user, _GUEST_GAME_PROMPT + html.escape(answer))
+    elif _GUEST_GAME_PROMPT in asked:
+        guest_name = asked.split(_GUEST_GAME_PROMPT, 1)[1]
+        context.args = [*guest_name.split(), *answer.split()]
+        await guest_game(update, context)
+        # Guests usually bring more than one; an unanswered prompt costs nothing.
+        await _send_prompt(context, chat_id, user, _GUEST_GAME_PROMPT + html.escape(guest_name))
+    elif asked.endswith(_ADD_GAME_PROMPT):
+        context.args = answer.split()
+        await add_game(update, context)
+    else:
+        return
+
+    # The prompt has done its job; leaving it would invite a second reply.
+    with contextlib.suppress(Exception):
+        await prompt.delete()
+
+
+async def _add_guest(update: Update, context: ContextTypes.DEFAULT_TYPE, guest_name: str) -> bool:
+    """Create a guest and seat them in the chat's game night. False if there is none."""
     chat_id = update.effective_chat.id
     added_by = update.effective_user.id
 
@@ -1559,7 +1642,7 @@ async def add_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_session = await session.get(Session, chat_id)
         if not db_session or not db_session.is_active:
             await update.message.reply_text("No active game night! Use /gamenight first.")
-            return
+            return False
 
         # Create guest user
         guest = User(
@@ -1578,6 +1661,13 @@ async def add_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Use `/guestgame {guest_name} <game>` to add their games.",
         parse_mode="Markdown",
     )
+
+    # One more player changes which games fit, so a running poll must catch up.
+    try:
+        await _refresh_affected_polls(update, context)
+    except Exception as e:
+        logger.warning(f"Failed to refresh polls after adding a guest: {e}")
+    return True
 
 
 @_refreshes_polls
@@ -2729,14 +2819,14 @@ async def create_custom_poll(
 
 
 def _build_poll_ballot(game_poll, games, priority_ids, session_obj) -> Ballot | None:
-    """Render a poll's ballot, shortening names if that is what it takes to fit."""
+    """Render a poll's ballot, trimming it step by step if that is what it takes to fit."""
     seed = None
     if session_obj and session_obj.shuffle_options:
         seed = game_poll.shuffle_seed or 0
     title = game_poll.chat_title or "Game Night"
-    for name_limit in _BALLOT_NAME_LIMITS:
+    for name_limit, with_ids in _BALLOT_FITS:
         try:
-            return build_ballot(title, games, priority_ids, name_limit, seed)
+            return build_ballot(title, games, priority_ids, name_limit, seed, with_ids)
         except WidgetTooLarge as e:
             too_large = e
     logger.warning("Ballot for poll %s does not fit a widget: %s", game_poll.poll_id, too_large)
@@ -2842,7 +2932,13 @@ async def _retire_ballots(bot, session, poll_id: str, text: str) -> None:
 
 
 async def _open_ballot(update: Update, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
-    """Send the caller their ballot for a poll, replacing any they already have."""
+    """Give the caller their ballot for a poll.
+
+    Tapping Vote again while holding a current ballot must not resend it: the
+    old one vanishing and a new one arriving reads as a glitch. It is refreshed
+    in place instead, and only replaced when its game list is out of date or
+    the voter deleted it.
+    """
     user = update.effective_user
     message = update.message
     if update.effective_chat.type != ChatType.PRIVATE:
@@ -2877,7 +2973,15 @@ async def _open_ballot(update: Update, context: ContextTypes.DEFAULT_TYPE, poll_
             select(PollBallot).where(PollBallot.poll_id == poll_id, PollBallot.user_id == user.id)
         )
         try:
-            if row is None:
+            kept = False
+            if row is not None and row.catalog_hash == ballot.catalog_hash:
+                # Fails only if the voter deleted the message; then send anew.
+                with contextlib.suppress(telegram.error.TelegramError):
+                    await edit_widget_data(context.bot, user.id, row.message_id, state)
+                    kept = True
+            if kept:
+                pass
+            elif row is None:
                 message_id = await send_ballot(context.bot, user.id, ballot, state)
                 session.add(
                     PollBallot(
@@ -2895,9 +2999,15 @@ async def _open_ballot(update: Update, context: ContextTypes.DEFAULT_TYPE, poll_
                 "Could not send a ballot for poll %s to user %s: %s", poll_id, user.id, e
             )
             await message.reply_text("I couldn't open your ballot. Update Telegram and try again.")
+            return
         except IntegrityError:
             # Two taps raced; the other one's ballot is the one on record.
             await session.rollback()
+
+    # The deep link arrives as a "/start b_..." message from the voter. Removing
+    # it leaves the ballot as the last thing in the chat.
+    with contextlib.suppress(Exception):
+        await message.delete()
 
 
 def _parse_ballot_request(data: object, ballot: Ballot) -> tuple[VoteType, int] | None:
@@ -2919,15 +3029,29 @@ async def widget_query_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = widget_query_of(update)
     if query is None:
         return
+    started = time.monotonic()
     bot = context.bot
     sender = query.get("from") or {}
     user_id = sender.get("id")
     message_id = query.get("message_id")
 
     async def answer(state: str) -> None:
-        # Telegram allows 15 seconds; a late or failed answer just reverts the tap.
-        with contextlib.suppress(Exception):
+        # Telegram allows 15 seconds. A late or failed answer makes the widget
+        # undo the tap on screen even though the vote is recorded, so it is
+        # logged with how long the handler took: that is the first thing to
+        # look at when voters report ticks that do not stick.
+        elapsed_ms = (time.monotonic() - started) * 1000
+        try:
             await answer_widget_query(bot, query["id"], state)
+        except Exception as e:
+            logger.warning(
+                "Could not answer the widget query of user %s after %.0f ms: %s",
+                user_id,
+                elapsed_ms,
+                e,
+            )
+        else:
+            logger.info("Answered the widget query of user %s in %.0f ms", user_id, elapsed_ms)
 
     async with db.AsyncSessionLocal() as session:
         row = None
@@ -3014,9 +3138,21 @@ async def widget_query_callback(update: Update, context: ContextTypes.DEFAULT_TY
             )
         )
 
+        if result.success:
+            # An answer reaches only the widget that asked and is not stored.
+            # Storing the state now, rather than leaving it to the debounced
+            # render, means a widget whose answer went missing still finds the
+            # vote when it next reads its data.
+            with contextlib.suppress(Exception):
+                await edit_widget_data(
+                    bot,
+                    user_id,
+                    message_id,
+                    _ballot_state(ballot, votes, user_id, member_ids, session_obj),
+                )
+
         # The render updates the group tally and pushes the new state to every
-        # ballot, this one included — an answer alone is not stored. Debounced,
-        # so a burst of votes collapses into one round of edits.
+        # ballot. Debounced, so a burst of votes collapses into one round of edits.
         if result.success and not _schedule_poll_render(context, chat_id, poll_message_id, poll_id):
             await render_poll_message(
                 bot,
@@ -3148,12 +3284,6 @@ async def render_poll_message(
                 total_votes += 1
                 unique_voters.add(v.user_id)
 
-    # Sort games: Most votes -> Starred -> Name
-    def sort_key(g):
-        votes = vote_counts.get(g.id, 0)
-        is_starred = g.id in priority_ids
-        return (-int(is_starred), -votes, g.name)
-
     # Session settings
     session_obj = await session.get(Session, chat_id)
     hide_voters = session_obj.hide_voters if session_obj else False
@@ -3186,47 +3316,29 @@ async def render_poll_message(
 
     leader_found = False
 
-    # Text Generation: Group ALL games
-    groups = group_games_by_complexity(games)
-
     if hide_results:
         # When results are hidden, only show a generic status
         text_lines.append("_Results will be revealed when the poll closes._")
         leader_found = True
     else:
-        for level in sorted(groups.keys(), reverse=True):
-            group = groups[level]
-            sorted_group = sorted(group, key=sort_key)
+        # One list, most-voted first, so the leaders read off the top. Each
+        # entry is (votes, name to break ties by, label, voters).
+        entries: list[tuple[int, str, str, list[str]]] = []
+        for level, count in category_vote_counts.items():
+            what = f"complexity {level}" if level > 0 else "unrated"
+            entries.append(
+                (count, f"~{level}", f"🎲 Random {what} game", category_voters.get(level, []))
+            )
+        for g in games:
+            if vote_counts[g.id] > 0:
+                star = "⭐ " if g.id in priority_ids else ""
+                entries.append((vote_counts[g.id], g.name, f"{star}{g.name}", voters_by_game[g.id]))
 
-            # Check if any game in this group has votes OR if category has votes
-            group_has_game_votes = any(vote_counts[g.id] > 0 for g in sorted_group)
-            cat_vote_count = category_vote_counts.get(level, 0)
-
-            # Display category votes first if any
-            if cat_vote_count > 0:
-                level_display = level if level > 0 else "Unrated"
-                if hide_voters:
-                    voters_text = f"{cat_vote_count} voters"
-                else:
-                    voters_text = ", ".join(category_voters.get(level, []))
-                text_lines.append(f"**{cat_vote_count}** - 🎲 Category {level_display}")
-                text_lines.append(f"   └ _{voters_text}_")
-                leader_found = True
-
-            if group_has_game_votes:
-                for g in sorted_group:
-                    count = vote_counts[g.id]
-                    if count > 0:
-                        star = "⭐ " if g.id in priority_ids else ""
-
-                        if hide_voters:
-                            voters_text = f"{len(voters_by_game[g.id])} voters"
-                        else:
-                            voters_text = ", ".join(voters_by_game[g.id])
-
-                        text_lines.append(f"**{count}** - {star}{g.name}")
-                        text_lines.append(f"   └ _{voters_text}_")
-                        leader_found = True
+        for count, _, label, voters in sorted(entries, key=lambda e: (-e[0], e[1])):
+            voters_text = f"{count} voters" if hide_voters else ", ".join(voters)
+            text_lines.append(f"**{count}** - {label}")
+            text_lines.append(f"   └ _{voters_text}_")
+            leader_found = True
 
     if not leader_found:
         text_lines.append("_No votes yet! Tap 🗳 Vote to open your ballot._")
@@ -3332,24 +3444,18 @@ def _cancel_poll_render(context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> Non
 # pre-selecting which specific game will be played.
 
 
-async def _handle_poll_refresh(query, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
-    """Refresh the custom poll message with current vote state."""
+async def _handle_poll_guest(query, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
+    """Ask who the guest is. The name comes back as a reply: see prompt_reply."""
     with contextlib.suppress(telegram.error.BadRequest):
-        await query.answer("Refreshing...")
-    async with db.AsyncSessionLocal() as session:
-        game_poll = await session.get(GameNightPoll, poll_id)
-        if game_poll:
-            chat_id = game_poll.chat_id
-            valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-            await render_poll_message(
-                context.bot,
-                chat_id,
-                game_poll.message_id,
-                session,
-                poll_id,
-                valid_games,
-                priority_ids,
-            )
+        await query.answer()
+    await _send_prompt(context, query.message.chat.id, query.from_user, _GUEST_PROMPT)
+
+
+async def _handle_poll_my_game(query, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
+    """Ask which game to add to the tapper's own collection, as /addgame would."""
+    with contextlib.suppress(telegram.error.BadRequest):
+        await query.answer()
+    await _send_prompt(context, query.message.chat.id, query.from_user, _ADD_GAME_PROMPT)
 
 
 async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
@@ -3580,10 +3686,11 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Dispatcher for the poll message's buttons: Refresh, Close, Add.
+    Dispatcher for the poll message's buttons: Guest, Add my game, Add to poll, Close.
 
     Callback data formats:
-    - poll_refresh:<poll_id>
+    - poll_guest:<poll_id>
+    - poll_mygame:<poll_id>
     - poll_close:<poll_id>
     - poll_add:<poll_id>
     """
@@ -3598,8 +3705,11 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
         return
     poll_id = parts[1]
 
-    if action == "poll_refresh":
-        await _handle_poll_refresh(query, context, poll_id)
+    if action == "poll_guest":
+        await _handle_poll_guest(query, context, poll_id)
+
+    elif action == "poll_mygame":
+        await _handle_poll_my_game(query, context, poll_id)
 
     elif action == "poll_close":
         await _handle_poll_close(query, context, poll_id)

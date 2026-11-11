@@ -194,7 +194,9 @@ class PollService:
 
         # Generate appropriate message
         if vote_type == VoteType.CATEGORY:
-            return VoteResult(success=True, message=f"🎲 Voted on Category {target_id}!")
+            return VoteResult(
+                success=True, message=f"🎲 Voted for a random complexity {target_id} game!"
+            )
         else:
             return VoteResult(success=True, message="Vote recorded")
 

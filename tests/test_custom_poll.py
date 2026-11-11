@@ -150,44 +150,6 @@ async def test_create_poll_custom_mode_shows_games(mock_update, mock_context):
 
 
 @pytest.mark.asyncio
-async def test_custom_poll_refresh(mock_update, mock_context):
-    """Test refresh action re-renders the poll."""
-    chat_id = 12345
-    poll_id = "poll_12345_123456"
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True))
-
-        u1 = User(telegram_id=111, telegram_name="User1")
-        u2 = User(telegram_id=222, telegram_name="User2")
-        session.add_all([u1, u2])
-        await session.flush()
-
-        g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.0)
-        session.add(g1)
-        await session.flush()
-
-        c1 = Collection(user_id=111, game_id=1)
-        c2 = Collection(user_id=222, game_id=1)
-        session.add_all([c1, c2])
-
-        sp1 = SessionPlayer(session_id=chat_id, user_id=111)
-        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
-        session.add_all([sp1, sp2])
-
-        poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999)
-        session.add(poll)
-        await session.commit()
-
-    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
-
-    await custom_poll_action_callback(mock_update, mock_context)
-
-    mock_update.callback_query.answer.assert_called_with("Refreshing...")
-    mock_context.bot.edit_message_text.assert_called()
-
-
-@pytest.mark.asyncio
 async def test_custom_poll_close_announces_winner(mock_update, mock_context):
     """Test closing poll announces the winner."""
     chat_id = 12345
@@ -914,7 +876,7 @@ async def test_toggle_allow_adding_options(mock_update, mock_context):
 
 
 @pytest.mark.asyncio
-async def test_custom_poll_hide_results_hides_vote_counts(mock_update, mock_context):
+async def test_custom_poll_hide_results_hides_vote_counts(mock_update, mock_context, refresh_poll):
     """Test that hide_results hides vote counts and voter names in the poll display."""
     chat_id = 12345
     poll_id = "poll_12345_hide"
@@ -949,9 +911,7 @@ async def test_custom_poll_hide_results_hides_vote_counts(mock_update, mock_cont
         session.add(v1)
         await session.commit()
 
-    # Trigger a refresh to render the poll
-    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
-    await custom_poll_action_callback(mock_update, mock_context)
+    await refresh_poll(poll_id)
 
     call_kwargs = mock_context.bot.edit_message_text.call_args.kwargs
     text = call_kwargs.get("text")
@@ -974,7 +934,7 @@ async def test_custom_poll_hide_results_hides_vote_counts(mock_update, mock_cont
 
 
 @pytest.mark.asyncio
-async def test_custom_poll_add_button_shown_when_enabled(mock_update, mock_context):
+async def test_custom_poll_add_button_shown_when_enabled(mock_update, mock_context, refresh_poll):
     """Test that the Add button appears when allow_adding_options is enabled."""
     chat_id = 12345
     poll_id = "poll_12345_add"
@@ -1009,14 +969,13 @@ async def test_custom_poll_add_button_shown_when_enabled(mock_update, mock_conte
         session.add(poll)
         await session.commit()
 
-    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
-    await custom_poll_action_callback(mock_update, mock_context)
+    await refresh_poll(poll_id)
 
     call_kwargs = mock_context.bot.edit_message_text.call_args.kwargs
     keyboard = call_kwargs.get("reply_markup")
     button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
 
-    assert "➕ Add" in button_labels
+    assert "➕ Add to poll" in button_labels
 
 
 @pytest.mark.asyncio
@@ -1126,7 +1085,7 @@ async def test_settings_shows_new_toggles(mock_update, mock_context):
 
 
 @pytest.mark.asyncio
-async def test_custom_poll_shows_description(mock_update, mock_context):
+async def test_custom_poll_shows_description(mock_update, mock_context, refresh_poll):
     """Test that custom poll header includes context description."""
     chat_id = 12345
     poll_id = "poll_12345_desc"
@@ -1161,8 +1120,7 @@ async def test_custom_poll_shows_description(mock_update, mock_context):
         session.add(poll)
         await session.commit()
 
-    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
-    await custom_poll_action_callback(mock_update, mock_context)
+    await refresh_poll(poll_id)
 
     call_kwargs = mock_context.bot.edit_message_text.call_args.kwargs
     text = call_kwargs.get("text")
@@ -1308,7 +1266,9 @@ async def test_custom_poll_add_game_duplicate_prevented(mock_update, mock_contex
 
 
 @pytest.mark.asyncio
-async def test_custom_poll_hide_results_hides_category_votes(mock_update, mock_context):
+async def test_custom_poll_hide_results_hides_category_votes(
+    mock_update, mock_context, refresh_poll
+):
     """Test that hide_results also hides category vote counts."""
     chat_id = 12345
     poll_id = "poll_12345_hide_cat"
@@ -1347,8 +1307,7 @@ async def test_custom_poll_hide_results_hides_category_votes(mock_update, mock_c
         session.add(v1)
         await session.commit()
 
-    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
-    await custom_poll_action_callback(mock_update, mock_context)
+    await refresh_poll(poll_id)
 
     call_kwargs = mock_context.bot.edit_message_text.call_args.kwargs
     text = call_kwargs.get("text")
