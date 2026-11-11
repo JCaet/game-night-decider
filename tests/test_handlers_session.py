@@ -10,7 +10,7 @@ from src.bot.handlers import (
     start_night,
 )
 from src.core import db
-from src.core.models import Collection, Game, GameState, PollType, Session, SessionPlayer, User
+from src.core.models import Collection, Game, GameState, Session, SessionPlayer, User
 
 # ============================================================================
 # /gamenight command tests
@@ -625,48 +625,6 @@ async def test_poll_no_matching_games(mock_update, mock_context):
 
 
 @pytest.mark.asyncio
-async def test_poll_with_valid_games(mock_update, mock_context):
-    """Test /poll creates poll with valid intersecting games (native mode)."""
-    async with db.AsyncSessionLocal() as session:
-        # Use native poll mode for this test
-        sess = Session(chat_id=12345, is_active=True, poll_type=PollType.NATIVE)
-        session.add(sess)
-
-        u1 = User(telegram_id=111, telegram_name="User1")
-        u2 = User(telegram_id=222, telegram_name="User2")
-        session.add_all([u1, u2])
-        await session.flush()
-
-        # Need at least 2 games for a poll (Telegram requirement)
-        game1 = Game(
-            id=1, name="SharedGame1", min_players=2, max_players=4, playing_time=60, complexity=2.5
-        )
-        game2 = Game(
-            id=2, name="SharedGame2", min_players=2, max_players=4, playing_time=60, complexity=2.6
-        )
-        session.add_all([game1, game2])
-        await session.flush()
-
-        # Both users own both games
-        c1 = Collection(user_id=111, game_id=1)
-        c2 = Collection(user_id=222, game_id=1)
-        c3 = Collection(user_id=111, game_id=2)
-        c4 = Collection(user_id=222, game_id=2)
-        session.add_all([c1, c2, c3, c4])
-
-        sp1 = SessionPlayer(session_id=12345, user_id=111)
-        sp2 = SessionPlayer(session_id=12345, user_id=222)
-        session.add_all([sp1, sp2])
-        await session.commit()
-
-    await create_poll(mock_update, mock_context)
-
-    mock_context.bot.send_poll.assert_called_once()
-    call_kwargs = mock_context.bot.send_poll.call_args[1]
-    assert "SharedGame1" in call_kwargs["options"][0] or "SharedGame2" in call_kwargs["options"][0]
-
-
-@pytest.mark.asyncio
 async def test_poll_excludes_excluded_games(mock_update, mock_context):
     """Test /poll respects is_excluded flag."""
     async with db.AsyncSessionLocal() as session:
@@ -696,5 +654,6 @@ async def test_poll_excludes_excluded_games(mock_update, mock_context):
 
     await create_poll(mock_update, mock_context)
 
-    # Should not find any games (all excluded)
-    mock_context.bot.send_poll.assert_not_called()
+    # Should not find any games (all excluded), so no poll is started
+    text = mock_context.bot.send_message.call_args.kwargs["text"]
+    assert "No games found" in text

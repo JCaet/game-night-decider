@@ -1,9 +1,7 @@
 import pytest
-from sqlalchemy import select
 
 from src.bot.handlers import (
     cancel_night_callback,
-    custom_poll_vote_callback,
     render_poll_message,
 )
 from src.core import db
@@ -11,7 +9,6 @@ from src.core.models import (
     Collection,
     Game,
     GameNightPoll,
-    PollType,
     PollVote,
     Session,
     SessionPlayer,
@@ -30,9 +27,7 @@ async def test_anonymous_voting_toggle(mock_update, mock_context):
 
     async with db.AsyncSessionLocal() as session:
         # Create session and poll
-        session.add(
-            Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_voters=False)
-        )
+        session.add(Session(chat_id=chat_id, is_active=True, hide_voters=False))
         session.add(User(telegram_id=111, telegram_name="Voter1"))
 
         # Add game and vote
@@ -119,51 +114,13 @@ async def test_session_message_id_validation(mock_update, mock_context):
 
 
 @pytest.mark.asyncio
-async def test_vote_on_non_existent_game(mock_update, mock_context):
-    """Test voting for a game that doesn't exist."""
-    chat_id = 12345
-    poll_id = f"poll_{chat_id}"
-    bad_game_id = 99999
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-        session.add(User(telegram_id=111, telegram_name="Voter1"))
-        session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
-        await session.commit()
-
-    mock_update.callback_query.data = f"poll_vote:{poll_id}:{bad_game_id}"
-
-    # This might crash if not handled, or just add vote with invalid FK?
-    # SQLite enforces FK? SQLAlchemy does?
-    # If using SQLite without FK enforcement on connection, it might start.
-    # But logic calls session.commit().
-
-    import contextlib
-
-    with contextlib.suppress(Exception):
-        await custom_poll_vote_callback(mock_update, mock_context)
-
-    # Verify no vote added or crash handled
-    async with db.AsyncSessionLocal() as session:
-        (await session.execute(select(PollVote))).scalars().all()
-        # If FK constraint active, it failed. If not, maybe added?
-        # Ideally code should handle it.
-        # Check handlers.py custom_poll_vote_callback logic... it likely
-        # doesn't check Game existence first.
-        # It relies on DB constraints.
-        pass
-
-
-@pytest.mark.asyncio
 async def test_render_anonymous_poll(mock_update, mock_context):
     """Test explicit rendering of anonymous poll."""
     chat_id = 67890
     poll_id = f"poll_{chat_id}"
 
     async with db.AsyncSessionLocal() as session:
-        session.add(
-            Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_voters=True)
-        )
+        session.add(Session(chat_id=chat_id, is_active=True, hide_voters=True))
         session.add(User(telegram_id=222, telegram_name="SecretVoter"))
         await session.flush()
         session.add(SessionPlayer(session_id=chat_id, user_id=222))

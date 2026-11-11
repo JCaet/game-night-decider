@@ -10,7 +10,6 @@ from sqlalchemy import select
 from src.bot.handlers import (
     POLL_RUNNING_ALERT,
     calculate_auto_vote_limit,
-    custom_poll_vote_callback,
     cycle_vote_limit_callback,
     get_vote_limit_display,
     poll_settings_callback,
@@ -21,7 +20,6 @@ from src.core.models import (
     Collection,
     Game,
     GameNightPoll,
-    PollType,
     PollVote,
     Session,
     SessionPlayer,
@@ -117,7 +115,6 @@ async def test_cycle_vote_limit_changes_setting(mock_update, mock_context):
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 vote_limit=VoteLimit.AUTO,
             )
         )
@@ -143,7 +140,6 @@ async def test_cycle_vote_limit_wraps_around(mock_update, mock_context):
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 vote_limit=VoteLimit.UNLIMITED,  # Last option
             )
         )
@@ -165,7 +161,7 @@ async def test_cycle_vote_limit_wraps_around(mock_update, mock_context):
 
 
 @pytest.mark.asyncio
-async def test_vote_limit_enforced_when_exceeded(mock_update, mock_context):
+async def test_vote_limit_enforced_when_exceeded(mock_context, ballot):
     """Test that voting is blocked when user reaches vote limit."""
     chat_id = 12345
     poll_id = "poll_limit_test"
@@ -176,7 +172,6 @@ async def test_vote_limit_enforced_when_exceeded(mock_update, mock_context):
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 vote_limit=3,  # Static limit of 3
             )
         )
@@ -222,20 +217,15 @@ async def test_vote_limit_enforced_when_exceeded(mock_update, mock_context):
         await session.commit()
 
     # Try to vote for game 4 (should be blocked)
-    mock_update.callback_query.data = f"vote:{poll_id}:4"
-    mock_update.callback_query.from_user.id = user_id
-    mock_update.callback_query.from_user.first_name = "Voter"
+    state = await ballot.tap(poll_id, user_id, game_id=4)
 
-    await custom_poll_vote_callback(mock_update, mock_context)
-
-    # Verify error alert was shown
-    mock_update.callback_query.answer.assert_called()
-    call_args = mock_update.callback_query.answer.call_args
-    assert "limit reached" in call_args.kwargs.get("", "") or "limit reached" in str(call_args)
+    # The ballot is told why, and the vote is not recorded
+    assert "limit reached" in state["e"]
+    assert len(state["m"]) == 3
 
 
 @pytest.mark.asyncio
-async def test_vote_limit_unlimited_allows_all(mock_update, mock_context):
+async def test_vote_limit_unlimited_allows_all(mock_context, ballot):
     """Test that UNLIMITED mode allows voting for all games."""
     chat_id = 12345
     poll_id = "poll_unlimited_test"
@@ -246,7 +236,6 @@ async def test_vote_limit_unlimited_allows_all(mock_update, mock_context):
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 vote_limit=VoteLimit.UNLIMITED,
             )
         )
@@ -286,11 +275,7 @@ async def test_vote_limit_unlimited_allows_all(mock_update, mock_context):
         await session.commit()
 
     # Vote for 5th game (should succeed with UNLIMITED)
-    mock_update.callback_query.data = f"vote:{poll_id}:5"
-    mock_update.callback_query.from_user.id = user_id
-    mock_update.callback_query.from_user.first_name = "Voter"
-
-    await custom_poll_vote_callback(mock_update, mock_context)
+    await ballot.tap(poll_id, user_id, game_id=5)
 
     # Verify vote was recorded
     async with db.AsyncSessionLocal() as session:
@@ -308,7 +293,7 @@ async def test_vote_limit_unlimited_allows_all(mock_update, mock_context):
 
 
 @pytest.mark.asyncio
-async def test_vote_removal_allows_new_vote(mock_update, mock_context):
+async def test_vote_removal_allows_new_vote(mock_context, ballot):
     """Test that removing a vote allows adding a new one at limit."""
     chat_id = 12345
     poll_id = "poll_remove_test"
@@ -319,7 +304,6 @@ async def test_vote_removal_allows_new_vote(mock_update, mock_context):
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 vote_limit=2,  # Low limit
             )
         )
@@ -363,19 +347,13 @@ async def test_vote_removal_allows_new_vote(mock_update, mock_context):
         await session.commit()
 
     # Remove vote for game 1
-    mock_update.callback_query.data = f"vote:{poll_id}:1"
-    mock_update.callback_query.from_user.id = user_id
-    mock_update.callback_query.from_user.first_name = "Voter"
-
-    await custom_poll_vote_callback(mock_update, mock_context)
+    state = await ballot.tap(poll_id, user_id, game_id=1)
 
     # Verify removal
-    mock_update.callback_query.answer.assert_called_with("Vote removed")
+    assert len(state["m"]) == 1
 
     # Now vote for game 3 should succeed
-    mock_update.callback_query.data = f"vote:{poll_id}:3"
-
-    await custom_poll_vote_callback(mock_update, mock_context)
+    state = await ballot.tap(poll_id, user_id, game_id=3)
 
     # Verify new vote recorded
     async with db.AsyncSessionLocal() as session:
@@ -425,34 +403,6 @@ async def test_poll_settings_shows_vote_limit_button(mock_update, mock_context):
     assert any("Vote Limit" in t for t in btn_texts)
 
 
-@pytest.mark.asyncio
-async def test_poll_settings_hides_vote_limit_button_for_native(mock_update, mock_context):
-    """Vote Limit button is hidden in Native mode (setting has no effect there)."""
-    chat_id = 12345
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(
-            Session(
-                chat_id=chat_id,
-                is_active=True,
-                poll_type=PollType.NATIVE,
-                vote_limit=VoteLimit.AUTO,
-            )
-        )
-        await session.commit()
-
-    mock_update.callback_query.message.chat.id = chat_id
-
-    await poll_settings_callback(mock_update, mock_context)
-
-    call_kwargs = mock_update.callback_query.edit_message_text.call_args.kwargs
-    reply_markup = call_kwargs.get("reply_markup")
-    buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
-    btn_texts = [btn.text for btn in buttons]
-
-    assert not any("Vote Limit" in t for t in btn_texts)
-
-
 # ============================================================================
 # Settings Lock During Active Poll
 # ============================================================================
@@ -486,7 +436,6 @@ async def test_cycle_vote_limit_blocked_while_poll_active(mock_update, mock_cont
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 vote_limit=VoteLimit.AUTO,
             )
         )

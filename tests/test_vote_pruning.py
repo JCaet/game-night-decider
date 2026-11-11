@@ -17,7 +17,6 @@ from src.core.models import (
     Collection,
     Game,
     GameNightPoll,
-    PollType,
     PollVote,
     Session,
     SessionPlayer,
@@ -61,7 +60,6 @@ async def _setup_poll_scenario(
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 vote_limit=vote_limit,
                 message_id=888,
             )

@@ -1,7 +1,9 @@
+import json
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 from telegram import CallbackQuery, Message, Update
@@ -9,23 +11,10 @@ from telegram.ext import ContextTypes
 
 from src.bot import handlers
 from src.core import db
-from src.core.models import Base
+from src.core.models import Base, GameNightPoll, PollBallot, Session
 
 # Configure logging for tests
 logging.basicConfig(level=logging.INFO)
-
-
-@pytest.fixture(scope="function", autouse=True)
-def reset_learned_markup_budget():
-    """Keep the per-process reply_markup budget from leaking between tests.
-
-    render_poll_message remembers a Telegram "reply markup is too long"
-    rejection in a module global so later renders skip a call they know fails.
-    That is deliberate in production but would make test order significant.
-    """
-    original = handlers._learned_markup_budget
-    yield
-    handlers._learned_markup_budget = original
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -104,18 +93,22 @@ def mock_context():
     mock_message.message_id = 998
     context.bot.send_message = AsyncMock(return_value=mock_message)
 
-    # Configure send_poll to return a proper mock with poll.id
-    mock_poll_message = MagicMock()
-    mock_poll_message.poll.id = "test_poll_id"
-    mock_poll_message.message_id = 999
-    context.bot.send_poll = AsyncMock(return_value=mock_poll_message)
-
     # Configure edit_message_text
     context.bot.edit_message_text = AsyncMock()
 
     # Configure pin/unpin
     context.bot.pin_chat_message = AsyncMock()
     context.bot.unpin_chat_message = AsyncMock()
+
+    # Widgets go through raw API calls; sendWidget must hand back a message id.
+    sent_widgets = iter(range(7000, 8000))
+
+    async def do_api_request(endpoint, api_kwargs=None, **_):
+        return {"message_id": next(sent_widgets)} if endpoint == "sendWidget" else True
+
+    context.bot.do_api_request = AsyncMock(side_effect=do_api_request)
+    context.bot.delete_message = AsyncMock()
+    context.bot.username = "test_bot"
 
     # Default to no job queue so vote handlers take the inline-render fallback
     # path (which calls edit_message_text directly, as these tests assert).
@@ -124,3 +117,77 @@ def mock_context():
 
     context.args = []
     return context
+
+
+class BallotDriver:
+    """Acts as a voter's ballot widget: sends the queries Telegram would deliver."""
+
+    def __init__(self, context):
+        self.context = context
+
+    def api_calls(self, endpoint: str) -> list[dict]:
+        """api_kwargs of every raw Bot API call made to one endpoint, in order."""
+        return [
+            call.kwargs["api_kwargs"]
+            for call in self.context.bot.do_api_request.call_args_list
+            if call.args[0] == endpoint
+        ]
+
+    async def open(self, poll_id: str, user_id: int):
+        """Give a user an up-to-date ballot on record. Returns (ballot, message_id)."""
+        async with db.AsyncSessionLocal() as session:
+            game_poll = await session.get(GameNightPoll, poll_id)
+            valid, priority_ids = await handlers.get_session_valid_games(session, game_poll.chat_id)
+            games = await handlers._merge_added_games(session, poll_id, valid)
+            session_obj = await session.get(Session, game_poll.chat_id)
+            ballot = handlers._build_poll_ballot(game_poll, games, priority_ids, session_obj)
+            row = await session.scalar(
+                select(PollBallot).where(
+                    PollBallot.poll_id == poll_id, PollBallot.user_id == user_id
+                )
+            )
+            if row is None:
+                row = PollBallot(
+                    poll_id=poll_id,
+                    user_id=user_id,
+                    message_id=5000 + user_id,
+                    catalog_hash=ballot.catalog_hash,
+                )
+                session.add(row)
+            else:
+                row.catalog_hash = ballot.catalog_hash
+            await session.commit()
+            return ballot, row.message_id
+
+    async def send(self, user_id: int, message_id: int, data: str, first_name="Voter") -> dict:
+        """Deliver one widget query and return the state the bot answered with."""
+        query = {
+            "id": "query-1",
+            "from": {"id": user_id, "is_bot": False, "first_name": first_name},
+            "chat": {"id": user_id, "type": "private", "first_name": first_name},
+            "message_id": message_id,
+            "chat_instance": "1",
+            "type": {"type": "data"},
+            "data": data,
+        }
+        update = Update.de_json({"update_id": 1, "widget_query": query}, None)
+        answered = len(self.api_calls("answerWidgetQuery"))
+        await handlers.widget_query_callback(update, self.context)
+        answers = self.api_calls("answerWidgetQuery")
+        assert len(answers) == answered + 1, "every widget query must be answered exactly once"
+        state: dict = json.loads(answers[-1]["data"])
+        return state
+
+    async def tap(
+        self, poll_id: str, user_id: int, *, game_id: int | None = None, level: int | None = None
+    ) -> dict:
+        """Tap a game (or a complexity level's random row) on the user's ballot."""
+        ballot, message_id = await self.open(poll_id, user_id)
+        data = f"c:{level}" if game_id is None else f"v:{ballot.game_ids.index(game_id)}"
+        return await self.send(user_id, message_id, data)
+
+
+@pytest.fixture
+def ballot(mock_context):
+    """Vote the way players do now: through their ballot widget."""
+    return BallotDriver(mock_context)
