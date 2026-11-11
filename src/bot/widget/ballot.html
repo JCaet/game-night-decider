@@ -1,0 +1,121 @@
+<style>
+body{margin:0;font:14px system-ui,sans-serif;color:var(--tg-theme-text-color,#222);background:var(--tg-theme-bg-color,#fff)}
+#h,#f,#s{display:flex;align-items:center;padding:6px 10px;gap:6px}
+#h b{flex:1}
+#h b,.n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#u,#s,#f span{color:var(--tg-theme-hint-color,#888);font-size:12px}
+#t{display:flex;gap:4px;padding:0 10px}
+#t div{flex:1;text-align:center;padding:6px 0;border-radius:8px;background:var(--tg-theme-secondary-bg-color,#eee)}
+#t .a,.r.v i{background:var(--tg-theme-button-color,#39f);color:var(--tg-theme-button-text-color,#fff)}
+#l{height:408px}
+.r{display:flex;align-items:center;gap:8px;height:34px;padding:0 10px}
+.r i{flex:none;width:22px;height:22px;border-radius:6px;font-style:normal;text-align:center;line-height:22px;border:1px solid var(--tg-theme-hint-color,#888)}
+.n{flex:1}
+.w{opacity:.5}
+#f span{flex:1;text-align:center}
+#f div{padding:6px 14px}
+</style>
+<div id=h><b id=g></b><span id=u></span></div>
+<div id=t></div>
+<div id=s></div>
+<div id=l></div>
+<div id=f><div id=p>◀</div><span id=o></span><div id=q>▶</div></div>
+<script>
+/* Game-night ballot. C is baked in at send time; S arrives as chat_data and
+   in every answer. Tabs and paging are local, so nothing here is shared.
+
+   Sizing: the bubble takes the height of what is drawn first, so the list is a
+   fixed P rows tall (#l is P x the 34px row) and nothing relies on filling the
+   bubble -- percentage heights did not resolve against it on real clients. P is
+   the longest level's row count, capped at 12, so a small poll gets a short
+   ballot while the height still never changes between tabs or pages. */
+const C=/*CATALOG*/{n:"Preview",g:[]};
+const W=window.TelegramWidget;
+const P=Math.max(4,Math.min(12,Math.max(0,...C.g.map((g)=>g[1].length+1)))),$=(i)=>document.getElementById(i);
+/* Falls back to the stylesheet's 12-row height where style is not settable. */
+try{$("l").style.height=P*34+"px";}catch(e){}
+let S={r:0,m:[],c:[],l:0},tab=1,page=0,busy=0,note="";
+
+/* Flat list in catalog order. A game is known by its position x here: votes,
+   requests and the tally string in S.t all use it, which keeps ids out of the HTML. */
+const A=[];
+C.g.forEach(([lv,gs],k)=>gs.forEach((e)=>A.push(typeof e=="string"?{name:e,lv,k,x:A.length}:{name:e[0],star:1,lv,k,x:A.length})));
+/* Level 0 holds the games BGG has no complexity rating for. */
+const lvl=(v)=>v?""+v:"N/A";
+/* Tab 0 is the voter's own picks; the rest are one per complexity level. */
+const T=[{t:"✓"}].concat(C.g.map(([lv],k)=>({t:lvl(lv),lv,k})));
+if(T.length<2)tab=0;
+/* Tab and page survive a reopen where the client offers storage. */
+try{const k=(localStorage.getItem("b")||"").split(",");if(k[1]!=null&&k[0]<T.length){tab=+k[0];page=+k[1];}}catch(e){}
+
+function load(s){
+  try{const d=typeof s=="string"?JSON.parse(s):s;if(d&&d.r>=S.r){S=d;note=d.e||"";}}catch(e){}
+}
+function rows(){
+  const t=T[tab];
+  if(tab==0)return S.c.map((v)=>({lv:v,cat:1})).concat(A.filter((g)=>S.m.includes(g.x)));
+  return [{lv:t.lv,k:t.k,cat:1}].concat(A.filter((g)=>g.k==t.k));
+}
+function el(tag,cls,text){
+  const e=document.createElement(tag);
+  if(cls)e.className=cls;
+  if(text!=null)e.textContent=text;
+  return e;
+}
+function count(r){
+  if(!S.t)return "";
+  const n=r.cat?parseInt((S.k||"")[C.g.findIndex(([lv])=>lv==r.lv)]||"0",36):parseInt(S.t[r.x]||"0",36);
+  return n?""+n:"";
+}
+function draw(){
+  const used=S.m.length+S.c.length,all=rows(),pages=Math.max(1,Math.ceil(all.length/P));
+  page=Math.min(page,pages-1);
+  $("g").textContent=C.n;
+  $("u").textContent=S.x?"closed":used+(S.l?"/"+S.l:"")+" votes";
+  const tabs=$("t");
+  tabs.textContent="";
+  T.forEach((t,i)=>{
+    const d=el("div",i==tab?"a":"",t.t);
+    d.onclick=()=>{tab=i;page=0;note="";draw();};
+    tabs.appendChild(d);
+  });
+  const t=T[tab];
+  $("s").textContent=S.x||(S.p?"You're not in this game night. Join in the group to vote.":"")||note||(tab==0?"Your votes":(t.lv?"Complexity "+t.lv:"No complexity rating")+" · "+(all.length-1)+" games");
+  const list=$("l");
+  list.textContent="";
+  all.slice(page*P,page*P+P).forEach((r)=>{
+    const on=r.cat?S.c.includes(r.lv):S.m.includes(r.x);
+    const d=el("div","r"+(on?" v":"")+(busy?" w":""));
+    d.appendChild(el("i","",on?"✓":""));
+    d.appendChild(el("span","n",r.cat?"🎲 Random, "+(r.lv?"complexity "+r.lv:"unrated"):(r.star?"★ ":"")+r.name));
+    d.appendChild(el("span","",count(r)));
+    d.onclick=()=>vote(r);
+    list.appendChild(d);
+  });
+  $("o").textContent=(page+1)+" / "+pages;
+  $("p").onclick=()=>{if(page>0){page--;draw();}};
+  $("q").onclick=()=>{if(page<pages-1){page++;draw();}};
+  try{localStorage.setItem("b",tab+","+page);}catch(e){}
+}
+function vote(r){
+  if(busy||S.x||S.p)return;
+  const arr=r.cat?S.c:S.m,key=r.cat?r.lv:r.x,i=arr.indexOf(key);
+  if(i<0&&S.l&&S.m.length+S.c.length>=S.l){note="Vote limit reached. Remove a vote first.";draw();return;}
+  /* Optimistic: flip now, then let the bot's answer replace S wholesale. */
+  if(i<0)arr.push(key);else arr.splice(i,1);
+  busy=1;note="";draw();
+  if(W.HapticFeedback)W.HapticFeedback.selectionChanged();
+  W.request((r.cat?"c:":"v:")+key).then((a)=>{
+    busy=0;load(a&&a.result!=null?a.result:a);draw();
+  },(e)=>{
+    busy=0;
+    if(i<0)arr.splice(arr.indexOf(key),1);else arr.push(key);
+    note=e&&e.code=="RATE_LIMITED"?"Too fast. Try again in a moment.":"Could not reach the bot. Try again.";
+    draw();
+  });
+}
+W.onEvent("chatDataChanged",()=>{if(!busy){load(W.chatData);draw();}});
+load(W.chatData);
+draw();
+W.ready();
+</script>

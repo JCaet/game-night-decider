@@ -1,35 +1,24 @@
 """
-Tests for the Custom Single Poll Mode feature.
-
-This tests the alternative poll mechanism that uses inline buttons
-instead of native Telegram polls to overcome the 10-option limit.
+Tests for the game-night poll: one interactive message for all valid games.
 """
 
-import json
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import telegram
 from sqlalchemy import select
-from telegram import InlineKeyboardMarkup
 
 import src.bot.handlers as handlers
 from src.bot.handlers import (
-    _build_poll_keyboard,
     _render_poll_job,
     _wrap_button_label,
     create_poll,
     custom_poll_action_callback,
-    custom_poll_vote_callback,
     join_lobby_callback,
     poll_add_select_callback,
     poll_settings_callback,
-    render_poll_message,
     start_poll_callback,
     toggle_allow_adding_callback,
     toggle_hide_results_callback,
-    toggle_poll_mode_callback,
     toggle_shuffle_callback,
     toggle_weights_callback,
 )
@@ -40,7 +29,6 @@ from src.core.models import (
     GameNightPoll,
     GameState,
     PollAddedGame,
-    PollType,
     PollVote,
     Session,
     SessionPlayer,
@@ -54,44 +42,6 @@ from src.core.models import (
 
 
 @pytest.mark.asyncio
-async def test_poll_settings_shows_current_mode_custom(mock_update, mock_context):
-    """Test poll settings shows Custom mode when poll_type is CUSTOM."""
-    chat_id = 12345
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-        await session.commit()
-
-    mock_update.callback_query.message.chat.id = chat_id
-
-    await poll_settings_callback(mock_update, mock_context)
-
-    mock_update.callback_query.edit_message_text.assert_called_once()
-    call_args = mock_update.callback_query.edit_message_text.call_args
-    text = call_args.kwargs.get("text") or call_args.args[0]
-    assert "Custom (Single)" in text
-
-
-@pytest.mark.asyncio
-async def test_poll_settings_shows_current_mode_native(mock_update, mock_context):
-    """Test poll settings shows Native mode when settings_single_poll is False."""
-    chat_id = 12345
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.NATIVE))
-        await session.commit()
-
-    mock_update.callback_query.message.chat.id = chat_id
-
-    await poll_settings_callback(mock_update, mock_context)
-
-    mock_update.callback_query.edit_message_text.assert_called_once()
-    call_args = mock_update.callback_query.edit_message_text.call_args
-    text = call_args.kwargs.get("text") or call_args.args[0]
-    assert "Native (Multiple)" in text
-
-
-@pytest.mark.asyncio
 async def test_poll_settings_no_session_returns_early(mock_update, mock_context):
     """Test poll settings returns early when no session exists."""
     mock_update.callback_query.message.chat.id = 99999  # Non-existent
@@ -99,49 +49,6 @@ async def test_poll_settings_no_session_returns_early(mock_update, mock_context)
     await poll_settings_callback(mock_update, mock_context)
 
     mock_update.callback_query.edit_message_text.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_toggle_poll_mode_switches_to_native(mock_update, mock_context):
-    """Test toggling from Custom to Native mode."""
-    chat_id = 12345
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-        await session.commit()
-
-    mock_update.callback_query.message.chat.id = chat_id
-
-    await toggle_poll_mode_callback(mock_update, mock_context)
-
-    # Verify mode changed in DB
-    async with db.AsyncSessionLocal() as session:
-        sess = await session.get(Session, chat_id)
-        assert sess.poll_type == PollType.NATIVE
-
-    # Verify UI shows new mode
-    call_args = mock_update.callback_query.edit_message_text.call_args
-    text = call_args.kwargs.get("text") or call_args.args[0]
-    assert "Native (Multiple)" in text
-
-
-@pytest.mark.asyncio
-async def test_toggle_poll_mode_switches_to_custom(mock_update, mock_context):
-    """Test toggling from Native to Custom mode."""
-    chat_id = 12345
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.NATIVE))
-        await session.commit()
-
-    mock_update.callback_query.message.chat.id = chat_id
-
-    await toggle_poll_mode_callback(mock_update, mock_context)
-
-    # Verify mode changed in DB
-    async with db.AsyncSessionLocal() as session:
-        sess = await session.get(Session, chat_id)
-        assert sess.poll_type == PollType.CUSTOM
 
 
 # ============================================================================
@@ -156,7 +63,7 @@ async def test_create_poll_custom_mode_creates_poll(mock_update, mock_context):
 
     async with db.AsyncSessionLocal() as session:
         # Custom mode session
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -182,7 +89,7 @@ async def test_create_poll_custom_mode_creates_poll(mock_update, mock_context):
 
     await create_poll(mock_update, mock_context)
 
-    # Verify send_message was called (custom poll uses this, not send_poll)
+    # The poll starts life as a plain message that is then edited.
     mock_context.bot.send_message.assert_called()
 
     # Verify poll was saved to DB
@@ -199,7 +106,7 @@ async def test_create_poll_custom_mode_shows_games(mock_update, mock_context):
     chat_id = 12345
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -230,156 +137,11 @@ async def test_create_poll_custom_mode_shows_games(mock_update, mock_context):
     mock_context.bot.edit_message_text.assert_called()
     call_kwargs = mock_context.bot.edit_message_text.call_args.kwargs
 
-    # Check keyboard contains game names
+    # Games are voted on from each player's ballot; the message links to it
     keyboard = call_kwargs.get("reply_markup")
     assert keyboard is not None
-    button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
-    # At least one game should appear
-    assert any("Catan" in label or "Wingspan" in label for label in button_labels)
-
-
-# ============================================================================
-# Custom Poll Vote Tests
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_custom_poll_vote_adds_vote(mock_update, mock_context):
-    """Test voting on a custom poll adds a PollVote record."""
-    chat_id = 12345
-    poll_id = "poll_12345_123456"
-    game_id = 1
-    user_id = 111
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-
-        u1 = User(telegram_id=user_id, telegram_name="Voter")
-        u2 = User(telegram_id=222, telegram_name="Other")
-        session.add_all([u1, u2])
-        await session.flush()
-
-        g1 = Game(
-            id=game_id,
-            name="TestGame",
-            min_players=2,
-            max_players=4,
-            playing_time=60,
-            complexity=2.0,
-        )
-        session.add(g1)
-        await session.flush()
-
-        c1 = Collection(user_id=user_id, game_id=game_id)
-        c2 = Collection(user_id=222, game_id=game_id)
-        session.add_all([c1, c2])
-
-        sp1 = SessionPlayer(session_id=chat_id, user_id=user_id)
-        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
-        session.add_all([sp1, sp2])
-
-        # Create the poll
-        poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999)
-        session.add(poll)
-        await session.commit()
-
-    mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
-    mock_update.callback_query.from_user.id = user_id
-    mock_update.callback_query.from_user.first_name = "Voter"
-    mock_update.callback_query.from_user.last_name = None
-    mock_update.callback_query.from_user.username = None
-
-    await custom_poll_vote_callback(mock_update, mock_context)
-
-    # Verify vote was recorded
-    async with db.AsyncSessionLocal() as session:
-        stmt = select(PollVote).where(
-            PollVote.poll_id == poll_id, PollVote.user_id == user_id, PollVote.game_id == game_id
-        )
-        vote = (await session.execute(stmt)).scalar_one_or_none()
-        assert vote is not None
-        assert vote.user_name == "Voter"
-
-    # Verify answer callback was called
-    mock_update.callback_query.answer.assert_called_with("Vote recorded")
-
-
-@pytest.mark.asyncio
-async def test_custom_poll_vote_removes_vote(mock_update, mock_context):
-    """Test voting again on a custom poll removes the vote (toggle)."""
-    chat_id = 12345
-    poll_id = "poll_12345_123456"
-    game_id = 1
-    user_id = 111
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-
-        u1 = User(telegram_id=user_id, telegram_name="Voter")
-        u2 = User(telegram_id=222, telegram_name="Other")
-        session.add_all([u1, u2])
-        await session.flush()
-
-        g1 = Game(
-            id=game_id,
-            name="TestGame",
-            min_players=2,
-            max_players=4,
-            playing_time=60,
-            complexity=2.0,
-        )
-        session.add(g1)
-        await session.flush()
-
-        c1 = Collection(user_id=user_id, game_id=game_id)
-        c2 = Collection(user_id=222, game_id=game_id)
-        session.add_all([c1, c2])
-
-        sp1 = SessionPlayer(session_id=chat_id, user_id=user_id)
-        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
-        session.add_all([sp1, sp2])
-
-        poll = GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999)
-        session.add(poll)
-
-        # Pre-existing vote
-        vote = PollVote(
-            poll_id=poll_id,
-            user_id=user_id,
-            vote_type=VoteType.GAME,
-            game_id=game_id,
-            user_name="Voter",
-        )
-        session.add(vote)
-        await session.commit()
-
-    mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
-    mock_update.callback_query.from_user.id = user_id
-    mock_update.callback_query.from_user.first_name = "Voter"
-    mock_update.callback_query.from_user.last_name = None
-    mock_update.callback_query.from_user.username = None
-
-    await custom_poll_vote_callback(mock_update, mock_context)
-
-    # Verify vote was removed
-    async with db.AsyncSessionLocal() as session:
-        stmt = select(PollVote).where(
-            PollVote.poll_id == poll_id, PollVote.user_id == user_id, PollVote.game_id == game_id
-        )
-        vote = (await session.execute(stmt)).scalar_one_or_none()
-        assert vote is None
-
-    mock_update.callback_query.answer.assert_called_with("Vote removed")
-
-
-@pytest.mark.asyncio
-async def test_custom_poll_vote_invalid_data(mock_update, mock_context):
-    """Test voting with invalid callback data shows error."""
-    mock_update.callback_query.data = "vote:invalid"  # Missing game_id
-
-    await custom_poll_vote_callback(mock_update, mock_context)
-
-    mock_update.callback_query.answer.assert_called_with("Invalid vote data")
+    vote_button = keyboard.inline_keyboard[0][0]
+    assert vote_button.url.startswith("https://t.me/test_bot?start=b_poll_")
 
 
 # ============================================================================
@@ -394,7 +156,7 @@ async def test_custom_poll_refresh(mock_update, mock_context):
     poll_id = "poll_12345_123456"
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -432,7 +194,7 @@ async def test_custom_poll_close_announces_winner(mock_update, mock_context):
     poll_id = "poll_12345_123456"
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -491,7 +253,7 @@ async def test_custom_poll_close_tie(mock_update, mock_context):
     poll_id = "poll_12345_123456"
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -549,7 +311,7 @@ async def test_custom_poll_close_resolves_category_votes(mock_update, mock_conte
     base_id = 90000
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -629,7 +391,7 @@ async def test_custom_poll_close_no_votes(mock_update, mock_context):
     poll_id = "poll_12345_123456"
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -670,11 +432,7 @@ async def test_custom_poll_close_with_weighted_voting(mock_update, mock_context)
 
     async with db.AsyncSessionLocal() as session:
         # Weighted voting enabled
-        session.add(
-            Session(
-                chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, settings_weighted=True
-            )
-        )
+        session.add(Session(chat_id=chat_id, is_active=True, settings_weighted=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -753,7 +511,7 @@ async def _seed_close_poll_scenario(
     player_ids = list(dict.fromkeys(voter_ids + [111, 222]))[: max(2, len(voter_ids))]
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
 
         for uid in player_ids:
             session.add(User(telegram_id=uid, telegram_name=f"User{uid}"))
@@ -927,90 +685,6 @@ async def test_leaderboard_renders_tie_at_top_without_zero_padding(mock_update, 
 
 
 # ============================================================================
-# Integration: Native Poll Mode Still Works
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_native_poll_mode_uses_send_poll(mock_update, mock_context):
-    """Test that native poll mode still uses Telegram's send_poll."""
-    chat_id = 12345
-
-    async with db.AsyncSessionLocal() as session:
-        # Native mode
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.NATIVE))
-
-        u1 = User(telegram_id=111, telegram_name="User1")
-        u2 = User(telegram_id=222, telegram_name="User2")
-        session.add_all([u1, u2])
-        await session.flush()
-
-        g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.5)
-        g2 = Game(id=2, name="Game2", min_players=2, max_players=4, playing_time=60, complexity=2.6)
-        session.add_all([g1, g2])
-        await session.flush()
-
-        c1 = Collection(user_id=111, game_id=1)
-        c2 = Collection(user_id=222, game_id=2)
-        session.add_all([c1, c2])
-
-        sp1 = SessionPlayer(session_id=chat_id, user_id=111)
-        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
-        session.add_all([sp1, sp2])
-        await session.commit()
-
-    mock_update.effective_chat.id = chat_id
-
-    await create_poll(mock_update, mock_context)
-
-    # In native mode, send_poll should be called
-    mock_context.bot.send_poll.assert_called()
-
-
-@pytest.mark.asyncio
-async def test_custom_poll_allows_multiple_votes_per_user(mock_update, mock_context):
-    """Test that a user can vote for multiple games in the same poll."""
-    chat_id = 12345
-    poll_id = "poll_multi_vote"
-    user_id = 999
-
-    # 1. Setup Session, Games, Poll
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-        session.add(User(telegram_id=user_id, telegram_name="MultiVoter"))
-
-        g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.0)
-        g2 = Game(id=2, name="Game2", min_players=2, max_players=4, playing_time=60, complexity=2.0)
-        session.add_all([g1, g2])
-
-        session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=123))
-        await session.commit()
-
-    # 2. Vote for Game 1
-    mock_update.callback_query.data = f"vote:{poll_id}:1"
-    mock_update.callback_query.from_user.id = user_id
-    mock_update.callback_query.from_user.first_name = "MultiVoter"
-    mock_update.callback_query.from_user.last_name = None
-    mock_update.callback_query.from_user.username = None
-
-    await custom_poll_vote_callback(mock_update, mock_context)
-
-    # 3. Vote for Game 2 (Should NOT fail)
-    mock_update.callback_query.data = f"vote:{poll_id}:2"
-    await custom_poll_vote_callback(mock_update, mock_context)
-
-    # 4. Verify both votes exist
-    async with db.AsyncSessionLocal() as session:
-        stmt = select(PollVote).where(PollVote.poll_id == poll_id, PollVote.user_id == user_id)
-        votes = (await session.execute(stmt)).scalars().all()
-
-        assert len(votes) == 2
-        game_ids = [v.game_id for v in votes]
-        assert 1 in game_ids
-        assert 2 in game_ids
-
-
-# ============================================================================
 # Weights Toggle Tests (Poll Settings)
 # ============================================================================
 
@@ -1060,211 +734,6 @@ async def test_toggle_weights_updates_setting_and_refresh_menu(mock_update, mock
 
 
 @pytest.mark.asyncio
-async def test_custom_poll_ui_grouping(mock_update, mock_context):
-    """Test pollution UI groups games by complexity with separators."""
-
-    chat_id = 99999
-    base_id = 80000
-    g_ids = [base_id + i for i in range(4)]
-
-    # Setup:
-    # Game A (Starred, C=2.0) -> Should be at top
-    # Game B (C=4.5) -> Group 4
-    # Game C (C=4.2) -> Group 4
-    # Game D (C=1.5) -> Group 1
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-        session.add(User(telegram_id=111, telegram_name="User1"))
-        session.add(User(telegram_id=112, telegram_name="User2"))  # Second player needed
-
-        gA = Game(
-            id=g_ids[0], name="GameA", min_players=1, max_players=5, complexity=2.0, playing_time=60
-        )
-        gB = Game(
-            id=g_ids[1], name="GameB", min_players=1, max_players=5, complexity=4.5, playing_time=60
-        )
-        gC = Game(
-            id=g_ids[2], name="GameC", min_players=1, max_players=5, complexity=4.2, playing_time=60
-        )
-        gD = Game(
-            id=g_ids[3], name="GameD", min_players=1, max_players=5, complexity=1.5, playing_time=60
-        )
-        session.add_all([gA, gB, gC, gD])
-
-        # User owns all (Game 0 is starred)
-        state_map = {
-            g_ids[0]: GameState.STARRED,
-            g_ids[1]: GameState.INCLUDED,
-            g_ids[2]: GameState.INCLUDED,
-            g_ids[3]: GameState.INCLUDED,
-        }
-        for gid, state in state_map.items():
-            session.add(Collection(user_id=111, game_id=gid, state=state))
-
-        session.add(SessionPlayer(session_id=chat_id, user_id=111))
-        session.add(SessionPlayer(session_id=chat_id, user_id=112))  # Second player
-        await session.commit()
-
-    mock_update.effective_chat.id = chat_id
-    await create_poll(mock_update, mock_context)
-
-    # Poll is sent as placeholder then edited. Check edit_message_text.
-    calls = mock_context.bot.edit_message_text.call_args_list
-    assert len(calls) > 0
-    # Get the last call which should have the rendered poll
-    _, kwargs = calls[-1]
-    keyboard = kwargs["reply_markup"]
-
-    # Flatten buttons
-    buttons = [btn for row in keyboard.inline_keyboard for btn in row]
-    labels = [btn.text for btn in buttons]
-    callbacks = [btn.callback_data for btn in buttons]
-
-    # Verify Starred game exists (in its complexity group, not necessarily first)
-    assert any("⭐ GameA" in label for label in labels)
-
-    # Verify Separators (groups 4, 2, and 1 should exist)
-    assert "--- 4 ---" in labels or any("--- 4" in label for label in labels)
-    assert "--- 1 ---" in labels or any("--- 1" in label for label in labels)
-
-    # Verify Callback data: category headers carry the short category prefix
-    assert any(cb.startswith(handlers._CB_SEPARATOR) for cb in callbacks)
-
-
-@pytest.mark.asyncio
-async def test_custom_poll_random_vote(mock_update, mock_context):
-    """Test clicking separator stores a category vote (not a random game vote)."""
-
-    chat_id = 88888
-    poll_id = f"poll_random_{chat_id}"
-    base_id = 70000
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-        session.add(User(telegram_id=111, telegram_name="RandomVoter"))
-
-        # Group 4: Two games
-        g1 = Game(
-            id=base_id,
-            name="Complex1",
-            min_players=1,
-            max_players=5,
-            complexity=4.5,
-            playing_time=60,
-        )
-        g2 = Game(
-            id=base_id + 1,
-            name="Complex2",
-            min_players=1,
-            max_players=5,
-            complexity=4.2,
-            playing_time=60,
-        )
-        session.add_all([g1, g2])
-
-        session.add(Collection(user_id=111, game_id=base_id))
-        session.add(Collection(user_id=111, game_id=base_id + 1))
-        session.add(SessionPlayer(session_id=chat_id, user_id=111))
-
-        session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
-        await session.commit()
-
-    mock_update.callback_query.data = f"poll_random_vote:{poll_id}:4"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 999
-    mock_update.callback_query.from_user.id = 111
-    mock_update.callback_query.from_user.first_name = "RandomVoter"
-    mock_update.callback_query.from_user.last_name = None
-    mock_update.callback_query.from_user.username = None
-
-    # Mock bot.edit_message_text to avoid awaiting on Mock if not set up
-    mock_context.bot.edit_message_text = AsyncMock()
-
-    await custom_poll_action_callback(mock_update, mock_context)
-
-    # Verify category vote added (game_id = -level = -4)
-    async with db.AsyncSessionLocal() as session:
-        votes = (
-            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
-            .scalars()
-            .all()
-        )
-
-        assert len(votes) == 1
-        assert votes[0].category_level == 4  # Category vote should have level set
-
-    # Verify answer indicates category vote
-    mock_update.callback_query.answer.assert_called()
-
-
-@pytest.mark.asyncio
-async def test_custom_poll_category_vote_toggle(mock_update, mock_context):
-    """Test clicking category header again removes the vote (toggle behavior)."""
-
-    chat_id = 77777
-    poll_id = f"poll_toggle_{chat_id}"
-    base_id = 60000
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-        session.add(User(telegram_id=111, telegram_name="Toggler"))
-
-        # Group 3: One game
-        g1 = Game(
-            id=base_id,
-            name="Medium",
-            min_players=1,
-            max_players=5,
-            complexity=3.5,
-            playing_time=60,
-        )
-        session.add(g1)
-
-        session.add(Collection(user_id=111, game_id=base_id))
-        session.add(SessionPlayer(session_id=chat_id, user_id=111))
-
-        session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999))
-
-        # Pre-existing category vote
-        session.add(
-            PollVote(
-                poll_id=poll_id,
-                user_id=111,
-                vote_type=VoteType.CATEGORY,
-                category_level=3,
-                user_name="Toggler",
-            )
-        )
-        await session.commit()
-
-    mock_update.callback_query.data = f"poll_random_vote:{poll_id}:3"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 999
-    mock_update.callback_query.from_user.id = 111
-    mock_update.callback_query.from_user.first_name = "Toggler"
-    mock_update.callback_query.from_user.last_name = None
-    mock_update.callback_query.from_user.username = None
-
-    mock_context.bot.edit_message_text = AsyncMock()
-
-    await custom_poll_action_callback(mock_update, mock_context)
-
-    # Verify category vote was removed
-    async with db.AsyncSessionLocal() as session:
-        votes = (
-            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
-            .scalars()
-            .all()
-        )
-
-        assert len(votes) == 0
-
-    # Verify answer indicates removal
-    mock_update.callback_query.answer.assert_called_with("Vote removed")
-
-
-@pytest.mark.asyncio
 async def test_auto_close_previous_polls(mock_update, mock_context):
     """Test that starting a new poll closes existing ones."""
 
@@ -1273,7 +742,7 @@ async def test_auto_close_previous_polls(mock_update, mock_context):
 
     # Setup: Active Custom Poll
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
         session.add(User(telegram_id=111, telegram_name="User1"))
         session.add(User(telegram_id=112, telegram_name="User2"))
 
@@ -1301,7 +770,6 @@ async def test_auto_close_previous_polls(mock_update, mock_context):
     mock_update.callback_query.data = "start_poll"
 
     # Mock bot methods
-    mock_context.bot.stop_poll = AsyncMock()
     mock_context.bot.edit_message_text = AsyncMock()
     mock_context.bot.send_message = AsyncMock(
         return_value=MagicMock(message_id=999)
@@ -1309,11 +777,7 @@ async def test_auto_close_previous_polls(mock_update, mock_context):
 
     await start_poll_callback(mock_update, mock_context)
 
-    # Verify Old Poll Closed (Custom mode -> edit_message_text try)
-    # Since we didn't mock type to NATIVE, it probably tried stop_poll first then edit_message_text
-    # We can check specific calls. The code tries stop_poll, excepts, then edit_message_text.
-
-    # Verify DB deleted
+    # The old poll's row is gone
     async with db.AsyncSessionLocal() as session:
         poll = await session.get(GameNightPoll, old_poll_id)
         assert poll is None
@@ -1328,7 +792,7 @@ async def test_auto_refresh_poll_on_join(mock_update, mock_context):
     new_user_id = 999
 
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
         session.add(User(telegram_id=111, telegram_name="User1"))
 
         # Games
@@ -1375,86 +839,12 @@ async def test_auto_refresh_poll_on_join(mock_update, mock_context):
             break
 
     assert refresh_call is not None
-    # Game should be in keyboard buttons (not text if no votes)
-    keyboard = refresh_call.kwargs.get("reply_markup")
-    assert keyboard is not None
-    buttons = [btn.text for row in keyboard.inline_keyboard for btn in row]
-    assert any("GameA" in btn for btn in buttons)
+    assert "Poll Active" in refresh_call.kwargs["text"]
 
 
 # ============================================================================
 # New Settings Toggle Tests (API 9.6 Migration)
 # ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_shuffle_is_stable_across_renders(mock_context):
-    """With shuffle_options on, repeated renders of the same poll keep the same button order."""
-    chat_id = 31415
-    poll_id = f"poll_shuffle_{chat_id}"
-    base_id = 90000
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(
-            Session(
-                chat_id=chat_id,
-                is_active=True,
-                poll_type=PollType.CUSTOM,
-                shuffle_options=True,
-            )
-        )
-        session.add(
-            GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=555, shuffle_seed=424242)
-        )
-        session.add(User(telegram_id=111, telegram_name="P1"))
-        session.add(User(telegram_id=112, telegram_name="P2"))
-        session.add(SessionPlayer(session_id=chat_id, user_id=111))
-        session.add(SessionPlayer(session_id=chat_id, user_id=112))
-        games = [
-            Game(
-                id=base_id + i,
-                name=f"Game{i}",
-                min_players=1,
-                max_players=5,
-                complexity=2.0,
-                playing_time=60,
-            )
-            for i in range(6)
-        ]
-        session.add_all(games)
-        for g in games:
-            session.add(Collection(user_id=111, game_id=g.id))
-        await session.commit()
-
-    def vote_callbacks_of(call):
-        kb = call.kwargs["reply_markup"]
-        return [
-            btn.callback_data
-            for row in kb.inline_keyboard
-            for btn in row
-            if btn.callback_data and btn.callback_data.startswith(handlers._CB_VOTE)
-        ]
-
-    async with db.AsyncSessionLocal() as session:
-        games_list = list(
-            (await session.execute(select(Game).where(Game.id.in_([g.id for g in games]))))
-            .scalars()
-            .all()
-        )
-        await render_poll_message(
-            mock_context.bot, chat_id, 555, session, poll_id, games_list, set()
-        )
-        first_order = vote_callbacks_of(mock_context.bot.edit_message_text.call_args_list[-1])
-
-        await render_poll_message(
-            mock_context.bot, chat_id, 555, session, poll_id, games_list, set()
-        )
-        second_order = vote_callbacks_of(mock_context.bot.edit_message_text.call_args_list[-1])
-
-    assert first_order == second_order
-    # Sanity: shuffle actually ran (order differs from the sorted-by-id input)
-    sorted_order = [f"vote:{poll_id}:{base_id + i}" for i in range(6)]
-    assert first_order != sorted_order
 
 
 @pytest.mark.asyncio
@@ -1530,9 +920,7 @@ async def test_custom_poll_hide_results_hides_vote_counts(mock_update, mock_cont
     poll_id = "poll_12345_hide"
 
     async with db.AsyncSessionLocal() as session:
-        session.add(
-            Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_results=True)
-        )
+        session.add(Session(chat_id=chat_id, is_active=True, hide_results=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -1596,7 +984,6 @@ async def test_custom_poll_add_button_shown_when_enabled(mock_update, mock_conte
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 allow_adding_options=True,
             )
         )
@@ -1644,7 +1031,6 @@ async def test_custom_poll_add_game_select(mock_update, mock_context):
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 allow_adding_options=True,
             )
         )
@@ -1750,7 +1136,6 @@ async def test_custom_poll_shows_description(mock_update, mock_context):
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 settings_weighted=True,
             )
         )
@@ -1804,7 +1189,6 @@ async def test_custom_poll_add_cancel(mock_update, mock_context):
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 allow_adding_options=True,
             )
         )
@@ -1862,7 +1246,6 @@ async def test_custom_poll_add_game_duplicate_prevented(mock_update, mock_contex
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 allow_adding_options=True,
             )
         )
@@ -1931,9 +1314,7 @@ async def test_custom_poll_hide_results_hides_category_votes(mock_update, mock_c
     poll_id = "poll_12345_hide_cat"
 
     async with db.AsyncSessionLocal() as session:
-        session.add(
-            Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM, hide_results=True)
-        )
+        session.add(Session(chat_id=chat_id, is_active=True, hide_results=True))
 
         u1 = User(telegram_id=111, telegram_name="User1")
         u2 = User(telegram_id=222, telegram_name="User2")
@@ -1986,63 +1367,6 @@ async def test_custom_poll_hide_results_hides_category_votes(mock_update, mock_c
 
 
 # ============================================================================
-# Native Poll New Parameters Test
-# ============================================================================
-
-
-@pytest.mark.asyncio
-async def test_native_poll_passes_new_api_parameters(mock_update, mock_context):
-    """Test that native polls pass shuffle, hide_results, allow_adding params to send_poll."""
-    chat_id = 12345
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(
-            Session(
-                chat_id=chat_id,
-                is_active=True,
-                poll_type=PollType.NATIVE,
-                shuffle_options=True,
-                hide_results=True,
-                allow_adding_options=True,
-            )
-        )
-
-        u1 = User(telegram_id=111, telegram_name="User1")
-        u2 = User(telegram_id=222, telegram_name="User2")
-        session.add_all([u1, u2])
-        await session.flush()
-
-        g1 = Game(id=1, name="Game1", min_players=2, max_players=4, playing_time=60, complexity=2.5)
-        g2 = Game(id=2, name="Game2", min_players=2, max_players=4, playing_time=60, complexity=2.6)
-        session.add_all([g1, g2])
-        await session.flush()
-
-        c1 = Collection(user_id=111, game_id=1)
-        c2 = Collection(user_id=222, game_id=2)
-        session.add_all([c1, c2])
-
-        sp1 = SessionPlayer(session_id=chat_id, user_id=111)
-        sp2 = SessionPlayer(session_id=chat_id, user_id=222)
-        session.add_all([sp1, sp2])
-        await session.commit()
-
-    mock_update.effective_chat.id = chat_id
-
-    await create_poll(mock_update, mock_context)
-
-    mock_context.bot.send_poll.assert_called()
-    call_kwargs = mock_context.bot.send_poll.call_args.kwargs
-
-    # Bot API 9.1/9.6 poll params, native kwargs as of PTB 22.8.
-    assert call_kwargs["allows_revoting"] is True
-    assert call_kwargs["shuffle_options"] is True
-    assert call_kwargs["hide_results_until_closes"] is True
-    assert call_kwargs["allow_adding_options"] is True
-    assert "2 players" in call_kwargs["description"]
-    assert "api_kwargs" not in call_kwargs
-
-
-# ============================================================================
 # Allow Adding Guard Test
 # ============================================================================
 
@@ -2058,7 +1382,6 @@ async def test_poll_add_blocked_when_setting_disabled(mock_update, mock_context)
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 allow_adding_options=False,
             )
         )
@@ -2115,7 +1438,6 @@ async def test_poll_added_games_cascade_deleted(mock_update, mock_context):
             Session(
                 chat_id=chat_id,
                 is_active=True,
-                poll_type=PollType.CUSTOM,
                 allow_adding_options=True,
             )
         )
@@ -2218,214 +1540,6 @@ def test_wrap_button_label_long_word_without_spaces_breaks_mid_word():
     assert "expialidocious" in label.replace("\n", "")
 
 
-@pytest.mark.asyncio
-async def test_render_poll_long_game_name_wrapped_not_truncated(mock_update, mock_context):
-    """A game with a long name renders as a wrapped multi-line button, no '…'."""
-    chat_id = 12345
-    poll_id = "poll_12345_wrap"
-    long_name = "Twilight Imperium Fourth Edition"
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-
-        session.add_all(
-            [
-                User(telegram_id=111, telegram_name="User1"),
-                User(telegram_id=222, telegram_name="User2"),
-            ]
-        )
-        await session.flush()
-
-        g1 = Game(
-            id=1, name=long_name, min_players=2, max_players=4, playing_time=240, complexity=4.5
-        )
-        session.add(g1)
-        await session.flush()
-
-        session.add_all(
-            [
-                Collection(user_id=111, game_id=1),
-                Collection(user_id=222, game_id=1),
-                SessionPlayer(session_id=chat_id, user_id=111),
-                SessionPlayer(session_id=chat_id, user_id=222),
-                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999),
-            ]
-        )
-        await session.commit()
-
-    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
-    await custom_poll_action_callback(mock_update, mock_context)
-
-    keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
-    button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
-    long_button = next(b for b in button_labels if "Twilight" in b)
-
-    assert "\n" in long_button, "long name should wrap across multiple lines"
-    assert "…" not in long_button, "name fits within wrap budget; no ellipsis expected"
-    assert "Edition" in long_button, "tail of the name should not be lost"
-
-
-@pytest.mark.asyncio
-async def test_render_poll_long_name_group_renders_one_per_row(mock_update, mock_context):
-    """A complexity group containing any long name lays out one button per row."""
-    chat_id = 12345
-    poll_id = "poll_12345_onecol"
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-
-        session.add_all(
-            [
-                User(telegram_id=111, telegram_name="User1"),
-                User(telegram_id=222, telegram_name="User2"),
-            ]
-        )
-        await session.flush()
-
-        # Two games in the same complexity bucket, one with a long name.
-        g_short = Game(
-            id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0
-        )
-        g_long = Game(
-            id=2,
-            name="Twilight Imperium Fourth Edition",
-            min_players=2,
-            max_players=4,
-            playing_time=60,
-            complexity=2.0,
-        )
-        session.add_all([g_short, g_long])
-        await session.flush()
-
-        session.add_all(
-            [
-                Collection(user_id=111, game_id=1),
-                Collection(user_id=111, game_id=2),
-                Collection(user_id=222, game_id=1),
-                Collection(user_id=222, game_id=2),
-                SessionPlayer(session_id=chat_id, user_id=111),
-                SessionPlayer(session_id=chat_id, user_id=222),
-                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999),
-            ]
-        )
-        await session.commit()
-
-    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
-    await custom_poll_action_callback(mock_update, mock_context)
-
-    keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
-    # Find the two game-vote rows (callback_data starts with the vote prefix)
-    vote_rows = [
-        row
-        for row in keyboard.inline_keyboard
-        if row and row[0].callback_data and row[0].callback_data.startswith(handlers._CB_VOTE)
-    ]
-    assert len(vote_rows) == 2, "expected one row per game when group has a long name"
-    assert all(len(row) == 1 for row in vote_rows), "long-name group should be one-per-row"
-
-
-@pytest.mark.asyncio
-async def test_render_poll_short_names_stay_two_per_row(mock_update, mock_context):
-    """A complexity group with only short names keeps the two-per-row layout."""
-    chat_id = 12345
-    poll_id = "poll_12345_twocol"
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-
-        session.add_all(
-            [
-                User(telegram_id=111, telegram_name="User1"),
-                User(telegram_id=222, telegram_name="User2"),
-            ]
-        )
-        await session.flush()
-
-        # Two short-named games, same complexity bucket.
-        g1 = Game(id=1, name="Catan", min_players=2, max_players=4, playing_time=60, complexity=2.0)
-        g2 = Game(id=2, name="Azul", min_players=2, max_players=4, playing_time=60, complexity=2.0)
-        session.add_all([g1, g2])
-        await session.flush()
-
-        session.add_all(
-            [
-                Collection(user_id=111, game_id=1),
-                Collection(user_id=111, game_id=2),
-                Collection(user_id=222, game_id=1),
-                Collection(user_id=222, game_id=2),
-                SessionPlayer(session_id=chat_id, user_id=111),
-                SessionPlayer(session_id=chat_id, user_id=222),
-                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999),
-            ]
-        )
-        await session.commit()
-
-    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
-    await custom_poll_action_callback(mock_update, mock_context)
-
-    keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
-    vote_rows = [
-        row
-        for row in keyboard.inline_keyboard
-        if row and row[0].callback_data and row[0].callback_data.startswith(handlers._CB_VOTE)
-    ]
-    assert len(vote_rows) == 1, "expected a single row holding both short-name buttons"
-    assert len(vote_rows[0]) == 2, "short-name group should stay two-per-row"
-
-
-@pytest.mark.asyncio
-async def test_render_poll_long_name_with_vote_keeps_count_visible(mock_update, mock_context):
-    """A wrapped long-name button still ends with the vote-count suffix."""
-    chat_id = 12345
-    poll_id = "poll_12345_wrapcount"
-    long_name = "Twilight Imperium Fourth Edition"
-
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-
-        session.add_all(
-            [
-                User(telegram_id=111, telegram_name="User1"),
-                User(telegram_id=222, telegram_name="User2"),
-            ]
-        )
-        await session.flush()
-
-        g1 = Game(
-            id=1, name=long_name, min_players=2, max_players=4, playing_time=240, complexity=4.5
-        )
-        session.add(g1)
-        await session.flush()
-
-        session.add_all(
-            [
-                Collection(user_id=111, game_id=1),
-                Collection(user_id=222, game_id=1),
-                SessionPlayer(session_id=chat_id, user_id=111),
-                SessionPlayer(session_id=chat_id, user_id=222),
-                GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=999),
-                PollVote(
-                    poll_id=poll_id,
-                    user_id=111,
-                    vote_type=VoteType.GAME,
-                    game_id=1,
-                    user_name="User1",
-                ),
-            ]
-        )
-        await session.commit()
-
-    mock_update.callback_query.data = f"poll_refresh:{poll_id}"
-    await custom_poll_action_callback(mock_update, mock_context)
-
-    keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"]
-    button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
-    long_button = next(b for b in button_labels if "Twilight" in b)
-
-    # The count suffix lives on the last visual line of the wrapped label.
-    assert long_button.split("\n")[-1].endswith(" (1)")
-
-
 # ============================================================================
 # Debounced Render (Vote Coalescing) Tests
 # ============================================================================
@@ -2442,8 +1556,7 @@ class _FakeJob:
 
 
 class _FakeJobQueue:
-    """Minimal stand-in for telegram.ext.JobQueue used to assert that vote
-    handlers debounce renders instead of editing the message inline."""
+    """Minimal stand-in for telegram.ext.JobQueue."""
 
     def __init__(self):
         self.jobs: list[_FakeJob] = []
@@ -2460,7 +1573,7 @@ class _FakeJobQueue:
 
 async def _seed_basic_poll(chat_id, poll_id, game_id, user_id, message_id=999):
     async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
+        session.add(Session(chat_id=chat_id, is_active=True))
         session.add_all(
             [
                 User(telegram_id=user_id, telegram_name="Voter"),
@@ -2492,68 +1605,6 @@ async def _seed_basic_poll(chat_id, poll_id, game_id, user_id, message_id=999):
 
 
 @pytest.mark.asyncio
-async def test_vote_schedules_debounced_render_instead_of_inline_edit(mock_update, mock_context):
-    """With a job queue present, a vote schedules a render job and does NOT
-    edit the message inline (the edit happens later, in the coalesced job)."""
-    chat_id, poll_id, game_id, user_id = 12345, "poll_12345_1", 1, 111
-    await _seed_basic_poll(chat_id, poll_id, game_id, user_id)
-
-    mock_context.job_queue = _FakeJobQueue()
-    mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
-    mock_update.callback_query.from_user.id = user_id
-    mock_update.callback_query.from_user.first_name = "Voter"
-
-    await custom_poll_vote_callback(mock_update, mock_context)
-
-    # Vote persisted + acknowledged immediately (non-blocking UX preserved).
-    mock_update.callback_query.answer.assert_called_with("Vote recorded")
-    # Render is deferred to the job queue, not edited inline.
-    mock_context.bot.edit_message_text.assert_not_called()
-    pending = mock_context.job_queue.pending(f"render:{poll_id}")
-    assert len(pending) == 1
-    assert pending[0].data == {
-        "chat_id": chat_id,
-        "message_id": 999,
-        "poll_id": poll_id,
-    }
-
-
-@pytest.mark.asyncio
-async def test_rapid_votes_coalesce_to_single_pending_render(mock_update, mock_context):
-    """A burst of votes leaves exactly one pending render job: the first vote
-    schedules it and later votes in the window leave it in place (throttle, not
-    debounce — so sustained voting can't starve the render and freeze the tally).
-    The pending job reads fresh state when it fires, so it reflects every vote."""
-    chat_id, poll_id, user_id = 12345, "poll_12345_2", 111
-    await _seed_basic_poll(chat_id, poll_id, 1, user_id)
-    async with db.AsyncSessionLocal() as session:
-        session.add(
-            Game(id=2, name="Second", min_players=2, max_players=4, playing_time=60, complexity=2.0)
-        )
-        await session.flush()
-        session.add_all(
-            [
-                Collection(user_id=user_id, game_id=2),
-                Collection(user_id=user_id + 1, game_id=2),
-            ]
-        )
-        await session.commit()
-
-    mock_context.job_queue = _FakeJobQueue()
-    mock_update.callback_query.from_user.id = user_id
-    mock_update.callback_query.from_user.first_name = "Voter"
-
-    for game_id in (1, 2):
-        mock_update.callback_query.data = f"vote:{poll_id}:{game_id}"
-        await custom_poll_vote_callback(mock_update, mock_context)
-
-    # The first vote scheduled the only job; the second reused it instead of
-    # cancelling and rescheduling → one live job, nothing removed (no starvation).
-    assert len(mock_context.job_queue.pending(f"render:{poll_id}")) == 1
-    assert sum(j.removed for j in mock_context.job_queue.jobs) == 0
-
-
-@pytest.mark.asyncio
 async def test_render_job_edits_message(mock_context):
     """The debounced job renders the live poll state to the message."""
     chat_id, poll_id, game_id, user_id = 12345, "poll_12345_3", 1, 111
@@ -2581,312 +1632,6 @@ async def test_render_job_skips_closed_poll(mock_context):
     mock_context.bot.edit_message_text.assert_not_called()
 
 
-# ============================================================================
-# Keyboard Size-Budget Tests (large game lists)
-# ============================================================================
-
-
-def _vote_ids_from_markup(markup):
-    return [
-        int(btn.callback_data.removeprefix(handlers._CB_VOTE))
-        for row in markup.inline_keyboard
-        for btn in row
-        if btn.callback_data and btn.callback_data.startswith(handlers._CB_VOTE)
-    ]
-
-
-def _separator_levels_from_markup(markup):
-    return [
-        int(btn.callback_data.removeprefix(handlers._CB_SEPARATOR))
-        for row in markup.inline_keyboard
-        for btn in row
-        if btn.callback_data and btn.callback_data.startswith(handlers._CB_SEPARATOR)
-    ]
-
-
-def test_build_poll_keyboard_drops_lowest_complexity_first():
-    """Within a tight budget, only the highest-complexity games get buttons; the
-    lowest-complexity ones are dropped but keep their category-vote header."""
-    poll_id = "poll_budget"
-    levels_desc = [4, 2]
-    sorted_by_level = {
-        4: [SimpleNamespace(id=i, name=f"G{i}") for i in range(1, 21)],
-        2: [SimpleNamespace(id=i, name=f"G{i}") for i in range(101, 121)],
-    }
-    vote_counts = {g.id: 0 for games in sorted_by_level.values() for g in games}
-
-    keyboard, shown, hidden = _build_poll_keyboard(
-        poll_id, levels_desc, sorted_by_level, vote_counts, set(), {}, False, False, 400
-    )
-
-    markup = InlineKeyboardMarkup(keyboard)
-    vote_ids = _vote_ids_from_markup(markup)
-    assert vote_ids, "at least one high-complexity game should fit"
-    assert all(1 <= i <= 20 for i in vote_ids)  # only level-4 games (ids 1-20)
-    assert shown == len(vote_ids)
-    assert hidden == 40 - shown > 0  # some games were dropped
-    # Both categories keep a header so dropped games stay votable.
-    assert set(_separator_levels_from_markup(markup)) == {4, 2}
-
-
-async def _seed_poll_with_levels(chat_id, poll_id, level_counts, message_id=999):
-    """Seed a custom poll whose single player owns games spread across complexity
-    levels. `level_counts` maps complexity float -> count. Game ids are assigned
-    sequentially in the iteration order of `level_counts`."""
-    async with db.AsyncSessionLocal() as session:
-        session.add(Session(chat_id=chat_id, is_active=True, poll_type=PollType.CUSTOM))
-        session.add(User(telegram_id=111, telegram_name="Solo"))
-        await session.flush()
-        gid = 0
-        games = []
-        for complexity, count in level_counts.items():
-            for _ in range(count):
-                gid += 1
-                games.append(
-                    Game(
-                        id=gid,
-                        name=f"Game{gid:03d}",
-                        min_players=1,
-                        max_players=8,
-                        playing_time=60,
-                        complexity=complexity,
-                    )
-                )
-        session.add_all(games)
-        await session.flush()
-        session.add_all([Collection(user_id=111, game_id=g.id) for g in games])
-        session.add(SessionPlayer(session_id=chat_id, user_id=111))
-        session.add(GameNightPoll(poll_id=poll_id, chat_id=chat_id, message_id=message_id))
-        await session.commit()
-        return [g.id for g in games]
-
-
-@pytest.mark.asyncio
-async def test_small_poll_shows_all_games_and_no_note(mock_context):
-    """A poll that fits the budget shows every game and adds no truncation note."""
-    chat_id, poll_id = 12345, "poll_small"
-    ids = await _seed_poll_with_levels(chat_id, poll_id, {2.0: 5})
-
-    async with db.AsyncSessionLocal() as session:
-        games = list((await session.execute(select(Game))).scalars().all())
-        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
-
-    call = mock_context.bot.edit_message_text.call_args
-    assert "Showing" not in call.kwargs["text"]
-    assert sorted(_vote_ids_from_markup(call.kwargs["reply_markup"])) == sorted(ids)
-
-
-@pytest.mark.asyncio
-async def test_large_poll_drops_lowest_complexity_and_notes_it(mock_context, monkeypatch):
-    """Over the budget, the poll keeps high-complexity game buttons, drops the
-    lowest-complexity ones, and tells users where to find them."""
-    monkeypatch.setattr(handlers, "_REPLY_MARKUP_BUDGET_BYTES", 500)
-    chat_id, poll_id = 12345, "poll_big"
-    # ids 1-10 = complexity 4 (high), ids 11-20 = complexity 2 (low).
-    await _seed_poll_with_levels(chat_id, poll_id, {4.0: 10, 2.0: 10})
-
-    async with db.AsyncSessionLocal() as session:
-        games = list((await session.execute(select(Game))).scalars().all())
-        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
-
-    call = mock_context.bot.edit_message_text.call_args
-    markup = call.kwargs["reply_markup"]
-    vote_ids = _vote_ids_from_markup(markup)
-    assert vote_ids and all(1 <= i <= 10 for i in vote_ids)  # only high-complexity shown
-    assert len(vote_ids) < 20  # some dropped
-    assert "Showing" in call.kwargs["text"]
-    # Both complexity categories keep a header (low-complexity games votable there).
-    assert set(_separator_levels_from_markup(markup)) == {4, 2}
-
-
-@pytest.mark.asyncio
-async def test_render_retries_when_reply_markup_too_long(mock_context):
-    """If Telegram still rejects the keyboard as too long, the render retries
-    (with a smaller budget) instead of silently freezing the poll."""
-    chat_id, poll_id = 12345, "poll_retry"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 12})
-
-    calls = []
-
-    async def fake_edit(**kwargs):
-        calls.append(kwargs)
-        if len(calls) == 1:
-            raise Exception("Bad Request: reply markup is too long")
-
-    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
-
-    async with db.AsyncSessionLocal() as session:
-        games = list((await session.execute(select(Game))).scalars().all())
-        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
-
-    assert len(calls) == 2  # first failed, retried once
-
-    def n_votes(kwargs):
-        return len(_vote_ids_from_markup(kwargs["reply_markup"]))
-
-    # Retry shrinks the budget, so it never shows more buttons than the failed try.
-    assert n_votes(calls[1]) <= n_votes(calls[0])
-
-
-def test_build_poll_keyboard_keeps_starred_and_voted_over_complexity():
-    """The budget is spent on relevance, not raw complexity: a starred or
-    already-voted low-complexity game keeps its button while plain
-    high-complexity games lose theirs."""
-    levels_desc = [4, 2]
-    high = [SimpleNamespace(id=i, name=f"H{i}") for i in range(1, 21)]
-    low = [SimpleNamespace(id=i, name=f"L{i}") for i in range(101, 121)]
-    sorted_by_level = {4: high, 2: low}
-    vote_counts = {g.id: 0 for g in high + low}
-    vote_counts[110] = 5  # a low-complexity game people actually voted for
-    priority_ids = {115}  # a starred low-complexity game
-
-    keyboard, shown, hidden = _build_poll_keyboard(
-        "poll_rank", levels_desc, sorted_by_level, vote_counts, priority_ids, {}, False, False, 500
-    )
-
-    vote_ids = _vote_ids_from_markup(InlineKeyboardMarkup(keyboard))
-    assert hidden > 0, "budget must be tight enough to force a cut"
-    assert 115 in vote_ids, "starred game must survive the cut"
-    assert 110 in vote_ids, "voted game must survive the cut"
-    # Those two displaced plain high-complexity games rather than being dropped.
-    assert not all(1 <= i <= 20 for i in vote_ids)
-    assert shown == len(vote_ids)
-
-
-def test_poll_keyboard_callback_data_omits_poll_id():
-    """Game and category buttons use the short encoding, so a long poll id
-    doesn't cost ~30 bytes of budget on every button."""
-    games = [SimpleNamespace(id=42, name="Brass Birmingham")]
-    keyboard, _, _ = _build_poll_keyboard(
-        "poll_-1001234567890_1760000000", [3], {3: games}, {}, set(), {}, False, False, 8000
-    )
-    callbacks = [b.callback_data for row in keyboard for b in row]
-
-    assert "v:42" in callbacks
-    assert "sep:3" in callbacks
-    assert not any(c.startswith("vote:") or c.startswith("poll_random_vote:") for c in callbacks)
-
-
-@pytest.mark.asyncio
-async def test_short_vote_callback_resolves_poll_from_message(mock_update, mock_context):
-    """A "v:<game_id>" button carries no poll id, so the handler finds the poll
-    from the message it was tapped on."""
-    chat_id, poll_id = 31337, "poll_short_cb"
-    ids = await _seed_poll_with_levels(chat_id, poll_id, {3.0: 2}, message_id=4242)
-
-    mock_update.callback_query.data = f"v:{ids[0]}"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 4242
-    mock_context.bot.edit_message_text = AsyncMock()
-
-    await custom_poll_vote_callback(mock_update, mock_context)
-
-    async with db.AsyncSessionLocal() as session:
-        votes = (
-            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
-            .scalars()
-            .all()
-        )
-    assert [v.game_id for v in votes] == [ids[0]]
-
-
-@pytest.mark.asyncio
-async def test_legacy_vote_callback_still_works(mock_update, mock_context):
-    """Keyboards already sitting in chats use the long form; it must keep
-    working after deploy rather than answering "Poll not found"."""
-    chat_id, poll_id = 31338, "poll_legacy_cb"
-    ids = await _seed_poll_with_levels(chat_id, poll_id, {3.0: 2}, message_id=4343)
-
-    mock_update.callback_query.data = f"vote:{poll_id}:{ids[0]}"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 4343
-    mock_context.bot.edit_message_text = AsyncMock()
-
-    await custom_poll_vote_callback(mock_update, mock_context)
-
-    async with db.AsyncSessionLocal() as session:
-        votes = (
-            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
-            .scalars()
-            .all()
-        )
-    assert [v.game_id for v in votes] == [ids[0]]
-
-
-@pytest.mark.asyncio
-async def test_legacy_category_callback_still_works(mock_update, mock_context):
-    """Same for a category header from an older keyboard."""
-    chat_id, poll_id = 31339, "poll_legacy_cat"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 2}, message_id=4444)
-
-    mock_update.callback_query.data = f"poll_random_vote:{poll_id}:3"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 4444
-    mock_context.bot.edit_message_text = AsyncMock()
-
-    await custom_poll_action_callback(mock_update, mock_context)
-
-    async with db.AsyncSessionLocal() as session:
-        votes = (
-            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
-            .scalars()
-            .all()
-        )
-    assert [v.category_level for v in votes] == [3]
-
-
-@pytest.mark.asyncio
-async def test_message_too_long_does_not_shrink_the_keyboard(mock_context):
-    """ "Message is too long" is about the text, not the keyboard. Shrinking the
-    keyboard can't fix it, and it must not poison the learned budget."""
-    chat_id, poll_id = 12345, "poll_text_long"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 6})
-    before = handlers._learned_markup_budget
-
-    calls = []
-
-    async def fake_edit(**kwargs):
-        calls.append(kwargs)
-        raise Exception("Bad Request: message is too long")
-
-    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
-
-    async with db.AsyncSessionLocal() as session:
-        games = list((await session.execute(select(Game))).scalars().all())
-        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
-
-    assert len(calls) == 1, "a text-length error must not trigger keyboard retries"
-    assert handlers._learned_markup_budget == before
-
-
-@pytest.mark.asyncio
-async def test_learned_budget_skips_the_rejected_call_on_later_renders(mock_context):
-    """Once Telegram has rejected a keyboard size, later renders start from the
-    smaller budget instead of paying for the same doomed call every time."""
-    chat_id, poll_id = 12345, "poll_learned"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 12})
-
-    calls = []
-
-    async def fake_edit(**kwargs):
-        calls.append(kwargs)
-        # Reject anything built to the original budget, accept the halved one.
-        if len(calls) == 1:
-            raise Exception("Bad Request: reply markup is too long")
-
-    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
-
-    async with db.AsyncSessionLocal() as session:
-        games = list((await session.execute(select(Game))).scalars().all())
-        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
-        assert len(calls) == 2  # first rejected, retry accepted
-        assert handlers._learned_markup_budget < handlers._REPLY_MARKUP_BUDGET_BYTES
-
-        # Second render: no wasted first attempt this time.
-        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
-    assert len(calls) == 3
-
-
 def test_clamp_message_text_leaves_short_text_alone():
     lines = ["📊 **Poll Active**", "**3** - Brass Birmingham", "   └ _Joao, Maria_"]
     assert handlers._clamp_message_text(lines) == "\n".join(lines)
@@ -2904,484 +1649,3 @@ def test_clamp_message_text_truncates_a_long_tally():
     assert text.startswith("**0** - ")
     # Cuts only on line boundaries, so Markdown emphasis is never split.
     assert all(line.count("**") % 2 == 0 for line in text.split("\n") if "**" in line)
-
-
-def test_build_poll_keyboard_respects_the_button_count_cap():
-    """Past the server's button limit Telegram drops buttons silently, so the
-    builder must stop on count as well as bytes."""
-    monkey_games = [SimpleNamespace(id=i, name=f"G{i}") for i in range(1, 600)]
-    keyboard, shown, hidden = _build_poll_keyboard(
-        "poll_cap",
-        [3],
-        {3: monkey_games},
-        {},
-        set(),
-        {},
-        False,
-        True,
-        10**9,  # effectively unlimited bytes, so only the count cap can bite
-    )
-    total_buttons = sum(len(row) for row in keyboard)
-    assert total_buttons <= handlers._MAX_KEYBOARD_BUTTONS
-    assert hidden > 0 and shown + hidden == len(monkey_games)
-    assert max(len(row) for row in keyboard) <= handlers._MAX_BUTTONS_PER_ROW
-
-
-@pytest.mark.asyncio
-async def test_underscored_message_too_long_is_not_a_keyboard_error(mock_context):
-    """Telegram returns "Message_too_long" (underscores) for an over-long text.
-    A plain "too long" substring test misses it, so it must be matched
-    explicitly — shrinking the keyboard cannot fix a text problem."""
-    chat_id, poll_id = 12345, "poll_underscore"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 6})
-    before = handlers._learned_markup_budget
-
-    calls = []
-
-    async def fake_edit(**kwargs):
-        calls.append(kwargs)
-        raise Exception("Message_too_long")
-
-    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
-
-    async with db.AsyncSessionLocal() as session:
-        games = list((await session.execute(select(Game))).scalars().all())
-        await render_poll_message(mock_context.bot, chat_id, 999, session, poll_id, games, set())
-
-    assert len(calls) == 1, "must not retry: a smaller keyboard cannot fix a long text"
-    assert handlers._learned_markup_budget == before, "must not poison the learned budget"
-
-
-@pytest.mark.asyncio
-async def test_silently_dropped_buttons_are_logged(mock_context, caplog):
-    """Over 300 buttons (or 12 per row) Telegram returns HTTP 200 and quietly
-    keeps fewer. There is no error to retry on, so the mismatch has to be
-    noticed by comparing what came back with what we sent."""
-    chat_id, poll_id = 12345, "poll_dropped"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 6})
-
-    async def fake_edit(**kwargs):
-        # Echo back a keyboard with one row removed, as the server would.
-        kept = kwargs["reply_markup"].inline_keyboard[:-1]
-        return SimpleNamespace(reply_markup=InlineKeyboardMarkup(kept))
-
-    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
-
-    async with db.AsyncSessionLocal() as session:
-        games = list((await session.execute(select(Game))).scalars().all())
-        with caplog.at_level("WARNING"):
-            await render_poll_message(
-                mock_context.bot, chat_id, 999, session, poll_id, games, set()
-            )
-
-    assert "silently dropped poll buttons" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_full_keyboard_is_not_reported_as_dropped(mock_context, caplog):
-    """The happy path must stay quiet: an echo of exactly what we sent is not a
-    truncation, and neither is a non-Message return value."""
-    chat_id, poll_id = 12345, "poll_intact"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 6})
-
-    async def fake_edit(**kwargs):
-        return SimpleNamespace(reply_markup=kwargs["reply_markup"])
-
-    mock_context.bot.edit_message_text = AsyncMock(side_effect=fake_edit)
-
-    async with db.AsyncSessionLocal() as session:
-        games = list((await session.execute(select(Game))).scalars().all())
-        with caplog.at_level("WARNING"):
-            await render_poll_message(
-                mock_context.bot, chat_id, 999, session, poll_id, games, set()
-            )
-
-    assert "silently dropped" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_separator_tap_does_nothing(mock_update, mock_context):
-    """Complexity separators only label the group beneath them. Telegram has no
-    inert button on this API version, so the tap arrives and must be absorbed
-    without casting a vote or touching the poll."""
-    chat_id, poll_id = 54321, "poll_sep"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=4545)
-
-    mock_update.callback_query.data = "sep:3"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 4545
-    mock_context.bot.edit_message_text = AsyncMock()
-
-    await handlers.poll_separator_callback(mock_update, mock_context)
-
-    async with db.AsyncSessionLocal() as session:
-        votes = (
-            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
-            .scalars()
-            .all()
-        )
-    assert votes == [], "a separator must never record a vote"
-    mock_context.bot.edit_message_text.assert_not_called()
-    mock_update.callback_query.answer.assert_called_once_with()
-
-
-def test_separators_are_emitted_for_every_level():
-    """Every complexity group keeps its separator even when all of its games
-    were cut, so the remaining buttons stay grouped and labelled."""
-    levels_desc = [4, 2]
-    sorted_by_level = {
-        4: [SimpleNamespace(id=i, name=f"H{i}") for i in range(1, 21)],
-        2: [SimpleNamespace(id=i, name=f"L{i}") for i in range(101, 121)],
-    }
-    keyboard, shown, hidden = _build_poll_keyboard(
-        "poll_sep2", levels_desc, sorted_by_level, {}, set(), {}, False, False, 400
-    )
-    markup = InlineKeyboardMarkup(keyboard)
-    assert hidden > 0, "budget must be tight enough to drop a whole level"
-    assert set(_separator_levels_from_markup(markup)) == {4, 2}
-    # Separators are not vote buttons.
-    assert not any(
-        btn.callback_data.startswith(handlers._CB_VOTE)
-        for row in markup.inline_keyboard
-        for btn in row
-        if btn.callback_data.startswith(handlers._CB_SEPARATOR)
-    )
-
-
-def _picker_game_ids(keyboard):
-    return [
-        int(b.callback_data.split(":")[2])
-        for row in keyboard
-        for b in row
-        if b.callback_data.startswith(f"{handlers._CB_PICK}v:")
-    ]
-
-
-def _levelled(counts):
-    """Build (level, games) groups with the given per-level sizes."""
-    gid = iter(range(1000, 100000))
-    return [
-        (level, [SimpleNamespace(id=next(gid), name=f"L{level} Game {i}") for i in range(n)])
-        for level, n in counts
-    ]
-
-
-def test_picker_pages_reach_every_game():
-    """The picker exists so that no game is unreachable: paging through it must
-    cover the whole collection exactly once."""
-    level_groups = _levelled([(5, 25), (4, 33), (3, 27), (2, 15), (1, 20), (0, 31)])
-    all_ids = [g.id for _, games in level_groups for g in games]
-
-    seen: list[int] = []
-    _, _, total_pages = handlers._build_picker_keyboard(level_groups, 0, set(), set(), 42)
-    for page in range(total_pages):
-        keyboard, got_page, _ = handlers._build_picker_keyboard(
-            level_groups, page, set(), set(), 42
-        )
-        assert got_page == page
-        seen.extend(_picker_game_ids(keyboard))
-
-    assert sorted(seen) == sorted(all_ids)
-    assert len(seen) == len(set(seen)), "no game should appear on two pages"
-
-
-def test_picker_page_is_clamped_and_fits_the_edit_limits():
-    """Pages are edited into place, so each must stay under the 100-button and
-    8-per-row limits that editMessageText enforces silently."""
-    level_groups = [
-        (
-            level,
-            [
-                SimpleNamespace(id=level * 1000 + i, name=f"Game Number {i} With A Long Name")
-                for i in range(40)
-            ],
-        )
-        for level in (5, 4, 3, 2)
-    ]
-    _, _, total_pages = handlers._build_picker_keyboard(level_groups, 0, set(), set(), 42)
-
-    for page in range(total_pages):
-        keyboard, got, _ = handlers._build_picker_keyboard(level_groups, page, set(), set(), 42)
-        assert sum(len(r) for r in keyboard) <= handlers._MAX_KEYBOARD_BUTTONS
-        assert max(len(r) for r in keyboard) <= handlers._MAX_BUTTONS_PER_ROW
-        longest = max(len(b.callback_data) for row in keyboard for b in row if b.callback_data)
-        assert longest <= 64, "callback_data has a documented 64-byte limit"
-
-    keyboard, page, total_pages = handlers._build_picker_keyboard(
-        level_groups, 999, set(), set(), 42
-    )
-    assert page == total_pages - 1, "an out-of-range page clamps to the last one"
-
-
-def test_picker_marks_the_users_own_votes():
-    games = [SimpleNamespace(id=1, name="Voted"), SimpleNamespace(id=2, name="Not voted")]
-    keyboard, _, _ = handlers._build_picker_keyboard([(3, games)], 0, {1}, set(), 42)
-    labels = {
-        int(b.callback_data.split(":")[2]): b.text
-        for row in keyboard
-        for b in row
-        if b.callback_data.startswith(f"{handlers._CB_PICK}v:")
-    }
-    assert labels[1].startswith("✅")
-    assert not labels[2].startswith("✅")
-
-
-def test_picker_pages_are_labelled_by_complexity():
-    """Each page carries a separator per group it shows, so a page reads as
-    whole complexity groups rather than an arbitrary alphabetical slice."""
-    keyboard, _, _ = handlers._build_picker_keyboard(
-        _levelled([(4, 3), (2, 3)]), 0, set(), set(), 42
-    )
-    levels = _separator_levels_from_markup(InlineKeyboardMarkup(keyboard))
-    assert levels == [4, 2], "separators appear once per group, highest first"
-
-
-def test_pagination_keeps_whole_groups_together_when_they_fit():
-    pages = handlers._paginate_games_by_category(
-        _levelled([(5, 20), (4, 20), (3, 20)]), page_size=60, min_chunk=8
-    )
-    assert len(pages) == 1
-    assert [level for level, _ in pages[0]] == [5, 4, 3]
-
-
-def test_pagination_moves_a_group_rather_than_stranding_a_sliver():
-    """The case this exists for: a group that would leave one or two games
-    behind on the previous page is moved whole to the next page instead."""
-    # 55 placed, so only 5 slots remain — fewer than min_chunk.
-    pages = handlers._paginate_games_by_category(
-        _levelled([(5, 55), (4, 20)]), page_size=60, min_chunk=8
-    )
-    assert len(pages) == 2
-    assert [level for level, _ in pages[0]] == [5]
-    assert [(level, len(g)) for level, g in pages[1]] == [(4, 20)]
-
-
-def test_pagination_splits_a_group_when_both_halves_are_worth_showing():
-    """Splitting is fine when neither side is a sliver — that keeps page count
-    down instead of leaving half a page empty."""
-    pages = handlers._paginate_games_by_category(
-        _levelled([(5, 30), (4, 40)]), page_size=60, min_chunk=8
-    )
-    assert len(pages) == 2
-    assert [(level, len(g)) for level, g in pages[0]] == [(5, 30), (4, 30)]
-    assert [(level, len(g)) for level, g in pages[1]] == [(4, 10)]
-
-
-def test_pagination_spreads_an_oversized_group_evenly():
-    """A group bigger than a page must be split regardless; the pieces are
-    balanced so the last one isn't a sliver."""
-    pages = handlers._paginate_games_by_category(_levelled([(3, 65)]), page_size=60, min_chunk=8)
-    sizes = [len(g) for page in pages for _, g in page]
-    assert sizes == [33, 32], "65 over two pages, not 60 + 5"
-    assert sum(sizes) == 65
-
-
-def test_pagination_loses_nothing():
-    """Whatever the shape, every game appears exactly once."""
-    level_groups = _levelled([(5, 7), (4, 61), (3, 2), (2, 58), (1, 9), (0, 14)])
-    expected = [g.id for _, games in level_groups for g in games]
-    pages = handlers._paginate_games_by_category(level_groups, page_size=60, min_chunk=8)
-    got = [g.id for page in pages for _, games in page for g in games]
-    assert sorted(got) == sorted(expected)
-    assert len(got) == len(set(got))
-    for page in pages:
-        assert sum(len(games) for _, games in page) <= 60
-
-
-def test_browse_button_appears_only_when_games_are_left_out():
-    """A picker with nothing to reach is just clutter."""
-    small = [SimpleNamespace(id=i, name=f"G{i}") for i in range(1, 6)]
-    keyboard, shown, hidden = _build_poll_keyboard(
-        "poll_small_browse", [3], {3: small}, {}, set(), {}, False, False, 9800
-    )
-    assert hidden == 0
-    assert not any(b.callback_data.startswith(handlers._CB_PICK) for row in keyboard for b in row)
-
-    many = [SimpleNamespace(id=i, name=f"Game Number {i}") for i in range(1, 400)]
-    keyboard, shown, hidden = _build_poll_keyboard(
-        "poll_big_browse", [3], {3: many}, {}, set(), {}, False, False, 9800
-    )
-    assert hidden > 0
-    assert any(b.callback_data.startswith(handlers._CB_PICK) for row in keyboard for b in row)
-
-
-def _ephemeral_params(call):
-    """The ephemeral parameters a send_message call carried, as a dict."""
-    raw = call.kwargs.get("api_kwargs", {}).get("ephemeral_message_parameters")
-    return json.loads(raw) if raw else None
-
-
-@pytest.mark.asyncio
-async def test_picker_is_sent_only_to_the_person_who_opened_it(mock_update, mock_context):
-    """A picker everyone could see filled the group with other people's lists
-    and told them off for tapping the wrong one. It goes out as a Bot API 10.2
-    ephemeral message addressed to one receiver instead."""
-    chat_id, poll_id = 24683, "poll_pick_eph"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
-
-    mock_update.callback_query.data = "pk:p:0:0"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 777
-    mock_update.callback_query.from_user.id = 111
-
-    await handlers.poll_picker_callback(mock_update, mock_context)
-
-    call = mock_context.bot.send_message.call_args
-    params = _ephemeral_params(call)
-    assert params is not None, "the picker must not be sent as an ordinary message"
-    assert params["receiver_user_id"] == 111
-    assert call.kwargs["chat_id"] == chat_id, "ephemeral messages live in the group"
-
-
-@pytest.mark.asyncio
-async def test_opening_never_replaces_the_poll_message(mock_update, mock_context):
-    """replace_callback_query_message puts the new message where the tapped one
-    was. On the first open the tapped message is the *poll*, so replacing would
-    destroy it — that only becomes safe once the picker itself is tapped."""
-    chat_id, poll_id = 24684, "poll_pick_noreplace"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
-
-    mock_update.callback_query.data = "pk:p:0:0"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 777
-    mock_update.callback_query.from_user.id = 111
-
-    await handlers.poll_picker_callback(mock_update, mock_context)
-
-    params = _ephemeral_params(mock_context.bot.send_message.call_args)
-    assert "replace_callback_query_message" not in params
-    assert "callback_query_id" not in params
-
-
-@pytest.mark.asyncio
-async def test_paging_replaces_the_picker_in_place(mock_update, mock_context):
-    """Paging must not stack up a message per tap."""
-    chat_id, poll_id = 24685, "poll_pick_replace"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
-
-    mock_update.callback_query.data = f"pk:p:0:{chat_id}"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 778
-    mock_update.callback_query.from_user.id = 111
-    mock_update.callback_query.id = "cbq-1"
-
-    await handlers.poll_picker_callback(mock_update, mock_context)
-
-    params = _ephemeral_params(mock_context.bot.send_message.call_args)
-    assert params["replace_callback_query_message"] is True
-    assert params["callback_query_id"] == "cbq-1"
-
-
-@pytest.mark.asyncio
-async def test_picker_says_so_when_the_bot_is_not_admin(mock_update, mock_context):
-    """Ephemeral messages need admin rights. Without them the picker must say
-    why rather than falling back to a message the whole group can see."""
-    chat_id, poll_id = 24686, "poll_pick_notadmin"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
-
-    mock_context.bot.send_message = AsyncMock(
-        side_effect=telegram.error.BadRequest("Bot_not_admin")
-    )
-    mock_update.callback_query.data = "pk:p:0:0"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 777
-    mock_update.callback_query.from_user.id = 111
-
-    await handlers.poll_picker_callback(mock_update, mock_context)
-
-    said = " ".join(
-        str(a) for c in mock_update.callback_query.answer.call_args_list for a in c.args
-    )
-    assert "admin" in said.lower()
-
-
-@pytest.mark.asyncio
-async def test_picker_vote_records_and_refreshes_the_shared_poll(mock_update, mock_context):
-    """A vote cast in the picker is a real vote: it lands in the DB and the
-    shared poll's tally is brought up to date."""
-    chat_id, poll_id = 24681, "poll_pick_vote"
-    ids = await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
-
-    mock_update.callback_query.data = f"pk:v:{ids[0]}:0:{chat_id}"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 778
-    mock_update.callback_query.id = "cbq-vote"
-    mock_update.callback_query.from_user.id = 111
-    mock_update.callback_query.from_user.first_name = "Solo"
-    mock_update.callback_query.from_user.last_name = None
-    mock_update.callback_query.from_user.username = None
-    mock_context.bot.edit_message_text = AsyncMock()
-
-    await handlers.poll_picker_callback(mock_update, mock_context)
-
-    async with db.AsyncSessionLocal() as session:
-        votes = (
-            (await session.execute(select(PollVote).where(PollVote.poll_id == poll_id)))
-            .scalars()
-            .all()
-        )
-    assert [v.game_id for v in votes] == [ids[0]]
-    # The picker is re-sent ephemerally so the new tick shows.
-    assert _ephemeral_params(mock_context.bot.send_message.call_args) is not None
-
-
-@pytest.mark.asyncio
-async def test_picker_opens_in_its_own_message(mock_update, mock_context):
-    """The poll's browse button carries owner 0, meaning "whoever tapped owns
-    it" — that opens a fresh picker rather than editing the poll."""
-    chat_id, poll_id = 24682, "poll_pick_open"
-    await _seed_poll_with_levels(chat_id, poll_id, {3.0: 3}, message_id=777)
-
-    mock_update.callback_query.data = "pk:p:0:0"
-    mock_update.callback_query.message.chat.id = chat_id
-    mock_update.callback_query.message.message_id = 777
-    mock_update.callback_query.from_user.id = 111
-
-    await handlers.poll_picker_callback(mock_update, mock_context)
-
-    mock_context.bot.send_message.assert_called_once()
-    kwargs = mock_context.bot.send_message.call_args.kwargs
-    assert kwargs["chat_id"] == chat_id
-    assert "All games" in kwargs["text"]
-    # The poll message must not be touched by opening a picker.
-    mock_update.callback_query.edit_message_text.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_picker_page_indicator_is_inert(mock_update, mock_context):
-    mock_update.callback_query.data = "pk:n"
-    mock_update.callback_query.from_user.id = 111
-
-    await handlers.poll_picker_callback(mock_update, mock_context)
-
-    mock_update.callback_query.answer.assert_called_once_with()
-    mock_update.callback_query.edit_message_text.assert_not_called()
-
-
-def test_pagination_never_places_one_level_twice_on_a_page():
-    """A level appearing twice on a page renders two identical separators and
-    undoes the even spread. It happened when a balanced chunk was placed and the
-    remainder then flowed back onto the same page."""
-    # 100 games in one level, 60 to a page: the chunk is 50, leaving 50 with 10
-    # slots still free on that page — the shape that used to refill it.
-    pages = handlers._paginate_games_by_category(_levelled([(1, 100)]), page_size=60, min_chunk=8)
-    for page in pages:
-        levels = [level for level, _ in page]
-        assert len(levels) == len(set(levels)), f"level repeated on one page: {levels}"
-    assert [sum(len(g) for _, g in page) for page in pages] == [50, 50]
-
-
-def test_pagination_balanced_chunks_stay_balanced():
-    """The even spread must survive: a group over a page gets equal pieces, not
-    a full page followed by a remainder."""
-    for total, page_size, expected in [
-        (65, 60, [33, 32]),
-        (100, 60, [50, 50]),
-        (130, 60, [44, 43, 43]),  # rebalanced per remainder, not a fixed chunk
-    ]:
-        pages = handlers._paginate_games_by_category(
-            _levelled([(3, total)]), page_size=page_size, min_chunk=8
-        )
-        sizes = [sum(len(g) for _, g in page) for page in pages]
-        assert sizes == expected, f"{total} over {page_size}: {sizes}"
-        assert sum(sizes) == total

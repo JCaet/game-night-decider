@@ -81,13 +81,6 @@ class GameState:
     EXCLUDED = 2  # ❌ Excluded from polls
 
 
-class PollType:
-    """Poll types for the session."""
-
-    CUSTOM = 0  # Single interactive message with buttons
-    NATIVE = 1  # Standard Telegram polls (split if >12 games)
-
-
 class VoteLimit:
     """Vote limit options for polls."""
 
@@ -128,7 +121,6 @@ class Session(Base):
     chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     settings_weighted: Mapped[bool] = mapped_column(Boolean, default=True)
-    poll_type: Mapped[int] = mapped_column(Integer, default=PollType.CUSTOM)
     message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     hide_voters: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -167,9 +159,13 @@ class GameNightPoll(Base):
     chat_id: Mapped[int] = mapped_column(ForeignKey("sessions.chat_id"))
     message_id: Mapped[int] = mapped_column(Integer)
 
-    # Seed for deterministic shuffle across re-renders of a custom poll.
-    # NULL on legacy rows / native polls (Telegram handles shuffle server-side).
+    # Seed for deterministic shuffle across re-renders of a poll.
+    # NULL on rows created before the column existed.
     shuffle_seed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Group name shown on ballots, captured when the poll starts: a ballot is
+    # rebuilt from a private chat, where the group's title is not at hand.
+    chat_title: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Relationships
     votes: Mapped[list["PollVote"]] = relationship(
@@ -178,6 +174,30 @@ class GameNightPoll(Base):
     added_games: Mapped[list["PollAddedGame"]] = relationship(
         back_populates="poll", cascade="all, delete-orphan"
     )
+    ballots: Mapped[list["PollBallot"]] = relationship(
+        back_populates="poll", cascade="all, delete-orphan"
+    )
+
+
+class PollBallot(Base):
+    """A voter's ballot widget for a poll, living in their private chat with the bot.
+
+    A widget's HTML cannot be edited once sent, so catalog_hash records which
+    game list this message was built from; when the poll's list moves on, the
+    ballot is replaced rather than updated.
+    """
+
+    __tablename__ = "poll_ballots"
+    __table_args__ = (UniqueConstraint("poll_id", "user_id", name="uq_poll_ballot_user"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    poll_id: Mapped[str] = mapped_column(ForeignKey("game_night_polls.poll_id"), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    message_id: Mapped[int] = mapped_column(Integer)
+    catalog_hash: Mapped[str] = mapped_column(String)
+
+    # Relationships
+    poll: Mapped["GameNightPoll"] = relationship(back_populates="ballots")
 
 
 class PollAddedGame(Base):

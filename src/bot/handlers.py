@@ -1,5 +1,5 @@
 import contextlib
-import json
+import functools
 import logging
 import math
 import random
@@ -9,21 +9,28 @@ from collections.abc import Sequence
 from typing import cast
 
 import telegram
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ChatType
 from telegram.ext import ContextTypes
 
+from src.bot.widgets import (
+    Ballot,
+    WidgetTooLarge,
+    answer_widget_query,
+    build_ballot,
+    build_ballot_state,
+    closed_ballot_state,
+    edit_widget_data,
+    send_ballot,
+    widget_query_of,
+)
 from src.core import db
 from src.core.bgg import BGGClient
-from src.core.logic import (
-    STAR_BOOST,
-    group_games_by_complexity,
-    player_count_blocked,
-    split_games,
-)
+from src.core.logic import group_games_by_complexity, player_count_blocked
 from src.core.models import (
     Collection,
     Expansion,
@@ -31,7 +38,7 @@ from src.core.models import (
     GameNightPoll,
     GameState,
     PollAddedGame,
-    PollType,
+    PollBallot,
     PollVote,
     Session,
     SessionPlayer,
@@ -157,10 +164,10 @@ def disambiguate_voter_names(votes: list) -> dict[int, str]:
     return _disambiguate(entries)
 
 
-# Inline-keyboard button label layout for the custom poll's vote keyboard
-# and the "Add a game" picker. Telegram clients render '\n' inside button text
-# as a soft line break, so a long game name can span multiple visual rows
-# inside a single button rather than being truncated to '…'.
+# Inline-keyboard button label layout for the "Add a game" picker. Telegram
+# clients render '\n' inside button text as a soft line break, so a long game
+# name can span multiple visual rows inside a single button rather than being
+# truncated to '…'.
 _BUTTON_LINE_WIDTH = 18
 _BUTTON_MAX_LINES = 3
 # Names longer than this trigger a one-button-per-row layout for that group,
@@ -168,252 +175,28 @@ _BUTTON_MAX_LINES = 3
 # to wrap or fall back to the ellipsis placeholder.
 _BUTTON_LONG_THRESHOLD = 18
 
-# Callback-data prefixes for the two button kinds that repeat once per game /
-# per category in the poll keyboard. These omit the poll id (~30 bytes of a
-# ~90-byte button): the poll is identified by the message the button lives on,
-# so the handlers resolve it from (chat_id, message_id) instead. On a 151-game
-# poll that frees several KB of the reply_markup budget for real game buttons.
-# The long "vote:<poll_id>:<game_id>" / "poll_random_vote:<poll_id>:<level>"
-# forms are still accepted so keyboards already sent to chats keep working.
-_CB_VOTE = "v:"
-_CB_CATEGORY = "c:"
-
-# Complexity headers are separators, not controls: they label the group of game
-# buttons under them and do nothing when tapped. Telegram has no truly inert
-# button on this API version -- one with neither callback_data nor url is
-# rejected ("text buttons are not allowed in the inline keyboard") -- so they
-# carry a callback that is answered and discarded.
-#
-# Bot API 10.3 added a real `disabled` field, and it was verified to work
-# server-side, but python-telegram-bot 22.x has no support for it: using it
-# means hand-building the whole reply_markup as raw JSON through api_kwargs,
-# and how older clients render it is unknown. Swap to it once PTB ships
-# Bot API 10.3 and this prefix can go away.
-_CB_SEPARATOR = "sep:"
-
-# Per-user "browse all games" picker.
-#
-# Telegram allows 100 buttons on an edited message, so a collection bigger than
-# ~91 games cannot be shown in the poll at all. The picker covers the remainder
-# by paging through every game in its own message.
-#
-# The page lives in callback_data rather than in the poll row, which is what
-# makes this safe: paginating the shared poll keyboard moved everyone's page at
-# once (#90, reverted in #92) because the poll is a single shared message.
-#
-# Each picker is delivered as a Bot API 10.2 ephemeral message, visible to the
-# one person who opened it. A first attempt posted it as an ordinary group
-# message guarded by an owner check; in a real game night that filled the chat
-# with everyone's pickers and told people off for tapping the wrong one.
-# Ephemeral messages remove both problems at the source — nobody else sees a
-# picker, so nobody else can tap it. The bot must be a group admin to send
-# them; without that the picker says so rather than appearing publicly.
-#
-# Callback forms (all well inside the 64-byte limit). The trailing value is
-# the group's chat id, so a handler reached from an ephemeral message never has
-# to assume how such a message reports its own chat; the poll's entry button
-# carries 0, meaning "read it from the message this was tapped on".
-#   pk:p:<page>:<chat>            turn to a page
-#   pk:v:<game_id>:<page>:<chat>  toggle a vote, stay on the page
-#   pk:x:<chat>                   dismiss
-#   pk:n                          page indicator, inert
-_CB_PICK = "pk:"
-
-# Games per picker page, and the smallest slice of a complexity group worth
-# leaving on a page. Pages break on complexity boundaries where that is
-# reasonable, so a page reads as whole groups rather than an arbitrary cut;
-# _paginate_games_by_category explains how the two interact. 60 games costs
-# ~70 buttons and ~6.5KB once separators and navigation are added, comfortably
-# inside the 100-button edit limit.
-_POLL_PICKER_PAGE_SIZE = 60
-_POLL_PICKER_MIN_CHUNK = 8
-
-# Telegram's keyboard limits are undocumented apart from callback_data, so they
-# were measured against the live API (scripts/probe_telegram_keyboard_limits.py).
-# They differ by METHOD, which is the detail that matters here:
-#
-#                     sendMessage      editMessageText
-#   total buttons     300              100     <- silently truncated, HTTP 200
-#   buttons per row   12               8       <- silently truncated, HTTP 200
-#
-#   message text      4096 chars       -> error "Message_too_long"
-#   callback_data     1-64 bytes       (the only documented limit)
-#   reply_markup size >= 12,000 bytes accepted on the edit path; not crisp and
-#                     never the binding constraint once the count cap applies
-#
-# The poll sends a keyboard-less placeholder and then *edits* it on every
-# render, so the stricter edit limits are the only ones that ever apply: 100
-# buttons and 8 per row. Over them Telegram returns success and quietly drops
-# the excess, so nothing raises and the message would claim more games than it
-# shows -- the count has to be enforced here instead.
-_RENDER_MAX_ATTEMPTS = 4
-
-# Total buttons the keyboard may contain, controls included: the action row
-# (2-3) and one header per complexity level (up to 6) are reserved first, so
-# roughly 91 game buttons remain. A game list longer than that cannot fit in a
-# single message at all, which is why the message says how many it is showing.
-_MAX_KEYBOARD_BUTTONS = 100
-_MAX_BUTTONS_PER_ROW = 8
-
-# Secondary guard. With the count capped at 100 the keyboard runs ~6KB, well
-# under any size Telegram rejected, so this almost never binds -- it stays as a
-# backstop for unusually long game names and keeps the retry path meaningful.
-_REPLY_MARKUP_BUDGET_BYTES = 9800
-
 # Telegram rejects a message over this many characters with "Message_too_long",
-# which fails the whole edit -- keyboard included -- and freezes the poll. The
-# tally grows with every voted game, so it is clamped before sending.
+# which fails the whole edit and freezes the poll. The tally grows with every
+# voted game, so it is clamped before sending.
 _MESSAGE_TEXT_LIMIT = 4096
 
-# Smallest budget a rejection may ratchet us down to; below this the keyboard is
-# too sparse to be useful and the real problem is something other than size.
-_REPLY_MARKUP_MIN_BUDGET_BYTES = 2000
+# Start parameter of the deep link behind a poll's Vote button: /start b_<poll_id>
+_BALLOT_START_PREFIX = "b_"
 
-# _button_bytes prices a button but not the "[...]," wrapping its row, and the
-# row layout isn't known until assembly, so a flat allowance is reserved up
-# front. Measured: a 156-row/158-button keyboard needs 175 bytes beyond the sum
-# of _button_bytes, i.e. ~1.1 bytes per row — the "+2" each button already
-# carries covers most of it. 300 is roughly double the measured need, which is
-# margin enough without costing games. Capped at a tenth of the budget so the
-# tiny budgets used in tests aren't swallowed whole.
-_MARKUP_ROW_HEADROOM_BYTES = 300
-
-# Best-effort, per-process memory of the largest reply_markup Telegram accepted.
-# Cloud Run instances are ephemeral and there may be several, so this is a cache
-# that saves a wasted API call within an instance's life, not durable state.
-_learned_markup_budget = _REPLY_MARKUP_BUDGET_BYTES
+# Name lengths tried in turn when a ballot's HTML is over Telegram's size limit.
+_BALLOT_NAME_LIMITS = (None, 24, 16)
 
 
-def _button_bytes(button: InlineKeyboardButton) -> int:
-    """Approximate the serialized byte cost of one inline-keyboard button.
-
-    Counts UTF-8 bytes of the compact JSON (emoji/non-ASCII counted at their
-    real byte size) plus a couple of bytes for surrounding array punctuation.
-    Used to budget the keyboard; the retry in render_poll_message covers any
-    slack between this estimate and Telegram's actual accounting.
-    """
-    payload = json.dumps(button.to_dict(), ensure_ascii=False, separators=(",", ":"))
-    return len(payload.encode("utf-8")) + 2
-
-
-def _build_poll_keyboard(
-    poll_id: str,
-    levels_desc: list[int],
-    sorted_by_level: dict[int, list],
-    vote_counts: dict[int, int],
-    priority_ids: set[int],
-    category_vote_counts: dict[int, int],
-    hide_results: bool,
-    allow_adding: bool,
-    budget_bytes: int,
-) -> tuple[list[list[InlineKeyboardButton]], int, int]:
-    """Build the custom-poll keyboard within a serialized-size budget.
-
-    Returns (keyboard, shown_games, hidden_games). A category-vote header is
-    emitted for every complexity level (so dropped games stay votable) and the
-    action row is always included.
-
-    Game buttons are *selected* in relevance order — starred first, then by vote
-    count, then by complexity — until the next would exceed ``budget_bytes``, so
-    the games left without a button are the ones nobody has singled out. They are
-    still *displayed* grouped under their complexity header in the per-level
-    order the caller supplied, which keeps the shuffle setting meaningful.
-    """
-
-    def _game_button(g) -> InlineKeyboardButton:
-        count = vote_counts.get(g.id, 0)
-        prefix = "⭐ " if g.id in priority_ids else ""
-        suffix = f" ({count})" if count > 0 and not hide_results else ""
-        label = _wrap_button_label(prefix, g.name, suffix)
-        return InlineKeyboardButton(label, callback_data=f"{_CB_VOTE}{g.id}")
-
-    # Action row is fixed; reserve its cost up front. The browse button is
-    # reserved unconditionally even though it is only emitted when games had to
-    # be left out — whether that happens isn't known until selection is done,
-    # and over-reserving one button is cheaper than a second pass.
-    browse_button = InlineKeyboardButton("🔍 All games", callback_data=f"{_CB_PICK}p:0:0")
-    action_row = [
+def _build_poll_keyboard(bot, poll_id: str, allow_adding: bool) -> list[list[InlineKeyboardButton]]:
+    """The poll message's controls. Voting itself happens on each player's ballot."""
+    actions = [
         InlineKeyboardButton("🔄 Refresh", callback_data=f"poll_refresh:{poll_id}"),
         InlineKeyboardButton("🛑 Close", callback_data=f"poll_close:{poll_id}"),
     ]
     if allow_adding:
-        action_row.insert(1, InlineKeyboardButton("➕ Add", callback_data=f"poll_add:{poll_id}"))
-    reserved_action_row = [*action_row, browse_button]
-
-    headroom = min(_MARKUP_ROW_HEADROOM_BYTES, budget_bytes // 10)
-    used = headroom + sum(_button_bytes(b) for b in reserved_action_row)
-
-    # Reserve one separator per level (cheap, ≤6) so every group stays labelled
-    # even when all of its games were cut. A count only appears for a poll that
-    # still carries category votes cast before they were retired.
-    headers: dict[int, InlineKeyboardButton] = {}
-    for level in levels_desc:
-        cat_count = category_vote_counts.get(level, 0)
-        show_count = cat_count > 0 and not hide_results
-        level_name = level if level > 0 else "Unrated"
-        header_text = (
-            f"--- {level_name} ---" if not show_count else f"--- {level_name} ({cat_count}) ---"
-        )
-        header = InlineKeyboardButton(header_text, callback_data=f"{_CB_SEPARATOR}{level}")
-        headers[level] = header
-        used += _button_bytes(header)
-
-    # Rank every game globally so the budget is spent on the games people have
-    # actually singled out. Position within its own level is the last tiebreak,
-    # which preserves the caller's shuffle for games that are otherwise equal.
-    ranked = [
-        (-int(g.id in priority_ids), -vote_counts.get(g.id, 0), -level, index, g)
-        for level in levels_desc
-        for index, g in enumerate(sorted_by_level[level])
-    ]
-    ranked.sort(key=lambda entry: entry[:4])
-
-    # Fill in relevance order, stopping at the first game that doesn't fit
-    # either budget. The button count matters as much as the bytes: past the
-    # server's limit Telegram drops buttons silently, so a keyboard that
-    # overshoots would show fewer games than the message claims.
-    selected: set[int] = set()
-    total = len(ranked)
-    buttons_used = len(reserved_action_row) + len(headers)
-    for *_, g in ranked:
-        cost = _button_bytes(_game_button(g))
-        if used + cost > budget_bytes or buttons_used >= _MAX_KEYBOARD_BUTTONS:
-            break
-        used += cost
-        buttons_used += 1
-        selected.add(g.id)
-
-    shown_by_level: dict[int, list] = {
-        level: [g for g in sorted_by_level[level] if g.id in selected] for level in levels_desc
-    }
-    shown = len(selected)
-
-    # Assemble the keyboard: header + this level's shown buttons, per level.
-    keyboard: list[list[InlineKeyboardButton]] = []
-    for level in levels_desc:
-        keyboard.append([headers[level]])
-        games = shown_by_level[level]
-        if not games:
-            continue
-        # One button per row when any name is long (more room to wrap), else two.
-        # Clamped to the per-row limit, over which Telegram silently drops the
-        # extra buttons in the row rather than complaining.
-        columns = 1 if any(len(g.name) > _BUTTON_LONG_THRESHOLD for g in games) else 2
-        columns = min(columns, _MAX_BUTTONS_PER_ROW)
-        current_row: list[InlineKeyboardButton] = []
-        for g in games:
-            current_row.append(_game_button(g))
-            if len(current_row) == columns:
-                keyboard.append(current_row)
-                current_row = []
-        if current_row:
-            keyboard.append(current_row)
-
-    # Only offer the picker when there is something it can reach.
-    if total - shown > 0:
-        action_row = [*action_row, browse_button]
-    keyboard.append(action_row)
-    return keyboard, shown, total - shown
+        actions.append(InlineKeyboardButton("➕ Add", callback_data=f"poll_add:{poll_id}"))
+    vote_url = f"https://t.me/{bot.username}?start={_BALLOT_START_PREFIX}{poll_id}"
+    return [[InlineKeyboardButton("🗳 Vote", url=vote_url)], actions]
 
 
 def _wrap_button_label(prefix: str, name: str, suffix: str) -> str:
@@ -435,35 +218,6 @@ def _wrap_button_label(prefix: str, name: str, suffix: str) -> str:
     lines[0] = f"{prefix}{lines[0]}"
     lines[-1] = f"{lines[-1]}{suffix}"
     return "\n".join(lines)
-
-
-def _warn_if_buttons_dropped(poll_id: str, keyboard: list[list], sent) -> None:
-    """Log if Telegram stored fewer buttons than we sent.
-
-    Over 300 buttons, or 12 in one row, Telegram returns HTTP 200 and quietly
-    drops the excess — no error to retry on. The poll would then claim to show
-    more games than it does, and the votes for the missing ones would be
-    unreachable, so the discrepancy has to be noticed here or not at all.
-    """
-    # edit_message_text returns True (not a Message) for inline messages, and a
-    # test double can return anything at all — only a real row sequence is a
-    # trustworthy signal, so anything else is left alone rather than guessed at.
-    reply_markup = getattr(sent, "reply_markup", None)
-    rows = getattr(reply_markup, "inline_keyboard", None)
-    if not isinstance(rows, (list, tuple)):
-        return
-    want = sum(len(row) for row in keyboard)
-    got = sum(len(row) for row in rows)
-    if got < want:
-        logger.warning(
-            "Telegram silently dropped poll buttons: poll=%s sent=%d kept=%d "
-            "rows=%d widest_row=%d — keyboard exceeded a server limit",
-            poll_id,
-            want,
-            got,
-            len(keyboard),
-            max((len(row) for row in keyboard), default=0),
-        )
 
 
 def _clamp_message_text(lines: list[str], limit: int = _MESSAGE_TEXT_LIMIT) -> str:
@@ -519,8 +273,66 @@ def build_player_names(players: Sequence[SessionPlayer]) -> list[str]:
     return names
 
 
+def _refreshes_polls(handler):
+    """Re-render running polls after a handler that can change a collection.
+
+    A poll's game list is derived from its players' collections, and each
+    ballot has that list baked into its HTML. Without this a change would sit
+    unseen until the next vote or manual refresh.
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        result = await handler(update, context)
+        try:
+            await _refresh_affected_polls(update, context)
+        except Exception as e:
+            logger.warning(f"Failed to refresh polls after a collection change: {e}")
+        return result
+
+    return wrapper
+
+
+async def _refresh_affected_polls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Schedule a render for every poll the acting user or chat is part of."""
+    conditions = []
+    if update.effective_chat is not None:
+        # Covers guests, whose games are added on their behalf from the group.
+        conditions.append(GameNightPoll.chat_id == update.effective_chat.id)
+    if update.effective_user is not None:
+        conditions.append(
+            GameNightPoll.chat_id.in_(
+                select(SessionPlayer.session_id).where(
+                    SessionPlayer.user_id == update.effective_user.id
+                )
+            )
+        )
+    if not conditions:
+        return
+    async with db.AsyncSessionLocal() as session:
+        polls = (
+            (await session.execute(select(GameNightPoll).where(or_(*conditions)))).scalars().all()
+        )
+        for poll in polls:
+            if _schedule_poll_render(context, poll.chat_id, poll.message_id, poll.poll_id):
+                continue
+            valid_games, priority_ids = await get_session_valid_games(session, poll.chat_id)
+            await render_poll_message(
+                context.bot,
+                poll.chat_id,
+                poll.message_id,
+                session,
+                poll.poll_id,
+                valid_games,
+                priority_ids,
+            )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message."""
+    """Welcome message, or a voter's ballot when reached from a poll's Vote button."""
+    if context.args and context.args[0].startswith(_BALLOT_START_PREFIX):
+        await _open_ballot(update, context, context.args[0][len(_BALLOT_START_PREFIX) :])
+        return
 
     # Try to send photo if it exists, otherwise fall back to text
     import os
@@ -564,7 +376,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /guestgame `<name> <game>` - Add game to guest's list\n"
         "• /cancel - Cancel the current game night\n\n"
         "**Poll Settings** (via ⚙️ Settings in lobby):\n"
-        "• **Mode**: Custom (buttons) or Native (Telegram polls)\n"
         "• **Weights**: Starred games get +0.5 vote boost\n"
         "• **Anonymous**: Hide voter names in results\n"
         "• **Vote Limit**: Auto / 3 / 5 / 7 / 10 / Unlimited\n"
@@ -579,6 +390,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
+@_refreshes_polls
 async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Link BGG username."""
     if not context.args:
@@ -926,23 +738,22 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _close_existing_polls(session, context, chat_id, reason="Poll Closed"):
-    """Close all active polls for a chat: edit/stop messages and delete DB records."""
+    """Close all active polls for a chat: edit their messages and delete DB records."""
     existing_polls_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
     existing_polls = (await session.execute(existing_polls_stmt)).scalars().all()
 
     for p in existing_polls:
-        try:
-            await context.bot.stop_poll(chat_id, p.message_id)
-        except Exception:
-            with contextlib.suppress(Exception):
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=p.message_id,
-                    text=f"🛑 **{reason}**",
-                    parse_mode="Markdown",
-                    reply_markup=None,
-                )
+        with contextlib.suppress(Exception):
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=p.message_id,
+                text=f"🛑 **{reason}**",
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
         await _try_unpin_message(context.bot, chat_id, p.message_id)
+        # Before the delete: the ballot rows go with the poll.
+        await _retire_ballots(context.bot, session, p.poll_id, reason)
         await session.delete(p)
 
 
@@ -1095,27 +906,25 @@ async def _prune_stale_votes(session, context, chat_id):
 
 
 async def _auto_refresh_poll(session, context, chat_id):
-    """Refresh the custom poll UI if one is active."""
+    """Refresh the poll message if a poll is active."""
     active_poll_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
     active_poll = (await session.execute(active_poll_stmt)).scalars().first()
     if not active_poll:
         return
 
-    session_obj = await session.get(Session, chat_id)
-    if session_obj and session_obj.poll_type == PollType.CUSTOM:
-        try:
-            valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-            await render_poll_message(
-                context.bot,
-                chat_id,
-                active_poll.message_id,
-                session,
-                active_poll.poll_id,
-                valid_games,
-                priority_ids,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to auto-refresh poll: {e}")
+    try:
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        await render_poll_message(
+            context.bot,
+            chat_id,
+            active_poll.message_id,
+            session,
+            active_poll.poll_id,
+            valid_games,
+            priority_ids,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to auto-refresh poll: {e}")
 
 
 async def join_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1318,7 +1127,7 @@ async def leave_lobby_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate polls based on lobby."""
+    """Start a poll for the lobby."""
     chat_id = update.effective_chat.id
 
     with contextlib.suppress(Exception):
@@ -1336,6 +1145,12 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(players) < 2:
             await update.message.reply_text("Need at least 2 players to start a poll!")
             return
+
+        # A chat has one poll at a time, however it was started.
+        await _close_existing_polls(
+            session, context, chat_id, reason="Poll Closed (New poll started)"
+        )
+        await session.commit()
 
         player_count = len(players)
         player_ids = [p.user_id for p in players]
@@ -1394,72 +1209,11 @@ async def create_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Check Poll Mode
     async with db.AsyncSessionLocal() as session:
-        session_obj = await session.get(Session, chat_id)
-    if session_obj and session_obj.poll_type == PollType.CUSTOM:
-        async with db.AsyncSessionLocal() as session:
-            await create_custom_poll(update, context, session, list(valid_games), priority_game_ids)
-        return
-
-    # Build poll description with context metadata
-    poll_description = _build_poll_description(player_count, len(valid_games), session_obj)
-
-    # Filter/Sort
-    chunks = split_games(list(valid_games))
-
-    for label, games_chunk in chunks:
-        options = []
-        for g in games_chunk:
-            # formatting - add ⭐ for priority games
-            name = g.name
-            if g.id in priority_game_ids:
-                name = f"⭐ {name}"
-            options.append(name)
-
-        # Telegram Poll requires at least 2 options
-        if len(options) < 2:
-            # Send as message instead of poll
-            if len(options) == 1:
-                await context.bot.send_message(
-                    chat_id=chat_id, text=f"📋 {label}: {options[0]} (only 1 game - no poll needed)"
-                )
-            continue
-
-        message = await context.bot.send_poll(
-            chat_id=chat_id,
-            question=f"Vote: {label}",
-            options=options,
-            is_anonymous=False,
-            allows_multiple_answers=True,
-            allows_revoting=True,
-            shuffle_options=session_obj.shuffle_options,
-            hide_results_until_closes=session_obj.hide_results,
-            allow_adding_options=session_obj.allow_adding_options,
-            description=poll_description,
-        )
-
-        # Save poll to DB
-        async with db.AsyncSessionLocal() as session:
-            poll = GameNightPoll(
-                poll_id=message.poll.id, chat_id=chat_id, message_id=message.message_id
-            )
-            session.add(poll)
-            await session.commit()
-
-        # Pin poll message for visibility
-        pinned = await _try_pin_message(context.bot, chat_id, message.message_id)
-        if not pinned:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "💡 *Tip:* Promote this bot to admin with"
-                    " 'Pin Messages' permission to auto-pin polls."
-                ),
-                parse_mode="Markdown",
-            )
+        await create_custom_poll(update, context, session, list(valid_games), priority_game_ids)
 
 
+@_refreshes_polls
 async def add_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a game to collection. Searches BGG when only name is provided."""
     if not context.args:
@@ -1826,6 +1580,7 @@ async def add_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@_refreshes_polls
 async def guest_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a game to a guest's collection."""
     if len(context.args) < 2:
@@ -2218,71 +1973,8 @@ async def start_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # Check Poll Mode
-    session_obj = await session.get(Session, chat_id)
-    if session_obj and session_obj.poll_type == PollType.CUSTOM:
+    async with db.AsyncSessionLocal() as session:
         await create_custom_poll(update, context, session, list(valid_games), priority_game_ids)
-        return
-
-    # Build poll description with context metadata
-    poll_description = _build_poll_description(player_count, len(valid_games), session_obj)
-
-    # Filter/Sort
-    chunks = split_games(list(valid_games))
-
-    for label, games_chunk in chunks:
-        options = []
-        for g in games_chunk:
-            name = g.name
-            if g.id in priority_game_ids:
-                name = f"⭐ {name}"
-            options.append(name)
-
-        # Telegram Poll requires at least 2 options
-        if len(options) < 2:
-            # Send as message instead of poll
-            if len(options) == 1:
-                await context.bot.send_message(
-                    chat_id=chat_id, text=f"📋 {label}: {options[0]} (only 1 game - no poll needed)"
-                )
-            continue
-
-        # Telegram Poll max 12 options (API 9.1+)
-        if len(options) > 12:
-            options = options[:12]
-
-        message = await context.bot.send_poll(
-            chat_id=chat_id,
-            question=f"Vote: {label}",
-            options=options,
-            is_anonymous=False,
-            allows_multiple_answers=True,
-            allows_revoting=True,
-            shuffle_options=session_obj.shuffle_options,
-            hide_results_until_closes=session_obj.hide_results,
-            allow_adding_options=session_obj.allow_adding_options,
-            description=poll_description,
-        )
-
-        # Save poll to DB
-        async with db.AsyncSessionLocal() as session:
-            poll = GameNightPoll(
-                poll_id=message.poll.id, chat_id=chat_id, message_id=message.message_id
-            )
-            session.add(poll)
-            await session.commit()
-
-        # Pin poll message for visibility
-        pinned = await _try_pin_message(context.bot, chat_id, message.message_id)
-        if not pinned:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "💡 *Tip:* Promote this bot to admin with"
-                    " 'Pin Messages' permission to auto-pin polls."
-                ),
-                parse_mode="Markdown",
-            )
 
 
 async def cancel_night_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2337,6 +2029,11 @@ async def cancel_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Close any active polls
+        await _close_existing_polls(
+            session, context, chat_id, reason="Poll Closed (Game Night Cancelled)"
+        )
+
         # Clear players
         await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
 
@@ -2351,192 +2048,6 @@ async def cancel_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎲 **Game Night Cancelled.**\n\nUse /gamenight to start a new one!",
         parse_mode="Markdown",
     )
-
-
-async def receive_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle poll answers to track votes and auto-close."""
-    answer = update.poll_answer
-    poll_id = answer.poll_id
-    user_id = answer.user.id
-    user_name = answer.user.first_name
-    user_last_name = answer.user.last_name
-    user_tg_username = answer.user.username
-
-    # Store vote
-    async with db.AsyncSessionLocal() as session:
-        # Check if poll exists in our DB
-        stmt = select(GameNightPoll).where(GameNightPoll.poll_id == poll_id)
-        game_poll = (await session.execute(stmt)).scalar_one_or_none()
-
-        if not game_poll:
-            return  # Not a poll we care about
-
-        chat_id = game_poll.chat_id
-
-        # Get session for weighted settings
-        session_obj = await session.get(Session, chat_id)
-        is_weighted = session_obj.settings_weighted if session_obj else False
-
-        # Update Vote Record
-        # If user retracted vote (empty option_ids), remove them
-        if not answer.option_ids:
-            await session.execute(
-                delete(PollVote).where(PollVote.poll_id == poll_id, PollVote.user_id == user_id)
-            )
-        else:
-            # Upsert vote record (just to track *that* they voted)
-            # Check exist
-            vote_stmt = select(PollVote).where(
-                PollVote.poll_id == poll_id, PollVote.user_id == user_id
-            )
-            vote = (await session.execute(vote_stmt)).scalar_one_or_none()
-
-            if not vote:
-                vote = PollVote(
-                    poll_id=poll_id,
-                    user_id=user_id,
-                    user_name=user_name,
-                    user_last_name=user_last_name,
-                    user_tg_username=user_tg_username,
-                    vote_type=VoteType.GAME,
-                )
-                session.add(vote)
-
-        await session.commit()
-
-        # Check for Auto-Close condition
-        # 1. Get total voters for this poll
-        voters_count = await session.scalar(
-            select(func.count(PollVote.user_id)).where(PollVote.poll_id == poll_id)
-        )
-
-        # 2. Get total players in session
-        players_count = await session.scalar(
-            select(func.count(SessionPlayer.user_id)).where(SessionPlayer.session_id == chat_id)
-        )
-        # Note: If players_count is 0 (session ended?), we should probably stop.
-        if players_count == 0:
-            return
-
-        # If all players voted
-        if voters_count >= players_count:
-            # Close the poll!
-            try:
-                poll_data = await context.bot.stop_poll(
-                    chat_id=chat_id, message_id=game_poll.message_id
-                )
-
-                # Calculate Winner using extensible helper
-                scores, modifiers_applied = await calculate_winner_scores(
-                    poll_data, chat_id, session, is_weighted
-                )
-
-                # Find max score
-                if not scores:
-                    winners = []
-                else:
-                    max_score = max(scores.values())
-                    if max_score > 0:
-                        winners = [name for name, s in scores.items() if s == max_score]
-                    else:
-                        winners = []
-
-                if winners:
-                    if len(winners) == 1:
-                        text = f"🗳️ **Poll Closed!**\n\n🏆 The winner is: **{winners[0]}**! 🎉"
-                    else:
-                        text = "🗳️ **Poll Closed!**\n\nIt's a tie between:\n" + "\n".join(
-                            [f"• {w}" for w in winners]
-                        )
-
-                    if modifiers_applied:
-                        text += f"\n_{modifiers_applied}_"
-                else:
-                    text = "🗳️ **Poll Closed!**\n\nNo votes cast?"
-
-                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-
-                # Unpin the poll message
-                await _try_unpin_message(context.bot, chat_id, game_poll.message_id)
-
-                # End the game night session
-                session_obj = await session.get(Session, chat_id)
-                if session_obj:
-                    await session.execute(
-                        delete(SessionPlayer).where(SessionPlayer.session_id == chat_id)
-                    )
-                    await session.execute(delete(User).where(User.is_guest.is_(True)))
-                    session_obj.is_active = False
-                    await session.commit()
-
-            except Exception as e:
-                logger.error(f"Failed to auto-close poll: {e}")
-
-
-async def calculate_winner_scores(poll_data, chat_id: int, session, is_weighted: bool):
-    """
-    Calculate scores for each game option, applying modifiers.
-
-    Returns:
-        tuple: (scores_dict, modifiers_summary_string)
-            - scores_dict: {game_name: final_score}
-            - modifiers_summary_string: Human-readable string of applied modifiers (or empty)
-
-    This function is designed for extensibility. Add new modifiers here.
-    """
-    scores = {}
-    modifiers_info = []
-
-    # Get player IDs for this session
-    player_ids_stmt = select(SessionPlayer.user_id).where(SessionPlayer.session_id == chat_id)
-    player_ids = [row[0] for row in (await session.execute(player_ids_stmt)).all()]
-
-    for option in poll_data.options:
-        text = option.text
-        clean_name = text.replace("⭐ ", "")
-        base_score = float(option.voter_count)
-
-        modifier_score = 0.0
-
-        # =====================================================================
-        # MODIFIER 1: Star Boost (per-user who starred the game)
-        # =====================================================================
-        if is_weighted and "⭐" in text:
-            # Find the game ID for this option
-            game = (
-                await session.execute(select(Game).where(Game.name == clean_name))
-            ).scalar_one_or_none()
-
-            if game:
-                # Count how many session players have this game as priority
-                priority_count = await session.scalar(
-                    select(func.count(Collection.user_id)).where(
-                        Collection.game_id == game.id,
-                        Collection.user_id.in_(player_ids),
-                        Collection.state == GameState.STARRED,
-                    )
-                )
-                if priority_count > 0:
-                    modifier_score += STAR_BOOST * priority_count
-
-        # =====================================================================
-        # MODIFIER 2: Starvation Boost (placeholder for future)
-        # =====================================================================
-        # if is_weighted:
-        #     loss_count = await get_game_loss_count(game.id, session)
-        #     if loss_count > 0:
-        #         modifier_score += STARVATION_BOOST * loss_count
-        #         modifiers_info.append(
-        #             f"Starvation: +{STARVATION_BOOST * loss_count} for {clean_name}"
-        #         )
-
-        scores[clean_name] = base_score + modifier_score
-
-    # Build summary string
-    if is_weighted:
-        modifiers_info.append(f"Weighted votes active: +{STAR_BOOST}/⭐ per user")
-
-    return scores, " | ".join(modifiers_info) if modifiers_info else ""
 
 
 # ---------------------------------------------------------------------------- #
@@ -2688,6 +2199,7 @@ async def _render_detail_view(
     )
 
 
+@_refreshes_polls
 async def manage_collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle manage collection button clicks.
 
@@ -2933,8 +2445,6 @@ def _build_settings_keyboard(
     Returns:
         List of button rows for InlineKeyboardMarkup.
     """
-    is_custom = session_obj.poll_type == PollType.CUSTOM
-    mode_text = "Custom (Single)" if is_custom else "Native (Multiple)"
     weight_icon = "✅" if session_obj.settings_weighted else "❌"
     hide_icon = "✅" if session_obj.hide_voters else "❌"
     shuffle_icon = "✅" if session_obj.shuffle_options else "❌"
@@ -2943,51 +2453,34 @@ def _build_settings_keyboard(
     limit_text = vote_limit_text or get_vote_limit_display(session_obj.vote_limit)
 
     keyboard: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(f"Mode: {mode_text}", callback_data="toggle_poll_mode")],
         [InlineKeyboardButton(f"Weights: {weight_icon}", callback_data="toggle_weights")],
         [
             InlineKeyboardButton(
                 f"Anonymous Voting: {hide_icon}", callback_data="toggle_hide_voters"
             )
         ],
-    ]
-    # Vote Limit only applies to Custom polls — Native poll answers bypass
-    # PollService.cast_vote entirely, so hide the button when the setting
-    # would be a no-op.
-    if is_custom:
-        keyboard.append(
-            [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")]
-        )
-    keyboard.extend(
+        [InlineKeyboardButton(f"Vote Limit: {limit_text}", callback_data="cycle_vote_limit")],
+        [InlineKeyboardButton(f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle")],
         [
-            [
-                InlineKeyboardButton(
-                    f"Shuffle Options: {shuffle_icon}", callback_data="toggle_shuffle"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"Hide Results: {hide_results_icon}", callback_data="toggle_hide_results"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"Allow Suggestions: {allow_adding_icon}",
-                    callback_data="toggle_allow_adding",
-                )
-            ],
-            [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
-        ]
-    )
+            InlineKeyboardButton(
+                f"Hide Results: {hide_results_icon}", callback_data="toggle_hide_results"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"Allow Suggestions: {allow_adding_icon}",
+                callback_data="toggle_allow_adding",
+            )
+        ],
+        [InlineKeyboardButton("🔙 Back to Lobby", callback_data="resume_night")],
+    ]
     return keyboard
 
 
 POLL_SETTINGS_TEXT = (
     "**Poll Settings**\n\n"
-    "• **Custom (Single)**: One message with buttons. Good for large lists.\n"
-    "• **Native (Multiple)**: Standard Telegram polls. Split if >12 games.\n"
     "• **Weights**: Starred games get +0.5 votes.\n"
-    "• **Vote Limit**: Max votes per player (Custom mode only; Auto scales with game count).\n"
+    "• **Vote Limit**: Max votes per player (Auto scales with game count).\n"
     "• **Shuffle**: Randomize option order to reduce positional bias.\n"
     "• **Hide Results**: Hide votes until the poll is closed.\n"
     "• **Allow Suggestions**: Let players add games to the poll."
@@ -3034,45 +2527,6 @@ async def poll_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
-
-
-async def toggle_poll_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle between Custom and Native poll modes."""
-    query = update.callback_query
-    with contextlib.suppress(telegram.error.BadRequest):
-        await query.answer()
-
-    chat_id = query.message.chat.id
-    message_id = query.message.message_id
-
-    async with db.AsyncSessionLocal() as session:
-        session_obj = await session.get(Session, chat_id)
-
-        if session_obj:
-            if session_obj.message_id and session_obj.message_id != message_id:
-                with contextlib.suppress(telegram.error.BadRequest):
-                    await query.answer("This session is expired.", show_alert=True)
-                return
-
-            if await _has_active_poll(session, chat_id):
-                with contextlib.suppress(telegram.error.BadRequest):
-                    await query.answer(POLL_RUNNING_ALERT, show_alert=True)
-                return
-
-            # Toggle poll type
-            if session_obj.poll_type == PollType.CUSTOM:
-                session_obj.poll_type = PollType.NATIVE
-            else:
-                session_obj.poll_type = PollType.CUSTOM
-            await session.commit()
-
-            keyboard = _build_settings_keyboard(session_obj)
-
-            await query.edit_message_text(
-                POLL_SETTINGS_TEXT,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown",
-            )
 
 
 async def toggle_hide_voters_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3210,8 +2664,9 @@ async def create_custom_poll(
     valid_games: list,
     priority_game_ids: set,
 ):
-    """Create a single interactive message for voting on all valid games."""
+    """Post the poll message: a live tally, with voting on each player's ballot."""
     chat_id = update.effective_chat.id if update.message else update.callback_query.message.chat.id
+    chat_title = getattr(update.effective_chat, "title", None)
 
     # Generate unique poll ID
     import time
@@ -3223,14 +2678,14 @@ async def create_custom_poll(
         chat_id=chat_id, text="📊 **Initializing Poll...**", parse_mode="Markdown"
     )
 
-    # Create GameNightPoll entry with a stable shuffle seed — render_poll_message
-    # uses this so re-rendering the poll keeps button order consistent instead of
-    # reshuffling on every refresh.
+    # The shuffle seed is fixed for the poll's life, so every ballot — and every
+    # replacement of one — lists the games in the same shuffled order.
     db_poll = GameNightPoll(
         poll_id=poll_id,
         chat_id=chat_id,
         message_id=message.message_id,
         shuffle_seed=random.randint(0, 2**31 - 1),
+        chat_title=chat_title if isinstance(chat_title, str) else None,
     )
     session.add(db_poll)
     await session.commit()
@@ -3253,466 +2708,323 @@ async def create_custom_poll(
         )
 
 
-def _poll_callback_arg(data: str, short_prefix: str, legacy_action: str) -> int | None:
-    """Read the trailing int argument of a poll callback in either encoding.
+# ---------------------------------------------------------------------------- #
+# Ballots
+# ---------------------------------------------------------------------------- #
+#
+# Voting happens on a ballot: a Bot API 10.4 HTML widget in each player's
+# private chat with the bot, opened from the poll's Vote button. The poll
+# message in the group only shows the tally.
+#
+# This replaced a vote keyboard on the poll message itself. That message is
+# shared, so it could hold no per-user state (paging it moved everyone's page,
+# #90 / #92), and Telegram caps an edited keyboard at 100 buttons, which a
+# large combined collection overflows. A ballot is per user and pages locally.
+# Private chats are the only place production allows widgets today.
+#
+# A ballot's HTML — and so its game list — is fixed once sent, and it names
+# games by position. Two things keep that honest when the list changes: every
+# render replaces ballots whose list is stale (_sync_ballots), and every vote
+# checks the ballot's catalog_hash before trusting a position.
 
-    Short form is ``<prefix><arg>``; the legacy form that older keyboards still
-    carry is ``<action>:<poll_id>:<arg>``. Returns None if neither parses.
+
+def _build_poll_ballot(game_poll, games, priority_ids, session_obj) -> Ballot | None:
+    """Render a poll's ballot, shortening names if that is what it takes to fit."""
+    seed = None
+    if session_obj and session_obj.shuffle_options:
+        seed = game_poll.shuffle_seed or 0
+    title = game_poll.chat_title or "Game Night"
+    for name_limit in _BALLOT_NAME_LIMITS:
+        try:
+            return build_ballot(title, games, priority_ids, name_limit, seed)
+        except WidgetTooLarge as e:
+            too_large = e
+    logger.warning("Ballot for poll %s does not fit a widget: %s", game_poll.poll_id, too_large)
+    return None
+
+
+def _ballot_state(
+    ballot: Ballot, votes, user_id: int, member_ids, session_obj, error: str | None = None
+) -> str:
+    """One user's ballot state from all of a poll's votes.
+
+    `votes` includes those of players who have left: they are kept for a
+    rejoin, shown to their owner, and left out of the tallies.
     """
-    if data.startswith(short_prefix):
-        tail = data[len(short_prefix) :]
-    else:
-        parts = data.split(":")
-        if len(parts) < 3 or parts[0] != legacy_action:
-            return None
-        tail = parts[2]
+    vote_counts: dict[int, int] | None = None
+    category_counts: dict[int, int] | None = None
+    if not (session_obj and session_obj.hide_results):
+        vote_counts, category_counts = {}, {}
+        for v in votes:
+            if v.user_id not in member_ids:
+                continue
+            if v.vote_type == VoteType.CATEGORY:
+                category_counts[v.category_level] = category_counts.get(v.category_level, 0) + 1
+            elif v.game_id is not None:
+                vote_counts[v.game_id] = vote_counts.get(v.game_id, 0) + 1
+
+    mine = [v for v in votes if v.user_id == user_id]
+    vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
+    return build_ballot_state(
+        ballot,
+        [v.game_id for v in mine if v.vote_type == VoteType.GAME],
+        [v.category_level for v in mine if v.vote_type == VoteType.CATEGORY],
+        PollService.calculate_effective_limit(vote_limit, len(ballot.game_ids)),
+        vote_counts,
+        category_counts,
+        error=error,
+        paused=user_id not in member_ids,
+    )
+
+
+async def _replace_ballot(bot, row: PollBallot, ballot: Ballot, state: str) -> None:
+    """Send a fresh ballot and remove the message it supersedes."""
+    old_message_id = row.message_id
+    row.message_id = await send_ballot(bot, row.user_id, ballot, state, disable_notification=True)
+    row.catalog_hash = ballot.catalog_hash
+    with contextlib.suppress(Exception):
+        await bot.delete_message(chat_id=row.user_id, message_id=old_message_id)
+
+
+async def _sync_ballots(
+    bot, session, game_poll, games, priority_ids, votes, member_ids, session_obj
+) -> None:
+    """Bring every open ballot of a poll up to date.
+
+    A ballot built from the current game list gets the new tallies pushed to
+    it; one built from an older list is replaced.
+    """
+    rows = (
+        (await session.execute(select(PollBallot).where(PollBallot.poll_id == game_poll.poll_id)))
+        .scalars()
+        .all()
+    )
+    # No games means the lobby is mid-teardown; leave the ballots as they are.
+    if not rows or not games:
+        return
+    ballot = _build_poll_ballot(game_poll, games, priority_ids, session_obj)
+    if ballot is None:
+        return
+
+    replaced = False
+    for row in rows:
+        try:
+            state = _ballot_state(ballot, votes, row.user_id, member_ids, session_obj)
+            if row.catalog_hash != ballot.catalog_hash:
+                await _replace_ballot(bot, row, ballot, state)
+                replaced = True
+            else:
+                await edit_widget_data(bot, row.user_id, row.message_id, state)
+        except Exception as e:
+            # One unreachable voter (bot blocked, ballot deleted) must not
+            # stop the others from being updated.
+            logger.info(
+                "Could not update the ballot of user %s for poll %s: %s",
+                row.user_id,
+                game_poll.poll_id,
+                e,
+            )
+    if replaced:
+        await session.commit()
+
+
+async def _retire_ballots(bot, session, poll_id: str, text: str) -> None:
+    """Mark every ballot of a poll as closed. Call before the poll row is deleted."""
+    rows = (
+        (await session.execute(select(PollBallot).where(PollBallot.poll_id == poll_id)))
+        .scalars()
+        .all()
+    )
+    state = closed_ballot_state(text)
+    for row in rows:
+        with contextlib.suppress(Exception):
+            await edit_widget_data(bot, row.user_id, row.message_id, state)
+
+
+async def _open_ballot(update: Update, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
+    """Send the caller their ballot for a poll, replacing any they already have."""
+    user = update.effective_user
+    message = update.message
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await message.reply_text("Tap 🗳 Vote on the poll to open your ballot in our private chat.")
+        return
+
+    async with db.AsyncSessionLocal() as session:
+        game_poll = await session.get(GameNightPoll, poll_id)
+        if game_poll is None:
+            await message.reply_text("That poll is closed.")
+            return
+        chat_id = game_poll.chat_id
+
+        member_ids = await get_active_member_ids(session, chat_id)
+        if user.id not in member_ids:
+            await message.reply_text(
+                "You're not in this game night yet. Tap Join in the group, then 🗳 Vote again."
+            )
+            return
+
+        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
+        games = await _merge_added_games(session, poll_id, valid_games)
+        session_obj = await session.get(Session, chat_id)
+        ballot = _build_poll_ballot(game_poll, games, priority_ids, session_obj) if games else None
+        if ballot is None:
+            await message.reply_text("I couldn't build a ballot for this poll's games.")
+            return
+
+        votes = await PollService.get_votes_for_poll(session, poll_id)
+        state = _ballot_state(ballot, votes, user.id, member_ids, session_obj)
+        row = await session.scalar(
+            select(PollBallot).where(PollBallot.poll_id == poll_id, PollBallot.user_id == user.id)
+        )
+        try:
+            if row is None:
+                message_id = await send_ballot(context.bot, user.id, ballot, state)
+                session.add(
+                    PollBallot(
+                        poll_id=poll_id,
+                        user_id=user.id,
+                        message_id=message_id,
+                        catalog_hash=ballot.catalog_hash,
+                    )
+                )
+            else:
+                await _replace_ballot(context.bot, row, ballot, state)
+            await session.commit()
+        except telegram.error.TelegramError as e:
+            logger.warning(
+                "Could not send a ballot for poll %s to user %s: %s", poll_id, user.id, e
+            )
+            await message.reply_text("I couldn't open your ballot. Update Telegram and try again.")
+        except IntegrityError:
+            # Two taps raced; the other one's ballot is the one on record.
+            await session.rollback()
+
+
+def _parse_ballot_request(data: object, ballot: Ballot) -> tuple[VoteType, int] | None:
+    """Decode a ballot's request: "v:<position>" for a game, "c:<level>" for a category."""
+    kind, _, arg = str(data or "").partition(":")
     try:
-        return int(tail)
+        value = int(arg)
     except ValueError:
         return None
+    if kind == "v" and 0 <= value < len(ballot.game_ids):
+        return VoteType.GAME, ballot.game_ids[value]
+    if kind == "c" and value in ballot.levels:
+        return VoteType.CATEGORY, value
+    return None
 
 
-async def _poll_for_callback(session, query, legacy_action: str) -> GameNightPoll | None:
-    """Find the poll a keyboard button belongs to.
-
-    The short callback forms omit the poll id to save reply_markup bytes, so the
-    poll is resolved from the message the button is attached to — unique per
-    chat. Legacy keyboards still carry the id, so those are looked up directly.
-    """
-    parts = (query.data or "").split(":")
-    if parts[0] == legacy_action and len(parts) >= 2:
-        return cast(GameNightPoll | None, await session.get(GameNightPoll, parts[1]))
-    message = query.message
-    if message is None:
-        return None
-    # chat.id rather than chat_id: an old button can arrive on an
-    # InaccessibleMessage, which carries chat but not the chat_id shortcut.
-    found = await session.scalar(
-        select(GameNightPoll).where(
-            GameNightPoll.chat_id == message.chat.id,
-            GameNightPoll.message_id == message.message_id,
-        )
-    )
-    return cast(GameNightPoll | None, found)
-
-
-async def _active_poll_for_chat(session, chat_id: int) -> GameNightPoll | None:
-    """The chat's current poll.
-
-    The picker lives in its own message, so it cannot be resolved the way poll
-    buttons are (by the message they sit on). Closing a poll deletes its row, so
-    a chat has at most one; the newest is taken in case a stale row survives.
-    """
-    found = await session.scalar(
-        select(GameNightPoll)
-        .where(GameNightPoll.chat_id == chat_id)
-        .order_by(GameNightPoll.poll_id.desc())
-        .limit(1)
-    )
-    return cast(GameNightPoll | None, found)
-
-
-def _paginate_games_by_category(
-    level_groups: list[tuple[int, list]],
-    page_size: int = _POLL_PICKER_PAGE_SIZE,
-    min_chunk: int = _POLL_PICKER_MIN_CHUNK,
-) -> list[list[tuple[int, list]]]:
-    """Split complexity groups into pages, breaking on group boundaries.
-
-    Each page is a list of ``(level, games)`` segments, so a page reads as whole
-    complexity groups instead of an arbitrary slice of an alphabetical list.
-
-    A group that does not fit the space left on a page is only split when both
-    resulting pieces are worth showing — at least ``min_chunk`` games. Otherwise
-    the whole group moves to a fresh page, which is what stops a group from
-    leaving one or two stranded games behind on the previous page.
-
-    A group too large for a whole page has to be split regardless; it is then
-    spread evenly over the pages it needs, so the last page of that group isn't
-    a sliver either.
-    """
-    pages: list[list[tuple[int, list]]] = []
-    current: list[tuple[int, list]] = []
-    used = 0
-
-    for level, games in level_groups:
-        i = 0
-        while i < len(games):
-            space = page_size - used
-            rest = len(games) - i
-
-            if rest <= space:  # the whole remainder of this group fits
-                current.append((level, games[i:]))
-                used += rest
-                break
-
-            # Splitting here would strand a sliver on one side or the other, and
-            # there is already something on this page — start a fresh one.
-            if current and (space < min_chunk or rest - space < min_chunk):
-                pages.append(current)
-                current, used = [], 0
-                continue
-
-            if used == 0 and rest > page_size:
-                # Bigger than a page on its own: spread it evenly rather than
-                # filling pages and leaving a remainder. The chunk *is* the
-                # page -- closing it here keeps the balance, and stops the
-                # remainder flowing back onto the same page, which would place
-                # this level twice and render two identical separators.
-                chunks = (rest + page_size - 1) // page_size
-                take = (rest + chunks - 1) // chunks
-                current.append((level, games[i : i + take]))
-                pages.append(current)
-                current, used = [], 0
-                i += take
-                continue
-
-            current.append((level, games[i : i + space]))
-            used += space
-            i += space
-
-    if current:
-        pages.append(current)
-    return pages or [[]]
-
-
-def _build_picker_keyboard(
-    level_groups: list[tuple[int, list]],
-    page: int,
-    voted_ids: set[int],
-    priority_ids: set[int],
-    chat_id: int,
-) -> tuple[list[list[InlineKeyboardButton]], int, int]:
-    """Build one page of the browse-all-games picker.
-
-    Returns (keyboard, clamped_page, total_pages). Every button carries the
-    group's chat id, because the picker is delivered as an ephemeral message and
-    the handler should not have to guess how one reports its own chat.
-    """
-    pages = _paginate_games_by_category(level_groups)
-    total_pages = len(pages)
-    page = max(0, min(page, total_pages - 1))
-    segments = pages[page]
-
-    keyboard: list[list[InlineKeyboardButton]] = []
-    for level, page_games in segments:
-        level_name = level if level > 0 else "Unrated"
-        keyboard.append(
-            [InlineKeyboardButton(f"--- {level_name} ---", callback_data=f"{_CB_SEPARATOR}{level}")]
-        )
-        # Two per row unless a name in this group needs the full width.
-        columns = (
-            1 if any(x.name and len(x.name) > _BUTTON_LONG_THRESHOLD for x in page_games) else 2
-        )
-        columns = min(columns, _MAX_BUTTONS_PER_ROW)
-        row: list[InlineKeyboardButton] = []
-        for g in page_games:
-            mark = "✅ " if g.id in voted_ids else ("⭐ " if g.id in priority_ids else "")
-            label = _wrap_button_label(mark, g.name, "")
-            row.append(
-                InlineKeyboardButton(label, callback_data=f"{_CB_PICK}v:{g.id}:{page}:{chat_id}")
-            )
-            if len(row) == columns:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
-
-    nav: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav.append(
-            InlineKeyboardButton("◀️ Prev", callback_data=f"{_CB_PICK}p:{page - 1}:{chat_id}")
-        )
-    if total_pages > 1:
-        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"{_CB_PICK}n"))
-    if page < total_pages - 1:
-        nav.append(
-            InlineKeyboardButton("Next ▶️", callback_data=f"{_CB_PICK}p:{page + 1}:{chat_id}")
-        )
-    if nav:
-        keyboard.append(nav)
-
-    keyboard.append([InlineKeyboardButton("✅ Done", callback_data=f"{_CB_PICK}x:{chat_id}")])
-    return keyboard, page, total_pages
-
-
-async def _picker_view(session, poll_id: str, chat_id: int, user_id: int, page: int):
-    """Gather everything one picker page needs: (text, keyboard)."""
-    valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-    valid_games = await _merge_added_games(session, poll_id, valid_games)
-
-    # Same grouping and ordering the poll uses, so a game sits where a voter
-    # expects it. group_games_by_complexity already sorts each group by name and
-    # drops empty levels; highest complexity first mirrors the poll keyboard.
-    groups = group_games_by_complexity(valid_games) if valid_games else {}
-    level_groups = [(level, groups[level]) for level in sorted(groups, reverse=True)]
-    total_games = sum(len(g) for _, g in level_groups)
-
-    voted = await session.execute(
-        select(PollVote.game_id).where(
-            PollVote.poll_id == poll_id,
-            PollVote.user_id == user_id,
-            PollVote.vote_type == VoteType.GAME,
-        )
-    )
-    voted_ids = {gid for gid in voted.scalars().all() if gid is not None}
-
-    keyboard, page, total_pages = _build_picker_keyboard(
-        level_groups, page, voted_ids, priority_ids, chat_id
-    )
-    text = "\n".join(
-        [
-            "🔍 **All games**",
-            f"_Page {page + 1} of {total_pages} · {total_games} games · "
-            f"{len(voted_ids)} of them voted by you_",
-            "",
-            "_Tap a game to vote or unvote. ✅ marks your votes._",
-        ]
-    )
-    return text, keyboard
-
-
-async def _send_ephemeral_picker(
-    context, chat_id: int, query, text: str, keyboard: list, replace: bool
-) -> bool:
-    """Show the picker to one person only, inside the group chat.
-
-    Bot API 10.2 ephemeral messages are visible to a single receiver, which is
-    what the picker needs: a picker everyone can see clutters the chat and
-    invites taps from people it does not belong to. python-telegram-bot 22.x has
-    no support for them, but they are plain sendMessage parameters, so they go
-    through api_kwargs the same way this module already passes unsupported poll
-    options.
-
-    ``replace`` uses Bot API 10.3's replace_callback_query_message to put the
-    new page where the old one was, so paging does not stack up messages. It is
-    never used for the first open, because there the callback query belongs to
-    the *poll* message and replacing that would destroy the poll.
-
-    Returns False if the bot lacks the rights to send one, so the caller can say
-    so instead of silently showing nothing.
-    """
-    params: dict = {"receiver_user_id": query.from_user.id}
-    if replace:
-        params["callback_query_id"] = query.id
-        params["replace_callback_query_message"] = True
-
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
-            api_kwargs={"ephemeral_message_parameters": json.dumps(params)},
-        )
-        return True
-    except telegram.error.TelegramError as e:
-        msg = str(e)
-        if "not_admin" in msg.lower() or "not admin" in msg.lower():
-            logger.info("Cannot send ephemeral picker in chat %s: %s", chat_id, msg)
-            return False
-        raise
-
-
-async def poll_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drive the browse-all-games picker: open, page, vote, dismiss.
-
-    Every render is an ephemeral message, so a picker is visible only to the
-    person who opened it. Nobody else sees it and nobody else can tap it, which
-    is why there is no owner check here: the first open sends a new one, and
-    every later tap replaces it in place.
-    """
-    query = update.callback_query
-    parts = (query.data or "").removeprefix(_CB_PICK).split(":")
-    action = parts[0] if parts else ""
-    user_id = query.from_user.id
-
-    if action == "n":  # page indicator, inert
-        with contextlib.suppress(telegram.error.BadRequest):
-            await query.answer()
+async def widget_query_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a tap on a ballot: toggle the vote and answer with the fresh state."""
+    query = widget_query_of(update)
+    if query is None:
         return
+    bot = context.bot
+    sender = query.get("from") or {}
+    user_id = sender.get("id")
+    message_id = query.get("message_id")
 
-    # The poll's own entry button carries chat 0, meaning "read the chat from
-    # the message this was tapped on". Picker buttons carry the group's id, so
-    # the handler never has to assume how an ephemeral message reports its chat.
-    tail = int(parts[-1]) if parts[-1].lstrip("-").isdigit() else 0
-    opening = tail == 0
-    chat_id = query.message.chat.id if opening else tail
-
-    if action == "x":
-        with contextlib.suppress(telegram.error.BadRequest):
-            await query.answer()
-        await _send_ephemeral_picker(context, chat_id, query, "✅ _Closed._", [], replace=True)
-        return
+    async def answer(state: str) -> None:
+        # Telegram allows 15 seconds; a late or failed answer just reverts the tap.
+        with contextlib.suppress(Exception):
+            await answer_widget_query(bot, query["id"], state)
 
     async with db.AsyncSessionLocal() as session:
-        game_poll = await _active_poll_for_chat(session, chat_id)
-        if game_poll is None:
-            with contextlib.suppress(telegram.error.BadRequest):
-                await query.answer("Poll not found", show_alert=True)
-            return
-        poll_id = game_poll.poll_id
-
-        if action == "v":
-            await _picker_cast_vote(session, context, query, game_poll, int(parts[1]))
-        elif action != "p":
-            with contextlib.suppress(telegram.error.BadRequest):
-                await query.answer("Unknown action")
-            return
-
-        page = int(parts[2]) if action == "v" else int(parts[1])
-        text, keyboard = await _picker_view(session, poll_id, chat_id, user_id, page)
-
-    if opening:
-        with contextlib.suppress(telegram.error.BadRequest):
-            await query.answer()
-
-    # Replacing is only safe once the picker itself is the message being tapped.
-    sent = await _send_ephemeral_picker(
-        context, chat_id, query, text, keyboard, replace=not opening
-    )
-    if not sent:
-        with contextlib.suppress(telegram.error.BadRequest):
-            await query.answer(
-                "I need to be an admin in this group to show you the game list "
-                "privately. Promote me and tap again.",
-                show_alert=True,
+        row = None
+        if user_id is not None and message_id is not None:
+            row = await session.scalar(
+                select(PollBallot).where(
+                    PollBallot.user_id == user_id, PollBallot.message_id == message_id
+                )
             )
-
-
-async def _picker_cast_vote(session, context, query, game_poll, game_id: int) -> None:
-    """Record a vote cast from the picker and refresh the shared poll."""
-    chat_id = game_poll.chat_id
-    poll_id = game_poll.poll_id
-    session_obj = await session.get(Session, chat_id)
-    vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
-
-    valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-    valid_games = await _merge_added_games(session, poll_id, valid_games)
-    valid_category_levels = (
-        set(group_games_by_complexity(valid_games).keys()) if valid_games else set()
-    )
-
-    result = await PollService.cast_vote(
-        session=session,
-        poll_id=poll_id,
-        user_id=query.from_user.id,
-        target_id=game_id,
-        vote_type=VoteType.GAME,
-        user_name=query.from_user.first_name,
-        vote_limit=vote_limit,
-        game_count=len(valid_games) if valid_games else 0,
-        user_last_name=query.from_user.last_name,
-        user_tg_username=query.from_user.username,
-        valid_game_ids={g.id for g in valid_games},
-        valid_category_levels=valid_category_levels,
-    )
-
-    with contextlib.suppress(telegram.error.BadRequest):
-        await query.answer(result.message)
-
-    # The shared poll shows the tally, so it has to catch up too. Reuse the
-    # debounce that keeps a burst of votes down to a single edit.
-    if result.success and not _schedule_poll_render(
-        context, chat_id, game_poll.message_id, poll_id
-    ):
-        await render_poll_message(
-            context.bot,
-            chat_id,
-            game_poll.message_id,
-            session,
-            poll_id,
-            valid_games,
-            priority_ids,
-            already_merged=True,
-        )
-
-
-async def poll_separator_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Absorb a tap on a complexity separator.
-
-    Separators exist to label the group of games beneath them. Telegram has no
-    inert button on this API version, so the tap still arrives and is answered
-    with nothing — which stops the client's loading spinner and leaves the poll
-    untouched.
-    """
-    with contextlib.suppress(telegram.error.BadRequest):
-        await update.callback_query.answer()
-
-
-async def custom_poll_vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle votes on custom poll."""
-    query = update.callback_query
-    # Data is "v:<game_id>", or "vote:<poll_id>:<game_id>" from an older keyboard.
-    game_id = _poll_callback_arg(query.data or "", _CB_VOTE, "vote")
-    if game_id is None:
-        with contextlib.suppress(telegram.error.BadRequest):
-            await query.answer("Invalid vote data")
-        return
-
-    user_id = query.from_user.id
-    user_name = query.from_user.first_name
-    user_last_name = query.from_user.last_name
-    user_tg_username = query.from_user.username
-
-    async with db.AsyncSessionLocal() as session:
-        # Get poll and session info for vote limit
-        game_poll = await _poll_for_callback(session, query, "vote")
-        if not game_poll:
-            await query.answer("Poll not found")
+        game_poll = await session.get(GameNightPoll, row.poll_id) if row else None
+        if row is None or game_poll is None:
+            # The poll is over and took its ballot rows with it. Stamp the
+            # ballot closed so it stops inviting taps.
+            state = closed_ballot_state("This poll is closed.")
+            await answer(state)
+            if user_id is not None and message_id is not None:
+                with contextlib.suppress(Exception):
+                    await edit_widget_data(bot, user_id, message_id, state)
             return
-
-        poll_id = game_poll.poll_id
 
         chat_id = game_poll.chat_id
-        session_obj = await session.get(Session, chat_id)
-
-        # Use PollService for vote casting
-        vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
-
-        # Fetch valid games once and reuse for both the vote-limit check and the
-        # UI render below — the game set can't change while casting a vote, so a
-        # second fetch would be wasted work (and a wasted Cloud SQL round-trip).
+        poll_id = game_poll.poll_id
+        poll_message_id = game_poll.message_id
         valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-        valid_games = await _merge_added_games(session, poll_id, valid_games)
-        game_count = len(valid_games) if valid_games else 0
-        valid_game_ids = {g.id for g in valid_games}
-        valid_category_levels = (
-            set(group_games_by_complexity(valid_games).keys()) if valid_games else set()
-        )
+        games = await _merge_added_games(session, poll_id, valid_games)
+        session_obj = await session.get(Session, chat_id)
+        member_ids = await get_active_member_ids(session, chat_id)
+        ballot = _build_poll_ballot(game_poll, games, priority_ids, session_obj) if games else None
+        if ballot is None:
+            await answer(closed_ballot_state("There are no games to vote on right now."))
+            return
+        votes = await PollService.get_votes_for_poll(session, poll_id)
 
+        if ballot.catalog_hash != row.catalog_hash:
+            # This ballot lists an older set of games, so its positions no
+            # longer mean what the voter saw. Record nothing; hand over a
+            # current ballot instead.
+            await answer(closed_ballot_state("The game list changed. Use the new ballot below."))
+            try:
+                state = _ballot_state(ballot, votes, user_id, member_ids, session_obj)
+                await _replace_ballot(bot, row, ballot, state)
+                await session.commit()
+            except Exception as e:
+                logger.warning("Could not replace a stale ballot for poll %s: %s", poll_id, e)
+            return
+
+        request = _parse_ballot_request(query.get("data"), ballot)
+        if request is None:
+            await answer(
+                _ballot_state(ballot, votes, user_id, member_ids, session_obj, "Invalid vote.")
+            )
+            return
+        if user_id not in member_ids:
+            # Left the lobby since opening the ballot: the state says so.
+            await answer(_ballot_state(ballot, votes, user_id, member_ids, session_obj))
+            return
+
+        vote_type, target_id = request
         result = await PollService.cast_vote(
             session=session,
             poll_id=poll_id,
             user_id=user_id,
-            target_id=game_id,
-            vote_type=VoteType.GAME,
-            user_name=user_name,
-            vote_limit=vote_limit,
-            game_count=game_count,
-            user_last_name=user_last_name,
-            user_tg_username=user_tg_username,
-            valid_game_ids=valid_game_ids,
-            valid_category_levels=valid_category_levels,
+            target_id=target_id,
+            vote_type=vote_type,
+            user_name=sender.get("first_name"),
+            vote_limit=session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED,
+            game_count=len(games),
+            user_last_name=sender.get("last_name"),
+            user_tg_username=sender.get("username"),
+            valid_game_ids=set(ballot.game_ids),
+            valid_category_levels=set(ballot.levels),
         )
 
-        # cast_vote commits internally; no extra commit needed here.
-        with contextlib.suppress(telegram.error.BadRequest):
-            await query.answer(result.message)
+        # cast_vote commits internally; re-read so the answer reflects it.
+        votes = await PollService.get_votes_for_poll(session, poll_id)
+        await answer(
+            _ballot_state(
+                ballot,
+                votes,
+                user_id,
+                member_ids,
+                session_obj,
+                None if result.success else result.message,
+            )
+        )
 
-        # Debounce the re-render so a burst of votes collapses into one edit.
-        # Fall back to an inline render (reusing the games already fetched
-        # above) if the job queue isn't available.
-        if result.success and not _schedule_poll_render(
-            context, chat_id, game_poll.message_id, poll_id
-        ):
+        # The render updates the group tally and pushes the new state to every
+        # ballot, this one included — an answer alone is not stored. Debounced,
+        # so a burst of votes collapses into one round of edits.
+        if result.success and not _schedule_poll_render(context, chat_id, poll_message_id, poll_id):
             await render_poll_message(
-                context.bot,
+                bot,
                 chat_id,
-                game_poll.message_id,
+                poll_message_id,
                 session,
                 poll_id,
-                valid_games,
+                games,
                 priority_ids,
                 already_merged=True,
             )
@@ -3780,7 +3092,7 @@ async def _merge_added_games(session, poll_id: str, games: list) -> list:
 async def render_poll_message(
     bot, chat_id, message_id, session, poll_id, games, priority_ids, already_merged=False
 ):
-    """Update custom poll message with current vote state.
+    """Update the poll message, and every open ballot, with current vote state.
 
     Set already_merged=True when the caller has already folded user-added games
     into `games` (via _merge_added_games), to skip a redundant query.
@@ -3846,13 +3158,9 @@ async def render_poll_message(
     session_obj = await session.get(Session, chat_id)
     hide_voters = session_obj.hide_voters if session_obj else False
     hide_results = session_obj.hide_results if session_obj else False
-    shuffle = session_obj.shuffle_options if session_obj else False
     allow_adding = session_obj.allow_adding_options if session_obj else False
 
-    # Per-poll shuffle seed so re-renders keep a consistent button order.
-    # Fall back to 0 for legacy polls created before the column existed.
     game_poll = await session.get(GameNightPoll, poll_id)
-    shuffle_seed = (game_poll.shuffle_seed if game_poll else None) or 0
 
     # Get vote limit info for display
     vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
@@ -3864,7 +3172,7 @@ async def render_poll_message(
     else:
         limit_display = f"🗳️ Limit: {vote_limit}"
 
-    # Build context description (parity with native poll description param)
+    # Build context description
     players_stmt = select(func.count(SessionPlayer.user_id)).where(
         SessionPlayer.session_id == chat_id
     )
@@ -3921,125 +3229,25 @@ async def render_poll_message(
                         leader_found = True
 
     if not leader_found:
-        text_lines.append("_No votes yet! Tap buttons below._")
+        text_lines.append("_No votes yet! Tap 🗳 Vote to open your ballot._")
 
-    # Pre-sort each complexity level's games once (shuffle or vote/star order).
-    # A per-group seed keeps order stable across re-renders and isolates groups
-    # from each other's changes. The keyboard builder consumes these and may
-    # include only a subset to stay within Telegram's reply_markup size limit.
-    levels_desc = sorted(groups.keys(), reverse=True)
-    sorted_by_level: dict[int, list] = {}
-    for level in levels_desc:
-        group = groups[level]
-        if shuffle:
-            sg = sorted(group, key=lambda g: g.id)
-            random.Random(shuffle_seed ^ level).shuffle(sg)
-        else:
-            sg = sorted(group, key=sort_key)
-        sorted_by_level[level] = sg
-
-    # Build + edit within a shrinking size budget. If Telegram still rejects the
-    # keyboard as too long, halve the budget and retry so the poll can never
-    # freeze — it just shows fewer game buttons (dropping the least relevant
-    # first; those games stay votable via their complexity-category button).
-    global _learned_markup_budget
-    # The configured constant stays the authoritative upper bound, so lowering it
-    # in a deploy takes effect even on an instance that learned a value already.
-    budget = min(_REPLY_MARKUP_BUDGET_BYTES, _learned_markup_budget)
-    for attempt in range(_RENDER_MAX_ATTEMPTS):
-        keyboard, shown, hidden = _build_poll_keyboard(
-            poll_id,
-            levels_desc,
-            sorted_by_level,
-            vote_counts,
-            priority_ids,
-            category_vote_counts,
-            hide_results,
-            allow_adding,
-            budget,
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=_clamp_message_text(text_lines),
+            reply_markup=InlineKeyboardMarkup(_build_poll_keyboard(bot, poll_id, allow_adding)),
+            parse_mode="Markdown",
         )
-        lines = list(text_lines)
-        if hidden > 0 and not hide_results:
-            lines.insert(
-                3,
-                f"🎛️ _Showing the top {shown} of {shown + hidden} games — Telegram "
-                f"allows only {_MAX_KEYBOARD_BUTTONS} buttons per message. "
-                f"Tap 🔍 All games to browse and vote for any of them._",
-            )
-        text = _clamp_message_text(lines)
-        try:
-            sent = await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown",
-            )
-            _warn_if_buttons_dropped(poll_id, keyboard, sent)
-            return
-        except Exception as e:
-            msg = str(e)
-            lowered = msg.lower()
-            # Ignore "Message is not modified" errors (common in rapid updates).
-            if "Message is not modified" in msg:
-                return
-
-            # Telegram spells these two inconsistently — "Reply markup is too
-            # long" with spaces, "Message_too_long" with underscores — so each
-            # is matched explicitly. A plain "too long" test catches the first
-            # and misses the second entirely. They must not be confused:
-            # shrinking the keyboard cannot fix an over-long text, and letting a
-            # text error ratchet the learned budget down would starve every
-            # later poll on this instance.
-            text_too_long = "message_too_long" in lowered or "message is too long" in lowered
-            markup_too_long = not text_too_long and "too long" in lowered
-
-            if markup_too_long:
-                # Permanent prod event, not a one-off diagnostic: this is the only
-                # place the real (undocumented) reply_markup ceiling is observable,
-                # and the numbers say where to set the budget next.
-                logger.warning(
-                    "Telegram rejected poll reply_markup as too long: "
-                    "poll=%s attempt=%d/%d budget=%d markup_bytes=%d "
-                    "buttons=%d shown=%d hidden=%d error=%s",
-                    poll_id,
-                    attempt + 1,
-                    _RENDER_MAX_ATTEMPTS,
-                    budget,
-                    len(
-                        json.dumps(
-                            InlineKeyboardMarkup(keyboard).to_dict(),
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    ),
-                    sum(len(row) for row in keyboard),
-                    shown,
-                    hidden,
-                    msg,
-                )
-                if attempt < _RENDER_MAX_ATTEMPTS - 1:
-                    budget = max(budget // 2, _REPLY_MARKUP_MIN_BUDGET_BYTES)
-                    # The ceiling belongs to the server, not to this poll, so
-                    # remember it and spare later renders the rejected call.
-                    if budget < _learned_markup_budget:
-                        _learned_markup_budget = budget
-                        logger.warning(
-                            "Lowered reply_markup budget to %d bytes for this instance",
-                            budget,
-                        )
-                    continue
-
-            if text_too_long:
-                logger.warning(
-                    "Poll message text too long: poll=%s text_chars=%d error=%s",
-                    poll_id,
-                    len(text),
-                    msg,
-                )
-
+    except Exception as e:
+        # "Message is not modified" is routine: a refresh with nothing new.
+        if "Message is not modified" not in str(e):
             logger.warning(f"Failed to update poll message: {e}")
-            return
+
+    if game_poll is not None:
+        await _sync_ballots(
+            bot, session, game_poll, games, priority_ids, raw_votes, active_member_ids, session_obj
+        )
 
 
 # Debounce window for coalescing vote-driven re-renders. A burst of votes within
@@ -4144,81 +3352,6 @@ async def _handle_poll_refresh(query, context: ContextTypes.DEFAULT_TYPE, poll_i
             )
 
 
-async def _handle_poll_category_vote(
-    query, context: ContextTypes.DEFAULT_TYPE, poll_id: str, level: int
-) -> None:
-    """
-    Handle voting for a complexity category.
-
-    Category votes use game_id = -level as the marker. At poll close time,
-    these are resolved to a randomly selected game from that category.
-    """
-    chat_id = query.message.chat.id
-    user_id = query.from_user.id
-    user_name = query.from_user.first_name
-    user_last_name = query.from_user.last_name
-    user_tg_username = query.from_user.username
-
-    async with db.AsyncSessionLocal() as session:
-        # Get session for vote limit
-        session_obj = await session.get(Session, chat_id)
-
-        # Re-fetch games to ensure validity (include user-added games)
-        valid_games, priority_ids = await get_session_valid_games(session, chat_id)
-        valid_games = await _merge_added_games(session, poll_id, valid_games)
-
-        # Use ALL valid games for grouping
-        groups = group_games_by_complexity(valid_games)
-
-        target_group = groups.get(level, [])
-        if not target_group:
-            with contextlib.suppress(telegram.error.BadRequest):
-                await query.answer("No games in this group!")
-            return
-
-        # Use PollService for vote casting
-        vote_limit = session_obj.vote_limit if session_obj else VoteLimit.UNLIMITED
-
-        # Calculate valid games count for auto-limit
-        game_count = len(valid_games) if valid_games else 0
-        valid_game_ids = {g.id for g in valid_games}
-        valid_category_levels = set(groups.keys())
-
-        result = await PollService.cast_vote(
-            session=session,
-            poll_id=poll_id,
-            user_id=user_id,
-            target_id=level,
-            vote_type=VoteType.CATEGORY,
-            user_name=user_name,
-            vote_limit=vote_limit,
-            game_count=game_count,
-            user_last_name=user_last_name,
-            user_tg_username=user_tg_username,
-            valid_game_ids=valid_game_ids,
-            valid_category_levels=valid_category_levels,
-        )
-
-        # cast_vote commits internally; no extra commit needed here.
-        await query.answer(result.message)
-
-        # Debounce the re-render (see custom_poll_vote_callback). Inline
-        # fallback reuses the already-merged games from above.
-        if result.success and not _schedule_poll_render(
-            context, chat_id, query.message.message_id, poll_id
-        ):
-            await render_poll_message(
-                context.bot,
-                chat_id,
-                query.message.message_id,
-                session,
-                poll_id,
-                valid_games,
-                priority_ids,
-                already_merged=True,
-            )
-
-
 async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id: str) -> None:
     """Close the poll, resolve category votes, calculate winner, and end session."""
     await query.answer("Closing poll...")
@@ -4274,6 +3407,9 @@ async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id:
 
         # Unpin the poll message
         await _try_unpin_message(context.bot, chat_id, game_poll.message_id)
+
+        closing = f"Poll closed. Winner: {', '.join(winners)}" if winners else "Poll closed."
+        await _retire_ballots(context.bot, session, poll_id, closing)
 
         # Delete the poll record (cascade deletes all PollVote rows)
         # The result message above remains visible in chat.
@@ -4335,8 +3471,8 @@ async def _handle_poll_add(query, context: ContextTypes.DEFAULT_TYPE, poll_id: s
             await query.answer("No additional games to add!", show_alert=True)
         return
 
-    # Build picker keyboard. Mirror the vote keyboard's layout: wrap long
-    # names across multiple lines and drop to one-per-row when needed.
+    # Build picker keyboard: wrap long names across multiple lines and drop
+    # to one-per-row when needed.
     keyboard = []
     columns = 1 if any(len(g.name) > _BUTTON_LONG_THRESHOLD for g in candidates) else 2
     current_row = []
@@ -4444,11 +3580,9 @@ async def poll_add_select_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Dispatcher for custom poll actions: Refresh, Close, Category vote, Add.
+    Dispatcher for the poll message's buttons: Refresh, Close, Add.
 
     Callback data formats:
-    - c:<level>                            (category vote; poll from the message)
-    - poll_random_vote:<poll_id>:<level>   (same, from an older keyboard)
     - poll_refresh:<poll_id>
     - poll_close:<poll_id>
     - poll_add:<poll_id>
@@ -4457,24 +3591,6 @@ async def custom_poll_action_callback(update: Update, context: ContextTypes.DEFA
     data = query.data or ""
     parts = data.split(":")
     action = parts[0]
-
-    # Category headers use the short form that omits the poll id. The action row
-    # still carries it — it's 3 buttons per keyboard, not worth the churn.
-    if data.startswith(_CB_CATEGORY) or action == "poll_random_vote":
-        level = _poll_callback_arg(data, _CB_CATEGORY, "poll_random_vote")
-        if level is None:
-            with contextlib.suppress(telegram.error.BadRequest):
-                await query.answer("Invalid data")
-            return
-        async with db.AsyncSessionLocal() as session:
-            game_poll = await _poll_for_callback(session, query, "poll_random_vote")
-            poll_id = game_poll.poll_id if game_poll else None
-        if poll_id is None:
-            with contextlib.suppress(telegram.error.BadRequest):
-                await query.answer("Poll not found")
-            return
-        await _handle_poll_category_vote(query, context, poll_id, level)
-        return
 
     if len(parts) < 2:
         with contextlib.suppress(telegram.error.BadRequest):

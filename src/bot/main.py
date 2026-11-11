@@ -11,7 +11,6 @@ from telegram.ext import (  # noqa: E402
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
-    PollAnswerHandler,
 )
 
 from src.bot.handlers import (  # noqa: E402
@@ -21,7 +20,6 @@ from src.bot.handlers import (  # noqa: E402
     cancel_night_callback,
     create_poll,
     custom_poll_action_callback,
-    custom_poll_vote_callback,
     cycle_vote_limit_callback,
     guest_game,
     help_command,
@@ -30,10 +28,7 @@ from src.bot.handlers import (  # noqa: E402
     manage_collection,
     manage_collection_callback,
     poll_add_select_callback,
-    poll_picker_callback,
-    poll_separator_callback,
     poll_settings_callback,
-    receive_poll_answer,
     restart_night_callback,
     resume_night_callback,
     set_bgg,
@@ -44,10 +39,15 @@ from src.bot.handlers import (  # noqa: E402
     toggle_allow_adding_callback,
     toggle_hide_results_callback,
     toggle_hide_voters_callback,
-    toggle_poll_mode_callback,
     toggle_shuffle_callback,
     toggle_weights_callback,
+    widget_query_callback,
 )
+from src.bot.widgets import WIDGET_QUERY_UPDATE, WidgetQueryHandler  # noqa: E402
+
+# Telegram only sends update types newer than its defaults when asked, and
+# python-telegram-bot has no constant for this one yet.
+ALLOWED_UPDATES = ["message", "edited_message", "callback_query", WIDGET_QUERY_UPDATE]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -86,24 +86,10 @@ def main():
     app.add_handler(CallbackQueryHandler(cancel_night_callback, pattern="^cancel_night$"))
     app.add_handler(CallbackQueryHandler(toggle_weights_callback, pattern="^toggle_weights$"))
     app.add_handler(CallbackQueryHandler(poll_settings_callback, pattern="^poll_settings$"))
-    app.add_handler(CallbackQueryHandler(toggle_poll_mode_callback, pattern="^toggle_poll_mode$"))
-    # Short forms ("v:<game_id>", "c:<level>") omit the poll id to keep the poll
-    # keyboard inside Telegram's reply_markup size limit; the long forms are kept
-    # registered so keyboards already sent to chats keep working after deploy.
-    app.add_handler(CallbackQueryHandler(custom_poll_vote_callback, pattern=r"^v:"))
-    # Complexity separators do nothing when tapped; the handler just answers so
-    # the client's spinner stops. "c:" is the retired category-vote prefix, kept
-    # registered for keyboards already sitting in chats.
-    app.add_handler(CallbackQueryHandler(poll_separator_callback, pattern=r"^sep:"))
-    # Browse-all-games picker: its own message, paged per user.
-    app.add_handler(CallbackQueryHandler(poll_picker_callback, pattern=r"^pk:"))
-    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^c:"))
-    app.add_handler(CallbackQueryHandler(custom_poll_vote_callback, pattern=r"^vote:"))
+    # Votes arrive as widget queries from each player's ballot, not as callbacks.
+    app.add_handler(WidgetQueryHandler(widget_query_callback))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_refresh:"))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_close:"))
-    app.add_handler(
-        CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_random_vote:")
-    )
     app.add_handler(
         CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$")
     )
@@ -119,7 +105,6 @@ def main():
     app.add_handler(CallbackQueryHandler(poll_add_select_callback, pattern=r"^poll_add_select:"))
     app.add_handler(CallbackQueryHandler(poll_add_select_callback, pattern=r"^poll_add_cancel:"))
     app.add_handler(CallbackQueryHandler(manage_collection_callback, pattern="^manage:"))
-    app.add_handler(PollAnswerHandler(receive_poll_answer))
 
     if webhook_url := os.getenv("WEBHOOK_URL"):
         port = int(os.getenv("PORT", "8080"))
@@ -134,10 +119,11 @@ def main():
             url_path="telegram",
             webhook_url=f"{webhook_url}/telegram",
             secret_token=webhook_secret,
+            allowed_updates=ALLOWED_UPDATES,
         )
     else:
         logger.info("Bot is polling...")
-        app.run_polling()
+        app.run_polling(allowed_updates=ALLOWED_UPDATES)
 
 
 if __name__ == "__main__":
