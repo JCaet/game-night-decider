@@ -11,6 +11,8 @@ from telegram.ext import (  # noqa: E402
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
+    MessageHandler,
+    filters,
 )
 
 from src.bot.handlers import (  # noqa: E402
@@ -29,6 +31,7 @@ from src.bot.handlers import (  # noqa: E402
     manage_collection_callback,
     poll_add_select_callback,
     poll_settings_callback,
+    prompt_reply,
     restart_night_callback,
     resume_night_callback,
     set_bgg,
@@ -88,7 +91,10 @@ def main():
     app.add_handler(CallbackQueryHandler(poll_settings_callback, pattern="^poll_settings$"))
     # Votes arrive as widget queries from each player's ballot, not as callbacks.
     app.add_handler(WidgetQueryHandler(widget_query_callback))
-    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_refresh:"))
+    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_guest:"))
+    app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_mygame:"))
+    # Those two buttons ask for a name; it arrives as a reply to their prompt.
+    app.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, prompt_reply))
     app.add_handler(CallbackQueryHandler(custom_poll_action_callback, pattern=r"^poll_close:"))
     app.add_handler(
         CallbackQueryHandler(toggle_hide_voters_callback, pattern=r"^toggle_hide_voters$")

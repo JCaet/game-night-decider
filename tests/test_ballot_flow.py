@@ -1,16 +1,18 @@
 """Voting through ballots: the widget in each player's private chat with the bot."""
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select
 from telegram.constants import ChatType
+from telegram.error import BadRequest
 
 from src.bot import handlers
 from src.bot.handlers import (
     cancel_night,
     create_poll,
     custom_poll_action_callback,
+    prompt_reply,
     render_poll_message,
     start,
 )
@@ -104,10 +106,13 @@ async def test_tap_updates_the_group_tally_and_stores_the_ballot_state(mock_cont
     # No job queue in tests, so the render runs inline.
     text = mock_context.bot.edit_message_text.call_args.kwargs["text"]
     assert "**1** - Game2" in text
-    # An answer is not stored by Telegram; the render pushes the state as data.
-    (stored,) = ballot.api_calls("editMessageWidgetData")
-    assert stored["chat_id"] == ALICE and stored["message_id"] == 5000 + ALICE
-    assert '"m":[1]' in stored["chat_data"]
+    # An answer is not stored by Telegram, so the state is also written as
+    # data: once straight away, and again by the render for every ballot.
+    stored = ballot.api_calls("editMessageWidgetData")
+    assert len(stored) == 2
+    for call in stored:
+        assert call["chat_id"] == ALICE and call["message_id"] == 5000 + ALICE
+        assert '"m":[1]' in call["chat_data"]
 
 
 @pytest.mark.asyncio
@@ -278,11 +283,57 @@ async def test_start_deep_link_sends_a_ballot(mock_update, mock_context, ballot)
 
 
 @pytest.mark.asyncio
-async def test_opening_again_replaces_the_previous_ballot(mock_update, mock_context, ballot):
+async def test_tapping_vote_again_keeps_the_ballot_already_there(mock_update, mock_context, ballot):
+    """Deleting and resending a ballot the voter is looking at reads as a glitch."""
     await _seed()
     _deep_link(mock_update, mock_context)
+    mock_update.message.delete = AsyncMock()
 
     await start(mock_update, mock_context)
+    await start(mock_update, mock_context)
+
+    assert len(ballot.api_calls("sendWidget")) == 1
+    (refreshed,) = ballot.api_calls("editMessageWidgetData")
+    assert refreshed["message_id"] == 7000
+    mock_context.bot.delete_message.assert_not_called()
+    (row,) = await _ballot_rows()
+    assert row.message_id == 7000
+    # The "/start b_..." message the deep link produced is cleared away each time.
+    assert mock_update.message.delete.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tapping_vote_again_resends_a_ballot_the_voter_deleted(
+    mock_update, mock_context, ballot
+):
+    await _seed()
+    _deep_link(mock_update, mock_context)
+    await start(mock_update, mock_context)
+    sent = iter([{"message_id": 7001}])
+
+    async def message_is_gone(endpoint, api_kwargs=None, **_):
+        if endpoint == "editMessageWidgetData":
+            raise BadRequest("Message to edit not found")
+        return next(sent)
+
+    mock_context.bot.do_api_request.side_effect = message_is_gone
+
+    await start(mock_update, mock_context)
+
+    (row,) = await _ballot_rows()
+    assert row.message_id == 7001
+
+
+@pytest.mark.asyncio
+async def test_tapping_vote_again_replaces_an_out_of_date_ballot(mock_update, mock_context, ballot):
+    await _seed()
+    _deep_link(mock_update, mock_context)
+    await start(mock_update, mock_context)
+    async with db.AsyncSessionLocal() as session:
+        row = await session.scalar(select(PollBallot))
+        row.catalog_hash = "built-from-an-older-list"
+        await session.commit()
+
     await start(mock_update, mock_context)
 
     assert len(ballot.api_calls("sendWidget")) == 2
@@ -477,5 +528,178 @@ async def test_poll_message_links_to_the_ballot(mock_context, allow_adding):
 
     keyboard = mock_context.bot.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard
     assert keyboard[0][0].url == f"https://t.me/test_bot?start=b_{POLL_ID}"
-    actions = [button.callback_data.split(":")[0] for button in keyboard[1]]
-    assert actions == ["poll_refresh", "poll_close"] + (["poll_add"] if allow_adding else [])
+    actions = [[button.callback_data.split(":")[0] for button in row] for row in keyboard[1:]]
+    assert actions == [
+        ["poll_guest", "poll_mygame"],
+        (["poll_add"] if allow_adding else []) + ["poll_close"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tally_lists_most_voted_first_whatever_the_complexity(mock_context, ballot):
+    await _seed()
+    await ballot.tap(POLL_ID, ALICE, game_id=3)  # the lightest game
+    await ballot.tap(POLL_ID, BOB, game_id=3)
+    await ballot.tap(POLL_ID, ALICE, game_id=1)  # the heaviest
+    await ballot.tap(POLL_ID, BOB, level=3)
+
+    text = mock_context.bot.edit_message_text.call_args.kwargs["text"]
+
+    assert text.index("**2** - Game3") < text.index("**1** - Game1")
+    # A category vote says what it is a vote for.
+    assert "**1** - 🎲 Random complexity 3 game" in text
+    assert "Category" not in text
+
+
+# ============================================================================
+# Buttons that need a name: the bot prompts, the player replies
+# ============================================================================
+
+
+async def _tap_button(mock_update, mock_context, action):
+    """Tap a poll button as Alice and return the prompt it posted."""
+    mock_update.callback_query.data = f"{action}:{POLL_ID}"
+    mock_update.callback_query.message.chat.id = CHAT_ID
+    mock_update.callback_query.from_user.mention_html = MagicMock(return_value="<a>Alice</a>")
+    await custom_poll_action_callback(mock_update, mock_context)
+    prompt: dict = mock_context.bot.send_message.call_args.kwargs
+    return prompt
+
+
+async def _reply(mock_update, mock_context, prompt_text, answer):
+    """Reply to a bot message the way a player answering a prompt does."""
+    mock_context.bot.id = 4242
+    mock_update.effective_chat.id = CHAT_ID
+    mock_update.effective_user.id = ALICE
+    mock_update.effective_user.mention_html = MagicMock(return_value="<a>Alice</a>")
+    mock_update.message.reply_to_message.from_user.id = 4242
+    # Telegram hands back the prompt as plain text, the mention's markup gone.
+    mock_update.message.reply_to_message.text = prompt_text.replace("<a>", "").replace("</a>", "")
+    mock_update.message.reply_to_message.delete = AsyncMock()
+    mock_update.message.text = answer
+    await prompt_reply(mock_update, mock_context)
+
+
+async def _guests():
+    async with db.AsyncSessionLocal() as session:
+        return (await session.execute(select(User).where(User.is_guest))).scalars().all()
+
+
+async def _collection_names(user_id):
+    async with db.AsyncSessionLocal() as session:
+        stmt = select(Game.name).join(Collection).where(Collection.user_id == user_id)
+        return sorted((await session.execute(stmt)).scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_guest_button_asks_for_a_name(mock_update, mock_context):
+    await _seed()
+
+    prompt = await _tap_button(mock_update, mock_context, "poll_guest")
+
+    assert prompt["chat_id"] == CHAT_ID
+    assert prompt["text"] == "<a>Alice</a>, reply to this message with the guest's name."
+    # Selective: only the mentioned player gets the reply box opened.
+    assert prompt["reply_markup"].selective is True
+
+
+@pytest.mark.asyncio
+async def test_guest_name_reply_seats_the_guest_and_asks_for_their_game(mock_update, mock_context):
+    await _seed()
+    prompt = await _tap_button(mock_update, mock_context, "poll_guest")
+
+    await _reply(mock_update, mock_context, prompt["text"], "  Carol ")
+
+    assert [g.telegram_name for g in await _guests()] == ["Carol"]
+    # Three players now, and the poll message says so.
+    assert "3 players" in mock_context.bot.edit_message_text.call_args.kwargs["text"]
+    mock_update.message.reply_to_message.delete.assert_awaited_once()
+    follow_up = mock_context.bot.send_message.call_args.kwargs["text"]
+    assert follow_up == "<a>Alice</a>, reply to this message with a game for the guest: Carol"
+
+
+@pytest.mark.asyncio
+async def test_guest_game_reply_adds_the_game_and_asks_for_another(mock_update, mock_context):
+    await _seed()
+    prompt = await _tap_button(mock_update, mock_context, "poll_guest")
+    await _reply(mock_update, mock_context, prompt["text"], "Carol Ann")
+    game_prompt = mock_context.bot.send_message.call_args.kwargs["text"]
+    mock_context.bot.send_message.reset_mock()
+
+    await _reply(mock_update, mock_context, game_prompt, "Twilight Struggle")
+
+    (guest,) = await _guests()
+    assert await _collection_names(guest.telegram_id) == ["Twilight Struggle"]
+    assert "Carol Ann's collection" in mock_update.message.reply_text.call_args.args[0]
+    assert mock_context.bot.send_message.call_args.kwargs["text"] == game_prompt
+
+
+@pytest.mark.asyncio
+async def test_guest_name_is_escaped_in_the_follow_up_prompt(mock_update, mock_context):
+    await _seed()
+    prompt = await _tap_button(mock_update, mock_context, "poll_guest")
+
+    await _reply(mock_update, mock_context, prompt["text"], "<b>Dan")
+
+    assert mock_context.bot.send_message.call_args.kwargs["text"].endswith("guest: &lt;b&gt;Dan")
+
+
+@pytest.mark.asyncio
+async def test_add_my_game_button_adds_to_the_repliers_collection(mock_update, mock_context):
+    await _seed()
+    prompt = await _tap_button(mock_update, mock_context, "poll_mygame")
+    assert prompt["text"].endswith("reply to this message with a game to add to your collection.")
+
+    # Name plus numbers is /addgame's manual form, which needs no BGG lookup.
+    await _reply(mock_update, mock_context, prompt["text"], "Homebrew 2 6 3.2")
+
+    assert "Homebrew" in await _collection_names(ALICE)
+    # The poll picks the new game up without anyone refreshing it.
+    assert "4 games" in mock_context.bot.edit_message_text.call_args.kwargs["text"]
+    mock_update.message.reply_to_message.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reply_to_any_other_bot_message_does_nothing(mock_update, mock_context):
+    await _seed()
+
+    await _reply(mock_update, mock_context, "🎲 Game Night Started!", "Carol")
+
+    assert await _guests() == []
+    mock_update.message.reply_to_message.delete.assert_not_awaited()
+    mock_context.bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reply_to_someone_elses_message_does_nothing(mock_update, mock_context):
+    await _seed()
+    prompt = await _tap_button(mock_update, mock_context, "poll_guest")
+    mock_context.bot.send_message.reset_mock()
+    mock_context.bot.id = 4242
+    mock_update.effective_chat.id = CHAT_ID
+    mock_update.message.reply_to_message.from_user.id = BOB
+    mock_update.message.reply_to_message.text = prompt["text"]
+    mock_update.message.text = "Carol"
+
+    await prompt_reply(mock_update, mock_context)
+
+    assert await _guests() == []
+
+
+@pytest.mark.asyncio
+async def test_manually_added_game_links_to_a_bgg_search(mock_context, ballot):
+    """Manual games have made-up negative ids; only real BGG ids make a link."""
+    await _seed()
+    async with db.AsyncSessionLocal() as session:
+        session.add(
+            Game(
+                id=-77, name="Homebrew", min_players=1, max_players=6, playing_time=60, complexity=2
+            )
+        )
+        session.add(Collection(user_id=ALICE, game_id=-77))
+        await session.commit()
+
+    built, _ = await ballot.open(POLL_ID, ALICE)
+
+    assert -77 in built.game_ids
+    assert '"Homebrew"' in built.html and "-77" not in built.html

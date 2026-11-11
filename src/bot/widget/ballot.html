@@ -6,11 +6,14 @@ body{margin:0;font:14px system-ui,sans-serif;color:var(--tg-theme-text-color,#22
 #u,#s,#f span{color:var(--tg-theme-hint-color,#888);font-size:12px}
 #t{display:flex;gap:4px;padding:0 10px}
 #t div{flex:1;text-align:center;padding:6px 0;border-radius:8px;background:var(--tg-theme-secondary-bg-color,#eee)}
-#t .a,.r.v i{background:var(--tg-theme-button-color,#39f);color:var(--tg-theme-button-text-color,#fff)}
+#t .a,.v i{background:var(--tg-theme-button-color,#39f);color:var(--tg-theme-button-text-color,#fff)}
 #l{height:408px}
-.r{display:flex;align-items:center;gap:8px;height:34px;padding:0 10px}
+.r,.b{display:flex;align-items:center;gap:8px;height:34px}
+.r{padding:0 10px}
+.b{flex:1;min-width:0}
 .r i{flex:none;width:22px;height:22px;border-radius:6px;font-style:normal;text-align:center;line-height:22px;border:1px solid var(--tg-theme-hint-color,#888)}
 .n{flex:1}
+.r a{flex:none;font-size:10px;font-weight:600;text-decoration:none;color:var(--tg-theme-hint-color,#888);border:1px solid;border-radius:6px;padding:2px 6px}
 .w{opacity:.5}
 #f span{flex:1;text-align:center}
 #f div{padding:6px 14px}
@@ -37,10 +40,16 @@ try{$("l").style.height=P*34+"px";}catch(e){}
 let S={r:0,m:[],c:[],l:0},tab=1,page=0,busy=0,note="";
 
 /* Flat list in catalog order. A game is known by its position x here: votes,
-   requests and the tally string in S.t all use it, which keeps ids out of the HTML. */
+   requests and the tally string in S.t all use it. An entry is a bare name, or
+   [name, BGG id, starred] when it has more to say; the id is 0 on a ballot too
+   big to carry ids. */
 const A=[];
-C.g.forEach(([lv,gs],k)=>gs.forEach((e)=>A.push(typeof e=="string"?{name:e,lv,k,x:A.length}:{name:e[0],star:1,lv,k,x:A.length})));
-/* Level 0 holds the games BGG has no complexity rating for. */
+C.g.forEach(([lv,gs],k)=>gs.forEach((e)=>{
+  const a=typeof e=="string"?[e]:e;
+  A.push({name:a[0],id:a[1],star:a[2],lv,k,x:A.length});
+}));
+/* BGG's complexity ("weight") scale. Level 0 holds the games it has no rating for. */
+const WT=["","light","medium-light","medium","medium-heavy","heavy"];
 const lvl=(v)=>v?""+v:"N/A";
 /* Tab 0 is the voter's own picks; the rest are one per complexity level. */
 const T=[{t:"✓"}].concat(C.g.map(([lv],k)=>({t:lvl(lv),lv,k})));
@@ -48,8 +57,10 @@ if(T.length<2)tab=0;
 /* Tab and page survive a reopen where the client offers storage. */
 try{const k=(localStorage.getItem("b")||"").split(",");if(k[1]!=null&&k[0]<T.length){tab=+k[0];page=+k[1];}}catch(e){}
 
+/* Only ever moves forward: answers and pushes can arrive in either order, and
+   chatData is re-read at times when it may not have changed. */
 function load(s){
-  try{const d=typeof s=="string"?JSON.parse(s):s;if(d&&d.r>=S.r){S=d;note=d.e||"";}}catch(e){}
+  try{const d=typeof s=="string"?JSON.parse(s):s;if(d&&d.r>S.r){S=d;note=d.e||"";}}catch(e){}
 }
 function rows(){
   const t=T[tab];
@@ -80,23 +91,34 @@ function draw(){
     tabs.appendChild(d);
   });
   const t=T[tab];
-  $("s").textContent=S.x||(S.p?"You're not in this game night. Join in the group to vote.":"")||note||(tab==0?"Your votes":(t.lv?"Complexity "+t.lv:"No complexity rating")+" · "+(all.length-1)+" games");
+  $("s").textContent=S.x||(S.p?"You're not in this game night. Join in the group to vote.":"")||note||(tab==0?"Your votes":(t.lv?"Complexity "+t.lv+" of 5 ("+WT[t.lv]+")":"No complexity rating on BGG")+" · "+(all.length-1)+" games");
   const list=$("l");
   list.textContent="";
   all.slice(page*P,page*P+P).forEach((r)=>{
     const on=r.cat?S.c.includes(r.lv):S.m.includes(r.x);
-    const d=el("div","r"+(on?" v":"")+(busy?" w":""));
-    d.appendChild(el("i","",on?"✓":""));
-    d.appendChild(el("span","n",r.cat?"🎲 Random, "+(r.lv?"complexity "+r.lv:"unrated"):(r.star?"★ ":"")+r.name));
-    d.appendChild(el("span","",count(r)));
-    d.onclick=()=>vote(r);
+    const d=el("div","r"),b=el("div","b"+(on?" v":"")+(busy?" w":""));
+    b.appendChild(el("i","",on?"✓":""));
+    b.appendChild(el("span","n",r.cat?"🎲 Random "+(r.lv?"complexity "+r.lv:"unrated")+" game":(r.star?"★ ":"")+r.name));
+    b.appendChild(el("span","",count(r)));
+    /* The vote area and the link are siblings, so a tap on the link is never a vote. */
+    b.onclick=()=>vote(r);
+    d.appendChild(b);
+    if(!r.cat){
+      const a=el("a","","BGG");
+      a.setAttribute("href","https://boardgamegeek.com/"+(r.id?"boardgame/"+r.id:"geeksearch.php?action=search&objecttype=boardgame&q="+encodeURIComponent(r.name)));
+      d.appendChild(a);
+    }
     list.appendChild(d);
   });
   $("o").textContent=(page+1)+" / "+pages;
-  $("p").onclick=()=>{if(page>0){page--;draw();}};
-  $("q").onclick=()=>{if(page<pages-1){page++;draw();}};
+  /* Past either end of a tab the arrows carry on into the neighbouring one. */
+  $("p").onclick=()=>{if(page>0)page--;else if(tab>0){tab--;page=1e9;}else return;note="";draw();};
+  $("q").onclick=()=>{if(page<pages-1)page++;else if(tab<T.length-1){tab++;page=0;}else return;note="";draw();};
   try{localStorage.setItem("b",tab+","+page);}catch(e){}
 }
+/* A push that lands while a request is in flight is held back so it cannot
+   undo the tap on screen; it is picked up here once the request settles. */
+function settle(){busy=0;load(W.chatData);draw();}
 function vote(r){
   if(busy||S.x||S.p)return;
   const arr=r.cat?S.c:S.m,key=r.cat?r.lv:r.x,i=arr.indexOf(key);
@@ -106,12 +128,14 @@ function vote(r){
   busy=1;note="";draw();
   if(W.HapticFeedback)W.HapticFeedback.selectionChanged();
   W.request((r.cat?"c:":"v:")+key).then((a)=>{
-    busy=0;load(a&&a.result!=null?a.result:a);draw();
+    load(a&&a.result);settle();
   },(e)=>{
-    busy=0;
+    /* No answer does not mean no vote: the bot may have recorded it and been
+       slow to say so. Undo the tap, then let settle() take the bot's stored
+       state if a newer one has arrived, which also clears this note. */
     if(i<0)arr.splice(arr.indexOf(key),1);else arr.push(key);
     note=e&&e.code=="RATE_LIMITED"?"Too fast. Try again in a moment.":"Could not reach the bot. Try again.";
-    draw();
+    settle();
   });
 }
 W.onEvent("chatDataChanged",()=>{if(!busy){load(W.chatData);draw();}});

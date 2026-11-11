@@ -9,7 +9,8 @@ A Telegram bot that helps your group decide what board game to play on game nigh
 - **Smart Filtering**: Only shows games that support the current player count
 - **Collection Management**: Three-state toggle per game (⬜ Included → 🌟 Starred → ❌ Excluded) plus custom max player overrides
 - **Single Poll**: One pinned message with the live tally for every eligible game
-- **Private Ballots**: Tap 🗳 Vote to get your own ballot (a Telegram HTML widget) in a private chat with the bot — games grouped by complexity, starred first, paged per voter, updated live
+- **Private Ballots**: Tap 🗳 Vote to get your own ballot (a Telegram HTML widget) in a private chat with the bot — games grouped by BGG complexity, starred first, paged per voter, each with a link to its BGG page, updated live
+- **Poll Shortcuts**: 👤 Guest seats a guest and then asks for their games; 📚 Add my game adds a game to your own collection — both by replying to a prompt instead of typing a command
 - **Live Refresh**: Joining, leaving, or changing a collection mid-poll updates the tally and every open ballot
 - **Weighted Voting**: Starred (🌟) games get a +0.5 vote boost per player who starred them
 - **Category Voting**: Vote for a complexity level instead of a specific game — resolved to a random game at close
