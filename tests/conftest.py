@@ -3,7 +3,7 @@ import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 from telegram import CallbackQuery, Message, Update
@@ -30,6 +30,14 @@ async def setup_test_db():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+
+    # SQLite ignores foreign keys unless asked; Postgres in production does not.
+    # Without this, deletes that break a reference pass here and fail live.
+    @event.listens_for(test_engine.sync_engine, "connect")
+    def _enforce_foreign_keys(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
     # Patch the global engine and sessionmaker in src.core.db
     # Since handlers.py imports 'db' and calls 'db.AsyncSessionLocal()', this works!

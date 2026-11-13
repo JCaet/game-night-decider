@@ -168,6 +168,9 @@ class GameNightPoll(Base):
     chat_title: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Relationships
+    # Tells the ORM a poll depends on its session, so a flush that adds both
+    # inserts the session first. Without it the order was left to chance.
+    session: Mapped["Session"] = relationship()
     votes: Mapped[list["PollVote"]] = relationship(
         back_populates="poll", cascade="all, delete-orphan"
     )

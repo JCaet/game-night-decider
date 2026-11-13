@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from typing import cast
 
 import telegram
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, exists, func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
@@ -766,6 +766,22 @@ async def set_bgg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _delete_orphaned_guests(session) -> None:
+    """Delete guests no longer seated in any game night, with their games.
+
+    Call it after clearing a chat's players. Guests belong to one chat, but this
+    runs from any chat, so it has to leave alone guests still seated in another
+    chat's night: deleting every guest broke session_players' foreign key and
+    rolled back the whole cleanup. The guests' own rows go first, since the
+    database refuses to drop a user that collection still points at.
+    """
+    unseated = ~exists().where(SessionPlayer.user_id == User.telegram_id)
+    orphans = select(User.telegram_id).where(User.is_guest.is_(True), unseated)
+    await session.execute(delete(Collection).where(Collection.user_id.in_(orphans)))
+    await session.execute(delete(UserExpansion).where(UserExpansion.user_id.in_(orphans)))
+    await session.execute(delete(User).where(User.is_guest.is_(True), unseated))
+
+
 async def _close_existing_polls(session, context, chat_id, reason="Poll Closed"):
     """Close all active polls for a chat: edit their messages and delete DB records."""
     existing_polls_stmt = select(GameNightPoll).where(GameNightPoll.chat_id == chat_id)
@@ -841,7 +857,7 @@ async def start_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
 
         # Clean up orphaned guests from previous session
-        await session.execute(delete(User).where(User.is_guest))
+        await _delete_orphaned_guests(session)
 
         db_session.is_active = True
         await session.commit()
@@ -1518,7 +1534,7 @@ async def test_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await session.flush()
 
             # Clean up orphaned guests from previous sessions
-            await session.execute(delete(User).where(User.is_guest))
+            await _delete_orphaned_guests(session)
 
             # Create a fresh new session
             db_session = Session(chat_id=chat_id, is_active=True)
@@ -1904,7 +1920,7 @@ async def restart_night_callback(update: Update, context: ContextTypes.DEFAULT_T
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
 
             # Clean up orphaned guests
-            await session.execute(delete(User).where(User.is_guest))
+            await _delete_orphaned_guests(session)
 
             db_session.is_active = True
             await session.commit()
@@ -2095,7 +2111,7 @@ async def cancel_night_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
 
             # Clean up orphaned guests
-            await session.execute(delete(User).where(User.is_guest.is_(True)))
+            await _delete_orphaned_guests(session)
 
             # Mark session as inactive
             db_session.is_active = False
@@ -2128,7 +2144,7 @@ async def cancel_night(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
 
         # Clean up orphaned guests
-        await session.execute(delete(User).where(User.is_guest.is_(True)))
+        await _delete_orphaned_guests(session)
 
         # Mark session as inactive
         db_session.is_active = False
@@ -3525,7 +3541,7 @@ async def _handle_poll_close(query, context: ContextTypes.DEFAULT_TYPE, poll_id:
         session_obj = await session.get(Session, chat_id)
         if session_obj:
             await session.execute(delete(SessionPlayer).where(SessionPlayer.session_id == chat_id))
-            await session.execute(delete(User).where(User.is_guest.is_(True)))
+            await _delete_orphaned_guests(session)
             session_obj.is_active = False
             await session.commit()
 
